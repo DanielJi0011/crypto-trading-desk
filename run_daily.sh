@@ -16,6 +16,8 @@ cd "$(dirname "$0")"
 DATA="${TA_DESK_HOME:-$PWD}"                 # 数据目录（测试时指向临时目录）
 PY="${TA_DESK_PYTHON:-$PWD/.venv/bin/python}"   # 默认用仓库 .venv；测试/无 .venv 环境可用 TA_DESK_PYTHON 覆盖
 RUNNER="${TA_DAILY_RUNNER:-$PY -m desk.run_daily}"   # 仅测试用：替换为桩命令，不跑真正的交易流程
+. "$PWD/scripts/notify_fallback.sh"; export TA_ALERT_SECRETS="$DATA/state/secrets.env"
+# 返回码：5 = 解释器缺失（本场跳过并告警）；6 = 窗口判断调用失败（不是“不在窗口”，本场跳过并告警）
 mkdir -p "$DATA/logs" "$DATA/state/locks" "$DATA/state/daily_done" "$DATA/state/daily_failed"
 DAY="$(TZ=Asia/Shanghai date +%F)"
 MOCK=0; prev=""; SESSION=morning
@@ -29,6 +31,11 @@ done
 case "$SESSION" in morning) SFX="" ;; evening) SFX="-evening" ;; *) echo "[run_daily.sh] 未知场次 $SESSION（只支持 morning/evening）"; exit 2 ;; esac
 KEY="$DAY$SFX"                                  # 标记名：早场 <日期>，晚场 <日期>-evening
 LOG="$DATA/logs/run-$(TZ=Asia/Shanghai date +%F)$SFX.log"
+SNAME=$([ "$SESSION" = evening ] && echo "20:30晚场" || echo "8点早场")
+if [ ! -x "$PY" ]; then
+  ta_alert daily_skipped "run_daily $KEY（$SNAME）被跳过：Python 解释器缺失或不可执行（$PY），未运行交易流程，请检查 .venv" "$LOG"
+  exit 5
+fi
 exec 9>"$DATA/state/locks/run_daily.lock"
 if ! flock -n 9; then
   echo "[run_daily.sh] 已有实例在运行，本次退出（daily_duplicate_trigger running）" | tee -a "$LOG"
@@ -39,6 +46,11 @@ NOW_HM="${TA_DAILY_NOW:-$(TZ=Asia/Shanghai date +%H:%M)}"   # TA_DAILY_NOW 仅�
 # 窗口按 config sessions.<场次> 用 zoneinfo 换算成北京时间（晚场按纽约时间，随夏令时切换）
 if [ "$MOCK" = "0" ] && [ "${TA_DAILY_IGNORE_WINDOW:-0}" != "1" ]; then
   WIN=$(TA_DESK_HOME="$DATA" "$PY" -m desk.sessions window "$SESSION" "$DAY" "$NOW_HM"); wrc=$?
+  if [ "$wrc" != "0" ] && ! { [ "$wrc" = "1" ] && [[ "$WIN" =~ ^[0-9]{2}:[0-9]{2}-[0-9]{2}:[0-9]{2}$ ]]; }; then
+    ta_alert daily_skipped "run_daily $KEY（$SNAME）被跳过：时间窗口判断失败（desk.sessions window 返回码 $wrc，非正常“不在窗口”结果），未运行交易流程，详见日志" "$LOG"
+    "$PY" -m desk.daily_gate duplicate "$KEY" window_check_failed >>"$LOG" 2>&1
+    exit 6
+  fi
   if [ "$wrc" != "0" ]; then
     echo "[run_daily.sh] 当前北京时间 $NOW_HM 不在 $SESSION 窗口 $WIN（北京时间）内，本次退出（daily_duplicate_trigger out_of_window）" | tee -a "$LOG"
     "$PY" -m desk.daily_gate duplicate "$KEY" out_of_window >>"$LOG" 2>&1

@@ -7,6 +7,8 @@ for _v in $(compgen -e); do case "$_v" in OKX_DEMO_*) ;; OKX_*KEY*|OKX_*SECRET*|
 set -uo pipefail
 cd "$(dirname "$0")"
 mkdir -p logs
+. "$PWD/scripts/notify_fallback.sh"; export TA_ALERT_SECRETS="$PWD/state/secrets.env"
+if [ ! -x .venv/bin/python ]; then ta_alert demo_watch_skipped "模拟盘轮询 run_demo_watch.sh 未启动：Python 解释器缺失（.venv/bin/python），请检查 .venv" "logs/demo-watch-$(TZ=Asia/Shanghai date +%F).log"; exit 5; fi
 once() { timeout -k 10 150 .venv/bin/python -m desk.demo_watch --once >> "logs/demo-watch-$(TZ=Asia/Shanghai date +%F).log" 2>&1; }
 if [ "${1:-}" = "--loop" ]; then
   while true; do once; sleep "${2:-300}"; done

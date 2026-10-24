@@ -52,7 +52,7 @@ NOTIFY_KINDS = {"trigger_placed",   # 挂出入场条件单（早场/晚场/止�
                 "fill", "stop_loss", "take_profit", "liquidation", "trigger_fired", "disconnect_alert",
                 "position_open", "position_closed",
                 # 整改第一批新增：R5 风控、R10 停机撤单、Q5 过期只通知、O1/O2 日流程失败
-                "daily_loss_halt", "drawdown_kill", "trigger_revoked", "trigger_expired", "position_expired", "daily_failed",
+                "daily_loss_halt", "drawdown_kill", "trigger_revoked", "trigger_expired", "position_expired", "daily_failed", "daily_skipped",
                 # 第二批：止损先挂新再撤旧失败、旧单残留、止损覆盖缺失（R11.4）
                 "stop_replace_failed", "stop_replace_old_left", "stop_coverage_missing",
                 # 第三批 L4：X 讨论摘录缺失（每天一次）

@@ -78,18 +78,22 @@ def missing_at(cfg, s, day: str) -> _dt.datetime:
 
 
 def main(argv=None) -> int:
-    """python -m desk.sessions window <session> <北京日期> [北京 HH:MM]：在窗口内退出 0，否则 1，并打印北京时间窗口。"""
+    """python -m desk.sessions window <session> <北京日期> [北京 HH:MM]：在窗口内退出 0，否则 1，并打印北京时间窗口；判断失败退出 3。"""
     a = list(sys.argv[1:] if argv is None else argv)
     if len(a) >= 3 and a[0] == "window":
-        from desk import settings
-        cfg = settings.load_config()
-        s, day = a[1], a[2]
-        lo, hi = window_bj(cfg, s, day)
-        if len(a) >= 4:
-            h, m = (int(x) for x in a[3].split(":"))
-            now = _dt.datetime.combine(_dt.date.fromisoformat(day), _dt.time(h, m), BJ)
-        else:
-            now = _dt.datetime.now(BJ)
+        try:
+            from desk import settings
+            cfg = settings.load_config()
+            s, day = a[1], a[2]
+            lo, hi = window_bj(cfg, s, day)
+            if len(a) >= 4:
+                h, m = (int(x) for x in a[3].split(":"))
+                now = _dt.datetime.combine(_dt.date.fromisoformat(day), _dt.time(h, m), BJ)
+            else:
+                now = _dt.datetime.now(BJ)
+        except Exception as e:   # 判断失败 ≠ 不在窗口：返回 3，stdout 不打印窗口，由 run_daily.sh 告警
+            print(f"window check failed: {type(e).__name__}: {e}", file=sys.stderr)
+            return 3
         print(f"{lo:%H:%M}-{hi:%H:%M}")
         return 0 if lo <= now <= hi else 1
     print(main.__doc__); return 2
