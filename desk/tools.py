@@ -1,4 +1,4 @@
-"""技术分析师专属工具：在 OKX 历史K线上跑 Python 回测（复用 /workspace/ai-trader/backtest.py）。"""
+"""技术分析师专属工具：在 OKX 历史K线上跑 Python 回测（复用 ai_trader/backtest.py）。"""
 from __future__ import annotations
 
 import json

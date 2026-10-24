@@ -4,7 +4,8 @@ FROM python:3.13-slim
 ENV TZ=Asia/Shanghai \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    TA_DESK_PYTHON=/workspace/ta-desk/.venv/bin/python
+    TA_DESK_PYTHON=/workspace/ta-desk/.venv/bin/python \
+    AI_TRADER_SRC=/workspace/ta-desk/ai_trader
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends bash git curl ca-certificates tzdata procps util-linux openssh-client \

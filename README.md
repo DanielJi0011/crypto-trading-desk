@@ -167,9 +167,9 @@ pgrep -af desk.demo_ws; cat state/demo_ws_heartbeat; tail -f logs/demo-ws-$(date
 - 早晚场触发：生产里由外部助手的例行任务定时调用。早场在北京时间 08:05 执行 `bash run_daily.sh`；晚场在纽约时间 08:30 执行 `bash run_daily.sh --session evening`（北京时间夏令时 20:30，冬令时 21:30）。
 - **早晚报摘要（以及抓取 X 舆情到 `state/x_feed/`）是外部助手完成的，不属于本仓库。Docker 里只跑交易台本身**：常驻服务和定时的 `run_daily.sh`。没有 x_feed 时，日流程按缺省情况处理。
 
-### 外部依赖 ai-trader（必需，不在本仓库）
+### 内置依赖 ai_trader/
 
-`desk/settings.py` 和 `desk/tools.py` 会从 `AI_TRADER_SRC`（默认 `/workspace/ai-trader`）导入 `store`、`guardrails`、`okx_client`、`backtest` 四个模块，这部分代码不在本仓库。原生运行时请把它放在 `/workspace/ai-trader`，或设置环境变量 `AI_TRADER_SRC`。Docker 下默认把同级目录 `../ai-trader` 只读挂载进容器，可用 `AI_TRADER_DIR` 覆盖。账本写在 ta-desk 自己的 `state/ledger`，不写 ai-trader 的目录。
+`ai_trader/` 目录收录了交易台用到的 4 个模块：`store.py`、`guardrails.py`、`backtest.py` 与原版相同；`okx_client.py` 是**发布裁剪版**，只保留公共行情接口，删除了凭据读取、签名、下单、撤单、设杠杆以及全部私有接口，任何私有或非 GET 请求都会被拒绝。`desk/settings.py` 默认从仓库内的 `ai_trader/` 导入这些模块（也可以用环境变量 `AI_TRADER_SRC` 指向别的目录），克隆下来就能用，不需要外部目录。模拟盘交易只走 `desk/okx_demo.py`。
 
 ### 推荐：Docker
 
@@ -197,9 +197,7 @@ chmod 600 state/secrets.env
 #    <BACKUP_HOST> 改成离机备份主机（不用离机备份就关掉 offsite）
 #    heartbeat_url_file 等绝对路径按你的环境调整
 
-# 4. 准备 ai-trader 代码（放在 ../ai-trader，或 export AI_TRADER_DIR=/path/to/ai-trader）
-
-# 5. 构建并启动
+# 4. 构建并启动
 docker compose build
 docker compose up -d
 docker compose ps

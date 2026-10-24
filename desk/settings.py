@@ -18,7 +18,7 @@ REPORTS = ROOT / "reports"
 PLAYBOOKS = ROOT / "playbooks"
 LOGS = ROOT / "logs"
 TZ = ZoneInfo("Asia/Shanghai")
-AI_TRADER = Path(os.environ.get("AI_TRADER_SRC", "/workspace/ai-trader"))
+AI_TRADER = Path(os.environ.get("AI_TRADER_SRC", Path(__file__).resolve().parents[1] / "ai_trader"))   # 默认仓库内 ai_trader/（发布裁剪版 okx_client）
 
 for p in (STATE, REPORTS, PLAYBOOKS, LOGS):
     p.mkdir(parents=True, exist_ok=True)
@@ -136,7 +136,7 @@ def read_jsonl(path: Path) -> list[dict]:
 
 
 def ai_trader_modules():
-    """复用 /workspace/ai-trader 的 okx_client / guardrails / store。
+    """复用 ai_trader/（默认仓库内，可用 AI_TRADER_SRC 覆盖）的 okx_client / guardrails / store。
 
     store 的路径由环境变量 AI_TRADER_HOME 决定 —— 指向 ta-desk 的独立账本目录，
     因此 guardrails 读取的是 ta-desk 的纸面交易记录，而不是 ai-trader 的。"""

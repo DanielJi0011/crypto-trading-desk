@@ -40,7 +40,7 @@ def test_load_config_scrubs(monkeypatch):
 def test_fresh_process_import_scrubs_before_ai_trader():
     env = {**os.environ, "OKX_API_KEY": "dummy", "OKX_API_SECRET": "dummy", "OKX_API_PASSPHRASE": "dummy", "OKX_SECRET_KEY": "dummy"}
     code = ("import os, desk, sys; from desk import settings; ot, _, _ = settings.ai_trader_modules();"
-            "print(sorted(k for k in os.environ if k.startswith('OKX_')), ot.Credentials.from_env() is None)")
+            "print(sorted(k for k in os.environ if k.startswith('OKX_')), not hasattr(ot, 'Credentials'))")   # 发布裁剪版：凭据类已删除
     out = subprocess.run([sys.executable, "-c", code], cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
     assert out.returncode == 0, out.stderr[-500:]
     assert out.stdout.strip() == "[] True"
@@ -50,7 +50,7 @@ def test_okx_data_no_access_key_header(monkeypatch):
     from desk import okx_data
     monkeypatch.setenv("OKX_API_KEY", "dummy"); monkeypatch.setenv("OKX_API_SECRET", "dummy"); monkeypatch.setenv("OKX_API_PASSPHRASE", "dummy")
     okx_client, _, _ = settings.ai_trader_modules()
-    monkeypatch.setattr(okx_client.Credentials, "from_env", classmethod(lambda cls: (_ for _ in ()).throw(AssertionError("不得读取实盘环境凭据"))))
+    assert not hasattr(okx_client, "Credentials")   # 发布裁剪版：不存在读取实盘环境凭据的入口
     seen = []
 
     class R:
@@ -104,6 +104,19 @@ def _sign_sites():
                 if hit:
                     sites.add((rel, name))
     return sites
+
+
+def test_trimmed_okx_client_public_only():
+    """发布裁剪版 ai_trader/okx_client.py：无凭据、无签名、无写操作，私有/非 GET 请求一律拒绝。"""
+    okx_client, _, _ = settings.ai_trader_modules()
+    src = Path(okx_client.__file__).read_text(encoding="utf-8")
+    for b in ("OKX_API_", "hmac", "OK-ACCESS", "place_order", "cancel_order", "set_leverage", "/trade/", "/account/"):
+        assert b not in src, b
+    c = okx_client.OKXClient(mode="live", simulated=False, credentials=object())
+    for args, kw in ((("GET", "/api/v5/account/balance"), {}), (("POST", "/api/v5/market/ticker"), {}),
+                     (("GET", "/api/v5/market/ticker"), {"private": True})):
+        with pytest.raises(okx_client.PrivateRequestRefused):
+            c._request(*args, **kw)
 
 
 def test_signing_whitelist_scan():

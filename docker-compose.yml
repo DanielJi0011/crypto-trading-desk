@@ -11,8 +11,6 @@ x-desk: &desk
     - ./reports:/workspace/ta-desk/reports
     - ./logs:/workspace/ta-desk/logs
     - ./config.yaml:/workspace/ta-desk/config.yaml:ro
-    # 外部依赖 ai-trader（store / guardrails / okx_client / backtest，不在本仓库），只读挂载；路径可用 AI_TRADER_DIR 覆盖
-    - ${AI_TRADER_DIR:-../ai-trader}:/workspace/ai-trader:ro
   restart: unless-stopped
 
 services:
