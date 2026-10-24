@@ -14,7 +14,7 @@ for _v in $(compgen -e); do case "$_v" in OKX_DEMO_*) ;; OKX_*KEY*|OKX_*SECRET*|
 set -uo pipefail
 cd "$(dirname "$0")"
 DATA="${TA_DESK_HOME:-$PWD}"                 # 数据目录（测试时指向临时目录）
-PY="$PWD/.venv/bin/python"
+PY="${TA_DESK_PYTHON:-$PWD/.venv/bin/python}"   # 默认用仓库 .venv；测试/无 .venv 环境可用 TA_DESK_PYTHON 覆盖
 RUNNER="${TA_DAILY_RUNNER:-$PY -m desk.run_daily}"   # 仅测试用：替换为桩命令，不跑真正的交易流程
 mkdir -p "$DATA/logs" "$DATA/state/locks" "$DATA/state/daily_done" "$DATA/state/daily_failed"
 DAY="$(TZ=Asia/Shanghai date +%F)"
@@ -60,7 +60,7 @@ if [ "$MOCK" = "0" ]; then
     # 成功后自动备份 state（不含密钥文件与锁）；备份失败只记日志，不改变返回码
     TA_DESK_HOME="$DATA" timeout 300 bash "$PWD/scripts/backup_state.sh" >>"$LOG" 2>&1 || echo "[run_daily.sh] state 备份失败（不影响日流程结果）" | tee -a "$LOG"
 B=$(ls -1t "$DATA"/backups/state-*.tar.gz 2>/dev/null | head -1)   # 离机上传（sftp）：失败只告警 offsite_backup_failed，不影响日报
-[ -n "$B" ] && { TA_DESK_HOME="$DATA" timeout 700 "$PWD/.venv/bin/python" -m desk.offsite upload "$B" >>"$LOG" 2>&1 || echo "[run_daily.sh] 离机备份上传失败（已告警，不影响日流程结果）" | tee -a "$LOG"; }
+[ -n "$B" ] && { TA_DESK_HOME="$DATA" timeout 700 "$PY" -m desk.offsite upload "$B" >>"$LOG" 2>&1 || echo "[run_daily.sh] 离机备份上传失败（已告警，不影响日流程结果）" | tee -a "$LOG"; }
   else
     echo "$rc" > "$DATA/state/daily_failed/$KEY"
     "$PY" -m desk.daily_gate failed "$KEY" "$rc" >>"$LOG" 2>&1

@@ -1,4 +1,5 @@
 """2b 实盘变量隔离 + D1.4 启动检查 + 签名入口白名单扫描。只按变量名判断，不读不打印任何密钥值。离线。"""
+import sys
 import ast
 import os
 import subprocess
@@ -40,7 +41,7 @@ def test_fresh_process_import_scrubs_before_ai_trader():
     env = {**os.environ, "OKX_API_KEY": "dummy", "OKX_API_SECRET": "dummy", "OKX_API_PASSPHRASE": "dummy", "OKX_SECRET_KEY": "dummy"}
     code = ("import os, desk, sys; from desk import settings; ot, _, _ = settings.ai_trader_modules();"
             "print(sorted(k for k in os.environ if k.startswith('OKX_')), ot.Credentials.from_env() is None)")
-    out = subprocess.run([str(ROOT / ".venv/bin/python"), "-c", code], cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
+    out = subprocess.run([sys.executable, "-c", code], cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
     assert out.returncode == 0, out.stderr[-500:]
     assert out.stdout.strip() == "[] True"
 

@@ -59,3 +59,9 @@ def _no_real_send_no_real_state(monkeypatch, tmp_path):
                 if isinstance(v, Path) and str(v.resolve()).startswith(str(_REAL_STATE)):
                     raise AssertionError(f"{name} 指向真实 state：{v}")
     yield
+
+
+# 子进程脚本（run_daily.sh 等）默认用仓库内 .venv/bin/python；测试统一用当前解释器，
+# 这样在没有 .venv 的检出（如导出副本、worktree）里也能跑。
+import os as _os, sys as _sys
+_os.environ.setdefault("TA_DESK_PYTHON", _sys.executable)
