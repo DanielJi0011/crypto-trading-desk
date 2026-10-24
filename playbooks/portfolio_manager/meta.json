@@ -1,0 +1,31 @@
+{
+  "current": 2,
+  "history": [
+    {
+      "version": 1,
+      "time": "2026-10-20 00:45:25+0800",
+      "reason": "初始版本",
+      "changes": [],
+      "baseline_hit": null,
+      "baseline_n": 0,
+      "scored_at_edit": 0,
+      "eval_status": "baseline"
+    },
+    {
+      "version": 2,
+      "time": "2026-10-21 09:10:00+0800",
+      "reason": "用户批准：交易经理入权重/否决/缺席规则；组合经理只执行不投票",
+      "changes": [
+        {
+          "op": "新增",
+          "rule": "## 角色定位（2026-10-21 起，v002）",
+          "why": "用户批准的 7 条改动"
+        }
+      ],
+      "baseline_hit": null,
+      "baseline_n": 0,
+      "scored_at_edit": 0,
+      "eval_status": "baseline"
+    }
+  ]
+}

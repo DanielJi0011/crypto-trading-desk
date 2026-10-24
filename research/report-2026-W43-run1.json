@@ -1,0 +1,439 @@
+{
+  "week": "2026-W43",
+  "time": "2026-10-22 14:31:15+0800",
+  "roles": {
+    "market": {
+      "tested": [
+        {
+          "hypothesis": {
+            "side": "long",
+            "name": "恐慌抛售后均值回归做多",
+            "rationale": "加密市场急跌后常出现流动性挤兑式超卖，放量恐慌盘出清后5日内反弹概率高于无条件同期，且RSI极低给出赔率",
+            "conditions": [
+              {
+                "feature": "ret_5",
+                "op": "<",
+                "value": -12.0
+              },
+              {
+                "feature": "rsi_14",
+                "op": "<",
+                "value": 32.0
+              },
+              {
+                "feature": "vol_z20",
+                "op": ">",
+                "value": 1.5
+              }
+            ],
+            "horizon_days": 5,
+            "stop_pct": 8.0
+          },
+          "id": "H-20261022-market-64c1e8",
+          "role": "market",
+          "tested": "2026-10-22 14:31:23+0800",
+          "side": "long",
+          "stats": {
+            "is": {
+              "n": 21,
+              "mean_excess_pct": 1.115,
+              "t": 0.4
+            },
+            "oos": {
+              "n": 17,
+              "mean_excess_pct": -1.52,
+              "t": -0.83
+            }
+          },
+          "z_crit_is": 1.64,
+          "k_tests": 1,
+          "cut": "2025-07-29",
+          "passed": false
+        },
+        {
+          "hypothesis": {
+            "side": "short",
+            "name": "弱势市况反弹衰竭做空",
+            "rationale": "价格在50日均线下方且大盘5日走弱时，单日急涨多为空头回补而非趋势反转，反弹易被卖出，做空胜率高于自然跌幅",
+            "conditions": [
+              {
+                "feature": "ret_1",
+                "op": ">",
+                "value": 4.0
+              },
+              {
+                "feature": "dist_ma50",
+                "op": "<",
+                "value": -8.0
+              },
+              {
+                "feature": "btc_ret_5",
+                "op": "<",
+                "value": -4.0
+              }
+            ],
+            "horizon_days": 3,
+            "stop_pct": 8.0
+          },
+          "id": "H-20261022-market-1bea23",
+          "role": "market",
+          "tested": "2026-10-22 14:31:23+0800",
+          "side": "short",
+          "stats": {
+            "is": {
+              "n": 11,
+              "mean_excess_pct": 1.365,
+              "t": 0.43
+            },
+            "oos": {
+              "n": 13,
+              "mean_excess_pct": 0.895,
+              "t": 0.86
+            }
+          },
+          "z_crit_is": 1.96,
+          "k_tests": 2,
+          "cut": "2025-07-29",
+          "passed": false
+        },
+        {
+          "hypothesis": {
+            "side": "long",
+            "name": "趋势延续突破做多",
+            "rationale": "站上50日均线且20日涨幅可观、贴近20日高点，说明多头结构完好，趋势延续性优于随机，日线级别动量在加密资产中偏正",
+            "conditions": [
+              {
+                "feature": "dist_ma50",
+                "op": ">",
+                "value": 5.0
+              },
+              {
+                "feature": "ret_20",
+                "op": ">",
+                "value": 10.0
+              },
+              {
+                "feature": "dd_high20",
+                "op": ">",
+                "value": -5.0
+              }
+            ],
+            "horizon_days": 10,
+            "stop_pct": 8.0
+          },
+          "id": "H-20261022-market-79168f",
+          "role": "market",
+          "tested": "2026-10-22 14:31:23+0800",
+          "side": "long",
+          "stats": {
+            "is": {
+              "n": 106,
+              "mean_excess_pct": 0.307,
+              "t": 0.29
+            },
+            "oos": {
+              "n": 37,
+              "mean_excess_pct": -0.659,
+              "t": -0.53
+            }
+          },
+          "z_crit_is": 2.13,
+          "k_tests": 3,
+          "cut": "2025-07-29",
+          "passed": false
+        }
+      ]
+    },
+    "sentiment": {
+      "tested": [
+        {
+          "hypothesis": {
+            "side": "long",
+            "name": "恐慌放量超卖",
+            "rationale": "三日急跌叠加RSI超卖与异常放量，像投降式出清，情绪极端后短线易修复。",
+            "conditions": [
+              {
+                "feature": "ret_3",
+                "op": "<",
+                "value": -8.0
+              },
+              {
+                "feature": "rsi_14",
+                "op": "<",
+                "value": 30.0
+              },
+              {
+                "feature": "vol_z20",
+                "op": ">",
+                "value": 2.0
+              }
+            ],
+            "horizon_days": 5,
+            "stop_pct": 8.0
+          },
+          "id": "H-20261022-sentiment-8d66f0",
+          "role": "sentiment",
+          "tested": "2026-10-22 14:31:59+0800",
+          "side": "long",
+          "stats": {
+            "is": {
+              "n": 19,
+              "mean_excess_pct": 0.447,
+              "t": 0.15
+            },
+            "oos": {
+              "n": 20,
+              "mean_excess_pct": -1.701,
+              "t": -1.0
+            }
+          },
+          "z_crit_is": 1.64,
+          "k_tests": 1,
+          "cut": "2025-07-29",
+          "passed": false
+        },
+        {
+          "hypothesis": {
+            "side": "short",
+            "name": "贪婪乘离回吐",
+            "rationale": "短期暴涨且远离均线、RSI过热，贪婪透支后容易出现情绪退潮。",
+            "conditions": [
+              {
+                "feature": "rsi_14",
+                "op": ">",
+                "value": 75.0
+              },
+              {
+                "feature": "dist_ma20",
+                "op": ">",
+                "value": 10.0
+              },
+              {
+                "feature": "ret_5",
+                "op": ">",
+                "value": 12.0
+              }
+            ],
+            "horizon_days": 5,
+            "stop_pct": 7.0
+          },
+          "id": "H-20261022-sentiment-5ee9f6",
+          "role": "sentiment",
+          "tested": "2026-10-22 14:31:59+0800",
+          "side": "short",
+          "stats": {
+            "is": {
+              "n": 48,
+              "mean_excess_pct": -1.622,
+              "t": -1.66
+            },
+            "oos": {
+              "n": 9,
+              "mean_excess_pct": -2.948,
+              "t": -1.56
+            }
+          },
+          "z_crit_is": 1.96,
+          "k_tests": 2,
+          "cut": "2025-07-29",
+          "passed": false
+        },
+        {
+          "hypothesis": {
+            "side": "long",
+            "name": "巨阴宣泄修复",
+            "rationale": "单日极大振幅配合大阴线，是恐慌宣泄而非趋势确认，数日内常有情绪修复。",
+            "conditions": [
+              {
+                "feature": "range_pct",
+                "op": ">",
+                "value": 10.0
+              },
+              {
+                "feature": "ret_1",
+                "op": "<",
+                "value": -6.0
+              },
+              {
+                "feature": "rsi_14",
+                "op": "<",
+                "value": 40.0
+              }
+            ],
+            "horizon_days": 3,
+            "stop_pct": 6.0
+          },
+          "id": "H-20261022-sentiment-cfec4c",
+          "role": "sentiment",
+          "tested": "2026-10-22 14:31:59+0800",
+          "side": "long",
+          "stats": {
+            "is": {
+              "n": 53,
+              "mean_excess_pct": -2.278,
+              "t": -2.39
+            },
+            "oos": {
+              "n": 19,
+              "mean_excess_pct": 1.494,
+              "t": 0.84
+            }
+          },
+          "z_crit_is": 2.13,
+          "k_tests": 3,
+          "cut": "2025-07-29",
+          "passed": false
+        }
+      ]
+    },
+    "news": {
+      "tested": [
+        {
+          "hypothesis": {
+            "side": "long",
+            "name": "周末恐慌抛售的周一回补",
+            "rationale": "周末流动性稀薄，坏消息冲击被放大；周一机构与ETF资金回流后常有部分回补。",
+            "conditions": [
+              {
+                "feature": "dow",
+                "op": ">",
+                "value": 5.0
+              },
+              {
+                "feature": "ret_3",
+                "op": "<",
+                "value": -6.0
+              },
+              {
+                "feature": "rsi_14",
+                "op": "<",
+                "value": 35.0
+              }
+            ],
+            "horizon_days": 3,
+            "stop_pct": 8.0
+          },
+          "id": "H-20261022-news-e144e2",
+          "role": "news",
+          "tested": "2026-10-22 14:32:15+0800",
+          "side": "long",
+          "stats": {
+            "is": {
+              "n": 19,
+              "mean_excess_pct": -3.033,
+              "t": -1.97
+            },
+            "oos": {
+              "n": 4,
+              "mean_excess_pct": -3.724,
+              "t": -1.16
+            }
+          },
+          "z_crit_is": 1.64,
+          "k_tests": 1,
+          "cut": "2025-07-29",
+          "passed": false
+        },
+        {
+          "hypothesis": {
+            "side": "short",
+            "name": "放量急涨后利好出尽",
+            "rationale": "事件驱动型放量大涨多为情绪集中释放，消息落地后缺乏增量买盘，追高易被回落。",
+            "conditions": [
+              {
+                "feature": "ret_5",
+                "op": ">",
+                "value": 12.0
+              },
+              {
+                "feature": "dist_ma20",
+                "op": ">",
+                "value": 8.0
+              },
+              {
+                "feature": "vol_z20",
+                "op": ">",
+                "value": 1.5
+              }
+            ],
+            "horizon_days": 5,
+            "stop_pct": 8.0
+          },
+          "id": "H-20261022-news-3d967d",
+          "role": "news",
+          "tested": "2026-10-22 14:32:16+0800",
+          "side": "short",
+          "stats": {
+            "is": {
+              "n": 55,
+              "mean_excess_pct": -1.261,
+              "t": -0.99
+            },
+            "oos": {
+              "n": 12,
+              "mean_excess_pct": -1.135,
+              "t": -0.53
+            }
+          },
+          "z_crit_is": 1.96,
+          "k_tests": 2,
+          "cut": "2025-07-29",
+          "passed": false
+        },
+        {
+          "hypothesis": {
+            "side": "long",
+            "name": "单日恐慌放量后的均值回归",
+            "rationale": "单日大跌幅伴随成交量与波动率飙升，通常是新闻冲击的过度反应，短期易技术性修复。",
+            "conditions": [
+              {
+                "feature": "ret_1",
+                "op": "<",
+                "value": -7.0
+              },
+              {
+                "feature": "vol_z20",
+                "op": ">",
+                "value": 2.0
+              },
+              {
+                "feature": "atr_pct",
+                "op": ">",
+                "value": 4.0
+              }
+            ],
+            "horizon_days": 3,
+            "stop_pct": 8.0
+          },
+          "id": "H-20261022-news-28e221",
+          "role": "news",
+          "tested": "2026-10-22 14:32:16+0800",
+          "side": "long",
+          "stats": {
+            "is": {
+              "n": 22,
+              "mean_excess_pct": -3.244,
+              "t": -1.91
+            },
+            "oos": {
+              "n": 13,
+              "mean_excess_pct": 1.276,
+              "t": 0.5
+            }
+          },
+          "z_crit_is": 2.13,
+          "k_tests": 3,
+          "cut": "2025-07-29",
+          "passed": false
+        }
+      ]
+    },
+    "flows": {
+      "error": "TypeError: __main__.HypoList() argument after ** must be a mapping, not NoneType"
+    }
+  },
+  "edits": [],
+  "stopped": null,
+  "cost_usd": 0.008,
+  "tokens": 13738
+}

@@ -1,0 +1,32 @@
+# 密钥（绝不入库）
+state/secrets.env
+*.env
+.env*
+# 运行环境与缓存
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+logs/
+install.log
+# 锁文件
+*.lock
+backups/
+# 离机备份私钥与主机指纹（绝不入库）
+state/keys/
+
+# ---- 发布准备（chore/publish-prep）----
+# 运行时数据与报告（含账本、持仓、日报，不入库）
+state/
+reports/
+backups/
+*.bak*
+*backup*/
+scratch/
+tmp/
+*.log
+.env.*
+!secrets.env.example
+.DS_Store
+.idea/
+.vscode/

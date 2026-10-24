@@ -1,0 +1,5 @@
+ta-desk
+This project is built on TradingAgents (https://github.com/TauricResearch/TradingAgents),
+Copyright TauricResearch, licensed under the Apache License, Version 2.0.
+TradingAgents is included as a git submodule at vendor/TradingAgents
+(pinned to commit e8f5503e9b86d5c2710b0c76b1f686703968c9df); see its LICENSE file.

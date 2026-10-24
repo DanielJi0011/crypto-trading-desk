@@ -1,0 +1,8 @@
+{"id": "H-20261022-market-64c1e8", "time": "2026-10-23 11:58:30+0800", "menu_violation": true, "features": ["rsi_14", "vol_z20"], "note": "登记时角色特征菜单尚未生效；保留在登记表与检验计数中，不作为规则依据"}
+{"id": "H-20261022-market-79168f", "time": "2026-10-23 11:58:30+0800", "menu_violation": true, "features": ["dd_high20"], "note": "登记时角色特征菜单尚未生效；保留在登记表与检验计数中，不作为规则依据"}
+{"id": "H-20261022-sentiment-8d66f0", "time": "2026-10-23 11:58:30+0800", "menu_violation": true, "features": ["ret_3", "vol_z20"], "note": "登记时角色特征菜单尚未生效；保留在登记表与检验计数中，不作为规则依据"}
+{"id": "H-20261022-sentiment-5ee9f6", "time": "2026-10-23 11:58:30+0800", "menu_violation": true, "features": ["dist_ma20", "ret_5"], "note": "登记时角色特征菜单尚未生效；保留在登记表与检验计数中，不作为规则依据"}
+{"id": "H-20261022-sentiment-cfec4c", "time": "2026-10-23 11:58:30+0800", "menu_violation": true, "features": ["range_pct", "ret_1"], "note": "登记时角色特征菜单尚未生效；保留在登记表与检验计数中，不作为规则依据"}
+{"id": "H-20261022-news-e144e2", "time": "2026-10-23 11:58:30+0800", "menu_violation": true, "features": ["dow", "ret_3", "rsi_14"], "note": "登记时角色特征菜单尚未生效；保留在登记表与检验计数中，不作为规则依据"}
+{"id": "H-20261022-news-3d967d", "time": "2026-10-23 11:58:30+0800", "menu_violation": true, "features": ["dist_ma20", "ret_5"], "note": "登记时角色特征菜单尚未生效；保留在登记表与检验计数中，不作为规则依据"}
+{"id": "H-20261022-news-28e221", "time": "2026-10-23 11:58:30+0800", "menu_violation": true, "features": ["atr_pct", "ret_1"], "note": "登记时角色特征菜单尚未生效；保留在登记表与检验计数中，不作为规则依据"}

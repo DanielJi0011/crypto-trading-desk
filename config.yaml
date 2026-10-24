@@ -1,0 +1,270 @@
+# ============================================================
+# ta-desk：基于 TradingAgents v0.7.0 的多智能体加密货币交易台 —— 配置
+# 所有密钥只从环境变量读取，本文件不得写入任何密钥。
+# ============================================================
+
+# 运行模式：paper（纸面，默认）| live（实盘：还需 state/LIVE_APPROVED 文件，见 README；当前禁止）
+mode: paper                             # 保留：旧纸面仓与 assert_paper 守卫用；实盘永远禁止
+
+# ---------------- 执行场所：OKX 官方模拟盘直连（desk/demo_exec.py + desk/okx_demo.py）。禁止实盘：
+# 只用 OKX_DEMO_* 密钥、每个请求强制 x-simulated-trading: 1、启动自检失败即拒单；事件记 state/ledger/demo_events.jsonl。
+# venue: paper 可切回旧的本地纸面流程（本地账本 + 本地 pending + desk.monitor 盯盘）。
+execution:
+  venue: okx_demo                       # okx_demo | paper
+  equity_basis: live                    # R4：护栏与定仓一律用模拟盘实时 USDT 权益（live）；initial 已停用（读不到实时权益即拒绝开仓）
+                                        # 仓位%、单笔保证金 20%、总名义 180%、当日亏损 5% 的分母都用它（金额=基准×百分比，不写死）
+  trigger_px_type: last                 # 条件单触发价类型 last | mark | index
+  cancel_pending_on_new_decision: true  # 新决策不支持入场/改为现价/已有持仓时，撤该币旧条件单（原规则）
+  protected_algo_ids: []                # Q6（2026-10-22 用户决定）：移除已成交的 4026779985963827200（只改本地登记，交易所未动）。受保护单不被新决策替换/撤销/过期撤单，但 KILL/HALT/日亏/回撤停机时照撤（R10）
+  stop_coverage_auto_replace: false     # R11：持仓止损缺失或张数不足（连续 2 轮确认）时是否自动重挂；false=只告警（stop_coverage_missing）。演练③经用户确认后再改 true
+  # 条件入场单触发后改挂限价（desk/demo_exec.place_trigger + desk/entry_limit.py；现价入场 open_now 仍是市价，不受影响）
+  entry_limit:
+    enabled: true                       # 开关：true=条件单触发后按限价挂单；false=与原来完全一样，orderPx=-1（触发后市价成交）
+    offset_pct: 0.1                     # 限价偏移（百分比，0.1 即 0.1%）：做多限价=触发价×(1-偏移)，做空限价=触发价×(1+偏移)，按合约 tickSz 四舍五入取整
+    timeout_minutes: 3                  # 从触发时刻起超过这么多分钟限价子单仍未完全成交 → 撤掉子单（demo_watch 每轮检查）
+    ws_check_secs: 20                   # R6b：demo_ws 常驻进程每隔这么多秒检查一次限价入场超时（只在有已触发未完结的限价单时调用，与 demo_watch 共用每币执行锁）；0=关闭，只靠 demo_watch 轮询；改动需重启 demo_ws 生效
+    fallback_market: true               # 撤单后剩余数量是否用市价补单（同方向、带原止损止盈；补单前过 KILL/当日亏损护栏）；false=只撤单并保护已成交部分
+
+llm:
+  provider: deepseek                    # TradingAgents 内置 provider（OpenAI 兼容，含 DeepSeek 思考模式适配）
+  base_url_env: TA_LLM_BASE_URL         # 未设置时用 default_base_url
+  default_base_url: https://api.deepseek.com
+  api_key_env: TA_LLM_API_KEY           # 未设置时依次尝试 fallback_key_envs
+  fallback_key_envs: [DEEPSEEK_API_KEY]
+  deep_model: deepseek-flash            # 研究经理 / 投资组合经理 / 交易经理 / 复盘会 / 手册修订
+  quick_model: deepseek-flash           # 分析师 / 多空研究员 / 交易员 / 风控三人 / 立场抽取 / 反思
+  # 可用环境变量覆盖：TA_DEEP_MODEL / TA_QUICK_MODEL
+  output_language: Chinese
+  max_debate_rounds: 1
+  max_risk_discuss_rounds: 1
+  max_tool_rounds: 8
+  temperature: null
+  max_retries: 3
+  # LLM 可重试错误（503/502/500/504/429、超时、连接错误）的退避间隔（秒），依次重试；全部失败才算该角色失败并在日报标出
+  retry_delays: [5, 15, 30, 60]
+  # 价格（USD / 百万 tokens），用于成本估算；peak 时段（UTC 周一至周五 01-04、06-10 点）按 peak 计
+  pricing:
+    deepseek-flash:   {input_miss: 0.30, input_hit: 0.006, output: 1.20, offpeak_factor: 0.5}
+    deepseek-v4-pro:  {input_miss: 1.32, input_hit: 0.044, output: 3.96, offpeak_factor: 0.5}
+    # 中转（Grok/GPT）价格未知：先记 0，日报按模型列出 token 数；知道价格后在此补上
+    relay-unknown:    {input_miss: 0, input_hit: 0, output: 0, offpeak_factor: 1.0}
+    default:          {input_miss: 1.32, input_hit: 0.044, output: 3.96, offpeak_factor: 1.0}
+  # 旧别名：deepseek-chat / deepseek-reasoner 目前都由 deepseek-flash 提供服务（API 返回的 model 字段为 deepseek-flash）
+  usd_cny: 7.2
+  model_aliases: {deepseek-chat: deepseek-flash, deepseek-reasoner: deepseek-flash}
+
+# ---------------- 多模型：每个角色用哪家/哪个模型（缺密钥或中转地址时自动回退 DeepSeek，并在日报注明）
+providers:
+  deepseek: {kind: deepseek}                                   # 使用上面 llm 段的地址与密钥
+  grok:     {kind: relay, base_url_env: RELAY_BASE_URL, default_base_url: "https://<LLM_RELAY_HOST>/v1", key_env: XAI_API_KEY}
+  gpt:      {kind: relay, base_url_env: RELAY_BASE_URL, default_base_url: "https://<LLM_RELAY_HOST>/v1", key_env: OPENAI_API_KEY}
+
+# tier = 回退到 DeepSeek 时用 deep 还是 quick 模型
+role_models:   # 用户要求：只用三家旗舰 grok-4.7 / gpt-6.1-sol / deepseek-flash（用户所说 deepseek-4.1-flash 在 API 中的 id）
+  market:            {provider: deepseek, model: deepseek-flash, tier: quick}      # 工具调用多、上下文长 → 价格明确的 DeepSeek
+  sentiment:         {provider: grok, model: grok-4.7, tier: quick}
+  news:              {provider: deepseek, model: deepseek-flash, tier: quick}   # GPT 暂不稳定，2026-10-20 临时改用 DeepSeek
+  flows:             {provider: deepseek, model: deepseek-flash, tier: quick}
+  bull:              {provider: grok, model: grok-4.7, tier: quick}                # 多空两方用不同厂商，避免同源偏见
+  bear:              {provider: deepseek, model: deepseek-flash, tier: quick}   # GPT 暂不稳定，2026-10-20 临时改用 DeepSeek
+  research_manager:  {provider: deepseek, model: deepseek-flash, tier: deep}
+  trader:            {provider: deepseek, model: deepseek-flash, tier: quick}
+  aggressive:        {provider: grok, model: grok-4.7, tier: quick}
+  conservative:      {provider: deepseek, model: deepseek-flash, tier: quick}   # GPT 暂不稳定，2026-10-20 临时改用 DeepSeek
+  neutral:           {provider: deepseek, model: deepseek-flash, tier: quick}
+  portfolio_manager: {provider: deepseek, model: deepseek-flash, tier: deep}   # GPT 暂不稳定，2026-10-20 临时改用 DeepSeek
+  trade_manager:     {provider: grok, model: grok-4.7, tier: deep}
+  reviewer:          {provider: deepseek, model: deepseek-flash, tier: deep}       # 复盘会 / 手册修订
+  extractor:         {provider: deepseek, model: deepseek-flash, tier: quick}
+  # TradingAgents 内部其余调用（记忆反思等）仍走 llm 段的 deepseek 深/快模型
+
+coins:                                  # TradingAgents 代码 -> OKX USDT 永续（纸面）
+  - {ticker: BTC-USD, inst_id: BTC-USDT-SWAP, name: 比特币}
+  - {ticker: ETH-USD, inst_id: ETH-USDT-SWAP, name: 以太坊}
+  - {ticker: SOL-USD, inst_id: SOL-USDT-SWAP, name: Solana}
+
+analysts: [market, social, news]        # 加密货币不使用 fundamentals（Yahoo 公司财报对币无意义）
+
+# ---------------- FRED 宏观数据（desk/macro.py）：只注入新闻分析师（news）日常讨论输入 + 日报小节；
+# 不影响每周自研 research.role_features。密钥只从环境变量 FRED_API_KEY（state/secrets.env）读取。按日缓存 state/macro_cache.json。
+macro:
+  enabled: true
+  fred_series:
+    - {id: DGS10, name: 10年美债收益率, unit: "%"}
+    - {id: DGS2, name: 2年美债收益率, unit: "%"}
+    - {id: DFF, name: 联邦基金有效利率, unit: "%"}
+    - {id: DTWEXBGS, name: 广义美元指数, unit: ""}
+    - {id: T10YIE, name: 10年盈亏平衡通胀, unit: "%"}
+    - {id: CPIAUCSL, name: CPI, unit: "", yoy: true}   # 月度，给同比
+    - {id: VIXCLS, name: VIX, unit: ""}
+
+schedule:
+  run_time: "08:00"                     # 未使用：代码不读取；实际由例行任务 08:05 触发 run_daily.sh，运行窗口 07:55~12:00 写在 run_daily.sh
+  timezone: Asia/Shanghai
+
+data:
+  okx_base_url: https://www.okx.com
+  daily_bar: 1Dutc                      # UTC 日线（北京时间 08:00 收盘）
+  history_days: 420                     # 指标（200 日均线等）需要的历史长度
+  intraday_bar: 1H                      # 未使用：代码不读取（旧纸面盯市实际用 1H 写死在代码里）
+  yahoo_fallback: true                  # OKX 失败时回退到 TradingAgents 默认的 Yahoo（BTC-USD 等）
+
+paper:
+  initial_equity_usdt: 1000             # 仅旧纸面账本（BTC/ETH 两个旧仓）；新流程仓位基准见 execution.equity_basis
+  fee_rate: 0.001                       # 未使用：代码不读取，纸面账本与对照组用 swap.fee_rate
+  slippage_bp: 5                        # 每边 5bp
+
+# 永续合约纸面模拟（逐仓，多空双向；不含实盘下单代码）
+swap:
+  leverage_max: 1                       # Q11（2026-10-22 用户决定）：新开仓杠杆上限 1 倍（10-21 曾批准 5 倍）。实际上限 = min(本项, guardrails.leverage)，allow_leverage=false 时夹到 1；现有持仓不动
+  fee_rate: 0.0005                      # taker 每边 0.05%
+  maint_margin_rate: 0.005              # 维持保证金率（近似，用于强平价）
+  funding_fallback_rate: 0.0001         # 取不到 OKX 资金费率时的常数（每 8h）
+
+# 硬护栏（代码强制，复用 /workspace/ai-trader/guardrails.py）
+guardrails:
+  max_position_pct: 20                  # 单笔保证金 ≤ 权益 20%
+  max_total_exposure_pct: 60            # 旧口径 60% × leverage_max；实际以下一行 max_total_notional_pct 为准
+  max_total_notional_pct: 180           # 显式保持总名义 ≤ 权益 180%（不随 leverage_max 变化，5 倍时仍为 180%）
+  require_stop_loss: true               # 每笔开仓必须有止损
+  max_stop_loss_pct: 15                 # 止损距入场价 ≤ 15%（日线级别）
+  max_daily_loss_pct: 2.5               # 当日已实现亏损 ≥ 权益 2.5% 后禁止开仓（旧口径附加检查，读取失败即拒绝；2026-10-22 用户决定由 5 改为 2.5；主检查见 risk.max_daily_loss_pct）
+  max_orders_per_day: 0                 # 每日开仓/挂单数上限；0 = 不限（2026-10-23 用户取消该上限，其他护栏不变）
+  max_open_positions: 3
+  leverage: 1                           # 新开仓杠杆上限（desk/config_safety.max_open_leverage 读取并执行）
+  allow_leverage: false                 # false = 新开仓只允许 1 倍；与 leverage>1 同时出现时启动报错
+  allow_withdrawal: false
+  min_order_usd: 10
+  allowed_ord_types: [market, limit]    # 普通单 /trade/order 只允许这些 ordType（okx_demo.post 强制）；条件单走 /trade/order-algo 不受此项约束
+  # 紧急停止（R7，路径为代码常量 settings.KILL_PATH / HALT_PATH，不再可配置）：
+  #   state/KILL 存在 = 停开仓（禁止现价单/条件单/限价补单，撤开仓类条件单；允许平仓、减仓、收紧止损、到期平仓；run_daily 跳过全部 LLM）
+  #   state/HALT 存在 = 全冻结（除读取与通知外禁止一切自动写操作；交易所端已挂止损止盈不动）
+  #   旧路径 state/ledger/KILL 过渡期内仍视为生效，日志提示迁移
+
+# 风控（整改任务书 R5 第一批；单位为小数，0.025 即 2.5%）
+risk:
+  risk_per_trade_pct: 0.0075            # 单笔止损亏损上限 = 0.75%×权益基准（2026-10-22 用户决定）；超出时先削减张数（size_clipped），check_open 兜底拒绝。完整按风险定仓见 R1（第二批）
+  max_daily_loss_pct: 0.025             # 实时总权益（含浮亏）较北京时间日初下跌 ≥2.5% → 当日停开新仓并撤入场类挂单（R10），webhook daily_loss_halt；次日自动解除
+  max_drawdown_pct: 0.10                # 实时总权益较历史峰值回撤 ≥10% → 自动写 KILL（state/KILL），webhook drawdown_kill；只能人工删除 KILL 解除
+                                        # 日初与峰值记录在 state/equity_marks.json；权益或该文件读取失败 → 拒绝开仓（guard_data_unavailable）
+  # 第二批 R1–R4：按风险定仓（desk/sizing.py）。权益一律用模拟盘实时权益
+  max_notional_per_trade_pct: 1.0       # R1 单笔名义上限 = 100%×权益
+  max_margin_pct: 0.20                  # R1 单笔保证金上限 = 20%×权益；超出时先提杠杆（不超过新开仓杠杆上限），仍不够则削减名义
+  stop_atr_mult: 1.5                    # R2 止损距离 = 1.5×ATR14（日线已收盘 K 线）/入场价
+  stop_min_pct: 0.01                    # R2 止损距离下限 1%
+  stop_max_pct: 0.08                    # R2 止损距离上限 8%；也用于无止损挂单的风险估算
+  tp_r_multiple: 2.0                    # R2 止盈 = 入场 ± 2×止损距离
+  liq_buffer_atr_mult: 1.0              # R3 强平价与止损之间至少 1×ATR14，不满足逐级降杠杆，1 倍仍不满足拒绝（liq_buffer_reject）
+  max_open_risk_pct: 0.02               # R4 所有持仓+挂单+在途子单的止损风险合计 ≤ 2%×权益
+  max_net_directional_pct: 1.2          # R4 同向净名义 ≤ 120%×权益
+  cost_buffer_pct: 0.002                # R1 止损距离额外加 0.2% 手续费与滑点缓冲
+  max_price_drift_atr: 0.5              # D1 第 3 点：执行前最新价偏离分析价 > 0.5×ATR14 → 不执行（price_drift_skip）
+  max_daily_bar_age_days: 2             # D1 第 2 点：最近一根已收盘日线（UTC）距今超过 2 天视为过期，不开仓（data_stale_no_trade）
+  stop_cooldown_hours: 24               # L6：同币某方向被止损后 24 小时内同向不开仓、不挂新条件单（cooldown_blocked）；反向不限；0=关闭
+  plan_conflict_pct: 0.20               # R2 入场方案组得分差距小于 20% 视为冲突，不开仓（plan_conflict）
+
+# 条件入场单参数（venue=okx_demo 时条件单挂在模拟盘；demo_watch 用 rediscuss_* 与有效期；desk.monitor 只管旧纸面仓）
+pending:
+  mode: auto                            # 仅旧纸面盯盘有效，模拟盘无效；auto=触发即纸面成交；confirm=触发/接近时再问交易经理确认
+  bar: 1m                               # 检查触发用的 OKX K线周期
+  mark_bar: 5m                          # 盘中止损/止盈/强平盯市用的 K线周期
+  near_pct: 0.3                         # confirm 模式：价格进入触发价 0.3% 以内即请求确认
+  default_expire_hours: 24
+  immediate_band_pct: 0.3               # 聚合入场价距现价 ≤0.3% 视为现价成交
+  rediscuss_after_stop: true            # 监控中止损后，后台对该币跑一次全角色讨论设定下次入场
+  rediscuss_cooldown_hours: 6
+
+manager:
+  # 加权共识分 S ∈ [-1,1]：S = Σ w_i·方向_i·置信度_i / Σ w_i
+  min_consensus_to_buy: 0.0             # 未使用：代码不读取（旧键，已由 consensus_threshold 取代）
+  consensus_threshold: 0.1              # S > 0.1 做多，S < −0.1 做空，之间不交易
+  min_valid_voters: 6                   # L3：有效票（排除抽取失败/无发言/数据缺失）少于 6 个时不交易（有效票不足）
+  half_size_below: 0.3                  # |S| < 0.3 时仓位减半
+  full_size_consensus: 0.6              # |S| ≥ 0.6 时用满仓位上限（保证金 % 权益）
+  max_size_pct: 20                      # 交易经理建议仓位的上限（再受护栏约束）
+  allow_stop_widen: false               # 已有持仓只允许上移止损，不允许放宽
+  tp_min_gap_pct: 0.3                   # 交易经理 new_tp：新止盈须在现价盈利一侧且距现价至少 0.3%，避免改完立即触发（可调近可调远）
+
+# L4 数据质量：输入数据缺失的角色记 data_missing，不进共识也不打分
+alerts:                                 # O2 链路告警（由 scripts/healthcheck.py 每 10 分钟调用 desk/chain_health.py）
+  daily_missing_after: "09:30"          # 北京时间该时刻后仍无今日完成标记 → daily_missing（每天一次）
+  heartbeat_hours: 0                    # 存活心跳间隔（小时）；0 = 关闭。默认关：外部无人值守接收方，心跳只会制造噪音，且主机整体宕机时本机发不出任何消息，真正的离机存活检测需要外部服务轮询，见风险登记表
+sessions:                               # 每日两场（desk/sessions.py）；日期一律按北京日期
+  morning:                              # 早场：沿用原 O1 窗口
+    tz: Asia/Shanghai                   # 早场按北京时间定义
+    start: "08:00"                      # 开场时刻（当地时间）
+    window: ["07:55", "12:00"]          # 允许运行的窗口（当地时间），窗口外退出
+    missing_after_minutes: 90           # 仅说明用；早场缺失告警仍由 alerts.daily_missing_after 控制
+  evening:                              # 晚场盘中复盘（2026-10-23 用户批准），流程与早场完全相同
+    tz: America/New_York                # 按纽约时间定义，随美国夏令时自动切换（夏令时=北京 20:30，冬令时=北京 21:30）
+    start: "08:30"                      # 开场时刻（纽约时间）；例行任务用 CRON_TZ=America/New_York 30 8 * * *
+    window: ["08:25", "10:30"]          # 允许运行的窗口（纽约时间）
+    missing_after_minutes: 60           # 开场后 60 分钟仍无 state/daily_done/<日期>-evening → evening_missing 告警（每天一次）
+offsite:                                # 离机备份与心跳（2026-10-23 用户批准接到 <BACKUP_HOST>，见 desk/offsite.py）
+  enabled: true                         # run_daily 成功并本机备份后，用 sftp 上传备份包；失败只告警（offsite_backup_failed），不影响日报
+  sftp_host: <BACKUP_HOST>              # 离机备份主机
+  sftp_port: 22                         # sftp 端口
+  sftp_user: ta-backup                  # sftp 用户名
+  sftp_dir: /uploads                    # 远端上传目录；远端自动删除 30 天前文件
+  sftp_key: state/keys/ta_backup_ed25519      # 私钥路径（600 权限，不入库、不备份、不打印）
+  known_hosts: state/keys/known_hosts_154     # 已固定的主机指纹，严格校验
+  heartbeat_enabled: true               # 离机心跳：demo_watch 每轮（约 5 分钟）POST 一次，期望 204；失败记 offsite_heartbeat_failed，1 小时最多告警一次
+  heartbeat_minutes: 5                  # 心跳最小间隔（分钟）
+  heartbeat_url_file: /home/box/.ta-desk/heartbeat_url   # 心跳 URL 文件（含令牌，600 权限，不打印、不记日志、不入库）
+  heartbeat_url_fallback: state/keys/heartbeat_url   # 主路径缺失时读这份备用（同样不打印、不入库、不备份）
+baselines:                              # B1 对照组：纸面记账，不调用模型、不下单，每日 run_daily 末尾更新
+  enabled: true                         # 关闭后不再更新对照组
+  initial_equity_usdt: 10000            # 每个对照组独立的纸面初始资金
+  seed: 20261023                        # 随机方向组的固定种子（与日期、币种一起决定当日方向）
+  leave_one_out: true                   # 是否额外记录逐个剔除一个角色的消融组
+data_quality:
+  sentiment_requires_x_feed: true       # X 讨论摘录缺失时情绪分析师记 data_missing（同时每天告警一次 x_feed_missing）
+  flows_missing_ratio: 0.5              # 资金流采集项失败比例 ≥50% 时资金流分析师记 data_missing
+
+scoring:
+  horizon_days: 5                       # 每条角色观点在 N 天后打分（与 TradingAgents holding_period_days 一致）
+  neutral_band_pct: 2.0                 # |收益| < 2% 记为"震荡"，观望类观点判为命中
+  regime_lookback_days: 20
+  regime_threshold_pct: 5.0             # 20 日涨跌 > +5% 上升 / < −5% 下降 / 其余震荡
+  # 第三批 L2：打分 v2（每条观点按自己的周期 1~30 天；中性带宽 0.5×ATR14%×√周期，ATR 不可得时用 neutral_band_pct）
+  n0: 30                                # 收缩权重的先验样本数：w = w0·clip(exp(k·Σskill/(n+n0)), 0.5, 2)，n 按"角色×交易日"计
+  k: 4                                  # 收缩权重的灵敏度
+
+learning:                               # 防过拟合规则
+  min_scored_before_edit: 20            # 角色累计 ≥20 条已打分决策才允许改手册
+  max_changes_per_edit: 2               # 每次修订最多 1～2 处改动
+  eval_window_after_edit: 20            # 修订后观察 20 条
+  rollback_if_worse_pp: 5.0             # 修订后命中率比修订前低 5 个百分点以上 → 自动回滚
+  weight_window: 40                     # 权重按最近 40 条已打分决策计算
+  weight_min_scored: 20
+  weight_eta: 4.0                       # w ∝ exp(eta·(命中率−0.5))
+  weight_clip: [0.5, 2.0]
+  # 学习冻结（整改任务书 L1 开关部分，2026-10-22 用户决定）：恢复条件见任务书 Q8，未经用户确认不得改为 true
+  apply_weights: false                  # false=update_weights 只写 state/weights_shadow.json（影子权重），决策用初始权重
+  auto_edit_playbooks: false            # false=不做手册修订与回滚评估（不调用 LLM、不切换版本）
+  research_write_playbook: false        # false=每周自研通过的规则只写 research/candidates.jsonl，不写手册
+  # 第三批 L1（默认值保持冻结，不改变当前运行行为）
+  ta_memory_inject: false               # false=关闭 TradingAgents 内置记忆：不结算旧决策（不调用反思 LLM），不向组合经理注入 past_context
+  playbook_proposals: false             # true=冻结期间仍让交易经理审阅打分并把修订建议写到 playbooks/<角色>/proposals/（会调用 LLM，不生效）；false=完全不审阅
+
+# ---------------- 每周自研：分析师提出假设 → 预注册 → OKX 历史样本内/样本外检验 → 通过才写入手册
+research:
+  enabled: true
+  weekday: 6                     # 0=周一 … 6=周日（北京时间）
+  roles: [market, sentiment, news, flows]
+  max_hypotheses_per_role: 3     # 每角色每周最多提出
+  role_features:                 # 每角色只能用自己的特征；含越权特征的假设在检验前整条拒绝（记入 research/rejected.jsonl，不计检验数）
+    market: [ret_1, ret_3, ret_5, ret_20, dist_ma20, dist_ma50, atr_pct, range_pct, btc_ret_5, dow]
+    sentiment: [rsi_14, dd_high20, up_high20]
+    news: [vol_z20]
+    flows: [vol_z20, ret_1, vol_dir]   # vol_dir = vol_z20 × sign(ret_1)
+  history_bars: 1500             # 日线根数（约 4 年）
+  oos_frac: 0.3                  # 最后 30% 时间为样本外
+  fee: 0.001                     # 单边
+  alpha: 0.05                    # 族错误率；确认期样本内门槛 = Bonferroni（全局累计已检验假设数）
+  phase: explore                 # 研究阶段：explore=每周探索，按单次名义门槛，通过只进候选；confirm=季度确认，Bonferroni 全局计数，通过才算通过
+  min_trades_is: 40
+  min_trades_oos: 15
+  min_t_oos: 1.65                # 样本外超额收益 t 值门槛（单侧约 5%）
+  cost_cap_usd: 0.50             # 每周研究的 LLM 成本上限（按已知价格估算）
+  token_cap: 400000              # 每周研究 token 上限（中转价格未知时也能封顶）
