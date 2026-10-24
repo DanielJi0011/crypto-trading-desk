@@ -1,0 +1,16 @@
+.git
+**/.git
+state/
+reports/
+logs/
+backups/
+.venv/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+secrets.env
+*.env
+.env*
+!secrets.env.example
+state/keys/
+*.log

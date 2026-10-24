@@ -1,0 +1,7 @@
+# supercronic 定时表（容器 TZ=Asia/Shanghai，按北京时间解释）
+# 早场：北京 08:05，与生产例行任务一致
+5 8 * * * cd /workspace/ta-desk && bash run_daily.sh
+# 晚场：生产按纽约时间 08:30（北京夏令时 20:30 / 冬令时 21:30）。
+# 这里两个时刻都触发，由 run_daily.sh 的窗口判断（纽约 08:25 到 10:30）和完成标记保证每天只跑一次：
+#   夏令时 20:30 进入窗口并运行，21:30 因已完成退出；冬令时 20:30 在窗口外退出，21:30 运行。
+30 20,21 * * * cd /workspace/ta-desk && bash run_daily.sh --session evening

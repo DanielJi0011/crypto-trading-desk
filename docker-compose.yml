@@ -1,0 +1,30 @@
+# 只连 OKX 模拟盘。密钥从挂载的 state/secrets.env 读取（env_file），不打进镜像；不要设置任何 OKX_API_* 实盘变量。
+x-desk: &desk
+  build: .
+  image: ta-desk:latest
+  env_file:
+    - ./state/secrets.env
+  environment:
+    TZ: Asia/Shanghai
+  volumes:
+    - ./state:/workspace/ta-desk/state
+    - ./reports:/workspace/ta-desk/reports
+    - ./logs:/workspace/ta-desk/logs
+    - ./config.yaml:/workspace/ta-desk/config.yaml:ro
+    # 外部依赖 ai-trader（store / guardrails / okx_client / backtest，不在本仓库），只读挂载；路径可用 AI_TRADER_DIR 覆盖
+    - ${AI_TRADER_DIR:-../ai-trader}:/workspace/ai-trader:ro
+  restart: unless-stopped
+
+services:
+  demo_ws:        # 模拟盘 WebSocket 常驻监听（只监听不下单）
+    <<: *desk
+    command: ["bash", "run_demo_ws.sh"]
+  demo_watch:     # 模拟盘轮询（条件单到期/成交、持有期到期、止损→再讨论），与生产相同 --loop 300
+    <<: *desk
+    command: ["bash", "run_demo_watch.sh", "--loop", "300"]
+  healthcheck:    # 每 10 分钟纯脚本健康检查（不调用 LLM）
+    <<: *desk
+    command: ["bash", "scripts/healthcheck_loop.sh"]
+  scheduler:      # 早场 08:05、晚场（纽约 08:30）定时运行 run_daily.sh
+    <<: *desk
+    command: ["supercronic", "/workspace/ta-desk/docker/crontab"]

@@ -153,3 +153,64 @@ pgrep -af desk.demo_ws; cat state/demo_ws_heartbeat; tail -f logs/demo-ws-$(date
 - 密钥与心跳 URL 不入库，参考 `secrets.env.example`。
 
 克隆后请执行 `git submodule update --init` 拉取 `vendor/TradingAgents`。
+
+## 运行环境
+
+> ⚠️ 本项目**只连 OKX 模拟盘**（Demo Trading，`OKX_DEMO_*` 密钥 + `x-simulated-trading: 1`），绝不实盘。不要配置任何 `OKX_API_*` 等实盘变量，入口脚本也会主动清除这类变量。
+
+### 当前生产环境
+
+- 系统：Debian GNU/Linux 13 (trixie)
+- Python：3.13.5（仓库内 `.venv`）
+- 主要依赖：TradingAgents（`vendor/TradingAgents` 子模块，可编辑安装）、langgraph / langchain-core / langchain-openai / langchain-anthropic / langchain-google-genai、openai、anthropic、pandas、numpy、yfinance、stockstats、requests、websockets、PyYAML、pydantic、pytest。完整锁定版本见 `requirements.txt`（由生产 `.venv` 的 `pip freeze` 生成）。
+- 常驻进程：`run_demo_ws.sh`（模拟盘 WS 监听）、`run_demo_watch.sh --loop 300`（模拟盘轮询）、`scripts/healthcheck_loop.sh`（每 10 分钟健康检查）。
+- 早晚场触发：生产里由外部助手的例行任务定时调用。早场在北京时间 08:05 执行 `bash run_daily.sh`；晚场在纽约时间 08:30 执行 `bash run_daily.sh --session evening`（北京时间夏令时 20:30，冬令时 21:30）。
+- **早晚报摘要（以及抓取 X 舆情到 `state/x_feed/`）是外部助手完成的，不属于本仓库。Docker 里只跑交易台本身**：常驻服务和定时的 `run_daily.sh`。没有 x_feed 时，日流程按缺省情况处理。
+
+### 外部依赖 ai-trader（必需，不在本仓库）
+
+`desk/settings.py` 和 `desk/tools.py` 会从 `AI_TRADER_SRC`（默认 `/workspace/ai-trader`）导入 `store`、`guardrails`、`okx_client`、`backtest` 四个模块，这部分代码不在本仓库。原生运行时请把它放在 `/workspace/ai-trader`，或设置环境变量 `AI_TRADER_SRC`。Docker 下默认把同级目录 `../ai-trader` 只读挂载进容器，可用 `AI_TRADER_DIR` 覆盖。账本写在 ta-desk 自己的 `state/ledger`，不写 ai-trader 的目录。
+
+### 推荐：Docker
+
+- Windows：安装 Docker Desktop（基于 WSL2 后端）
+- macOS：安装 Docker Desktop
+- Linux：安装 Docker Engine 和 Compose 插件
+- 也可以在 Linux 或 macOS 上原生运行：用 Python 3.13 建 `.venv`，执行 `pip install -r requirements.txt && pip install --no-deps -e vendor/TradingAgents`
+
+### 从零开始的完整步骤
+
+```bash
+# 1. 克隆并拉取子模块
+git clone https://github.com/DanielJi0011/ta-desk.git
+cd ta-desk
+git submodule update --init
+
+# 2. 准备数据目录和密钥（只填模拟盘密钥 OKX_DEMO_*，以及 LLM、通知 webhook 等）
+mkdir -p state reports logs
+cp secrets.env.example state/secrets.env
+chmod 600 state/secrets.env
+# 编辑 state/secrets.env
+
+# 3. 填占位符：编辑 config.yaml
+#    <LLM_RELAY_HOST> 改成你的 LLM 中转站（或在 secrets.env 里设 RELAY_BASE_URL）
+#    <BACKUP_HOST> 改成离机备份主机（不用离机备份就关掉 offsite）
+#    heartbeat_url_file 等绝对路径按你的环境调整
+
+# 4. 准备 ai-trader 代码（放在 ../ai-trader，或 export AI_TRADER_DIR=/path/to/ai-trader）
+
+# 5. 构建并启动
+docker compose build
+docker compose up -d
+docker compose ps
+docker compose logs -f demo_ws
+```
+
+- `docker-compose.yml` 包含 4 个服务：`demo_ws`、`demo_watch`、`healthcheck`、`scheduler`。前三个是常驻服务，`scheduler` 用 supercronic 按 `docker/crontab` 定时运行早晚场。所有服务都设了 `restart: unless-stopped`，`TZ=Asia/Shanghai`。
+- `state/`、`reports/`、`logs/` 以卷的形式挂载到宿主机。密钥通过 `env_file: ./state/secrets.env` 注入，`.dockerignore` 已排除 state、reports、logs、.venv 和各类 secrets，密钥不会打进镜像。
+- 容器里跑测试：`docker compose run --rm --no-deps -e TA_NOTIFY_DISABLED=1 demo_ws .venv/bin/python -m pytest -q`（测试使用临时数据目录，不发 webhook）。
+- 手动补跑（窗口外需要显式设置）：`docker compose run --rm -e TA_DAILY_IGNORE_WINDOW=1 scheduler bash run_daily.sh`
+
+### 入口脚本返回码
+
+`run_daily.sh`：0 = 完成，或正常跳过（已在运行、已完成、不在窗口内）；5 = Python 解释器缺失；6 = 窗口判断调用失败。5 和 6 都会经通知 webhook 发中文告警；通道不可用时，至少写入日志和 stderr。其余非 0 值为日流程本身的返回码。
