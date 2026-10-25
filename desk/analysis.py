@@ -85,6 +85,53 @@ def position_brief(book: dict, inst_id: str) -> str:
     return head + ("\n".join(L) if L else "- 无持仓")
 
 
+PENDING_HEAD = "## 当前挂着的条件单"
+PENDING_NOTE = ("（以下是已挂出、尚未成交的条件入场单。不要重复提出相同价位的条件单；"
+                "若认为需要改价/撤单，请在决策中说明——新决策会按现行逻辑撤旧单。）")
+
+
+def _fmt_trigger(t: dict, meta: dict) -> str:
+    inst = t.get("instId") or t.get("inst_id") or meta.get("inst_id")
+    side = meta.get("side") or t.get("side")
+    if side in ("buy", "sell"):
+        ps = t.get("posSide")
+        side = ps if ps in ("long", "short") else ("long" if side == "buy" else "short")
+    sd = {"long": "做多", "short": "做空"}.get(side, str(side or "?"))
+    px = t.get("triggerPx") or t.get("trigger_px") or meta.get("trigger_px")
+    sz = t.get("sz") or meta.get("sz") or t.get("contracts")
+    sl = tp = None
+    for a in t.get("attachAlgoOrds") or []:
+        sl = sl or a.get("slTriggerPx"); tp = tp or a.get("tpTriggerPx")
+    sl = sl or t.get("slTriggerPx") or t.get("stop_loss") or meta.get("stop_loss")
+    tp = tp or t.get("tpTriggerPx") or t.get("take_profit") or meta.get("take_profit")
+    exp = t.get("expires") or meta.get("expires")
+    return (f"- {inst}：{sd}，触发价 {px}" + (f"，张数 {sz}" if sz not in (None, "") else "")
+            + f"，止损 {sl or '无'}，止盈 {tp or '无'}，到期 {exp or '未知'}")
+
+
+def pending_brief(book: dict) -> str:
+    """当前挂着的条件入场单（只读信息）。来源：模拟盘 book["triggers"]（= OKX orders-algo-pending ordType=trigger，
+    由 demo_exec.book 拉取），用登记表 state/ledger/demo_orders.json 的 triggers[algoId] 补到期等元数据；
+    纸面模式 book 无 triggers 键时读 state/ledger/pending_entries.json。任何失败降级为"挂单信息不可用"。"""
+    try:
+        if "triggers" in book:
+            from desk import demo_exec
+            try:
+                regt = demo_exec.reg().get("triggers", {})
+            except Exception:
+                regt = {}
+            items = [(t, regt.get(str(t.get("algoId")), {})) for t in (book.get("triggers") or [])]
+        else:
+            from desk import pending
+            items = [({**o, "inst_id": o.get("inst_id") or k}, {}) for k, o in (pending.load() or {}).items()
+                     if isinstance(o, dict) and o.get("status", "pending") == "pending"]
+        L = [_fmt_trigger(t, m) for t, m in items]
+        return PENDING_HEAD + PENDING_NOTE + "\n" + ("\n".join(L) if L else "- 无")
+    except Exception as e:
+        log.warning("读取挂单失败：%s", type(e).__name__)
+        return PENDING_HEAD + "\n- 挂单信息不可用"
+
+
 def x_feed(ccy: str, trade_date: str) -> str:
     """X（推特）讨论：盒子上没有用户凭据无法直接搜索 X；由 Grok Bot 例行任务预先写入
     state/x_feed/<日期>/<币>.md（可选）。没有则返回空，情绪分析师仍有 Reddit/StockTwits。"""
@@ -116,7 +163,14 @@ def analyze(cfg, coin: dict, trade_date: str, book: dict, tracker, extra_brief: 
     from desk import flows, tools, untrusted
     tools._AS_OF["date"] = trade_date
     ccy = coin["inst_id"].split("-")[0]
-    fl = flows.analyze(cfg, ccy, tracker) if "flows" in cfg.get("desk_analysts", ["flows"]) else {"report": "", "data": ""}
+    shared = position_brief(book, coin["inst_id"]) + "\n\n" + pending_brief(book)   # 所有角色共享：持仓 + 已挂条件单
+    if extra_brief:
+        shared = (shared + "\n\n" + extra_brief).strip()
+    roles.set_briefs({"*": shared})   # 资金流分析师在图外先运行，也要看到共享信息
+    try:
+        fl = flows.analyze(cfg, ccy, tracker) if "flows" in cfg.get("desk_analysts", ["flows"]) else {"report": "", "data": ""}
+    finally:
+        roles.set_briefs({})
     xf = x_feed(ccy, trade_date)
     if not xf:
         x_feed_missing_alert(trade_date, ccy)
@@ -130,9 +184,7 @@ def analyze(cfg, coin: dict, trade_date: str, book: dict, tracker, extra_brief: 
             briefs["news"] = macro.brief(macro.safe_get(cfg, trade_date))
     except Exception as e:
         log.warning("宏观摘要失败：%s", e)
-    briefs["*"] = position_brief(book, coin["inst_id"])   # B3：所有角色都看到带方向的持仓
-    if extra_brief:   # 再讨论触发原因（止损/止盈）等共享上下文
-        briefs["*"] = ((briefs["*"] or "") + "\n\n" + extra_brief).strip()
+    briefs["*"] = shared   # B3 持仓 + 当前挂着的条件单 + 再讨论触发原因（止损/止盈），全体角色共享
     roles.set_briefs(briefs)
     tok = dllm.STAGE.set(f"{coin["inst_id"]}/分析图")
     try:

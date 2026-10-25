@@ -238,6 +238,8 @@ def _prompt(cfg, coin, mk, pos, bk, st, w, S, texts):
                      f"浮盈亏 {pos['upnl']:+.2f} USDT，到期 {pos['deadline']}")
     else:
         lines.append("本币无持仓。")
+    from desk import analysis as _an
+    lines += ["", _an.pending_brief(bk)]
     lines += ["", f"## 各角色观点（权重为历史表现给出；加权共识 S={S:+.3f}，范围 -1~+1）",
               f"口径说明：这里的 S={S:+.3f} 是【不含你本人投票】的其余角色加权共识。你的结构化决定会作为一票（权重 {w.get('trade_manager', 1):g}）计入，"
               "代码最终共识（决策记录 consensus）因此会与此值不同，这是已知口径差异。理由中引用共识时请写明\"不含交易经理的 S\"。"]
