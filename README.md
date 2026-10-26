@@ -182,7 +182,7 @@ pgrep -af desk.demo_ws; cat state/demo_ws_heartbeat; tail -f logs/demo-ws-$(date
 
 ```bash
 # 1. 克隆并拉取子模块
-git clone https://github.com/DanielJi0011/ta-desk.git
+git clone https://github.com/DanielJi0011/crypto-trading-desk.git
 cd ta-desk
 git submodule update --init
 
