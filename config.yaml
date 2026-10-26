@@ -58,24 +58,25 @@ providers:
   deepseek: {kind: deepseek}                                   # 使用上面 llm 段的地址与密钥
   grok:     {kind: relay, base_url_env: RELAY_BASE_URL, default_base_url: "https://<LLM_RELAY_HOST>/v1", key_env: XAI_API_KEY}
   gpt:      {kind: relay, base_url_env: RELAY_BASE_URL, default_base_url: "https://<LLM_RELAY_HOST>/v1", key_env: OPENAI_API_KEY}
+  claude:   {kind: relay, base_url_env: RELAY_BASE_URL, default_base_url: "https://<LLM_RELAY_HOST>/v1", key_env: CLAUDE_RELAY_API_KEY}
 
-# tier = 回退到 DeepSeek 时用 deep 还是 quick 模型
-role_models:   # 用户要求：只用三家旗舰 grok-4.7 / gpt-6.1-sol / deepseek-flash（用户所说 deepseek-4.1-flash 在 API 中的 id）
-  market:            {provider: deepseek, model: deepseek-flash, tier: quick}      # 工具调用多、上下文长 → 价格明确的 DeepSeek
-  sentiment:         {provider: grok, model: grok-4.7, tier: quick}
-  news:              {provider: deepseek, model: deepseek-flash, tier: quick}   # GPT 暂不稳定，2026-10-20 临时改用 DeepSeek
-  flows:             {provider: deepseek, model: deepseek-flash, tier: quick}
-  bull:              {provider: grok, model: grok-4.7, tier: quick}                # 多空两方用不同厂商，避免同源偏见
-  bear:              {provider: deepseek, model: deepseek-flash, tier: quick}   # GPT 暂不稳定，2026-10-20 临时改用 DeepSeek
-  research_manager:  {provider: deepseek, model: deepseek-flash, tier: deep}
-  trader:            {provider: deepseek, model: deepseek-flash, tier: quick}
-  aggressive:        {provider: grok, model: grok-4.7, tier: quick}
-  conservative:      {provider: deepseek, model: deepseek-flash, tier: quick}   # GPT 暂不稳定，2026-10-20 临时改用 DeepSeek
-  neutral:           {provider: deepseek, model: deepseek-flash, tier: quick}
-  portfolio_manager: {provider: deepseek, model: deepseek-flash, tier: deep}   # GPT 暂不稳定，2026-10-20 临时改用 DeepSeek
-  trade_manager:     {provider: grok, model: grok-4.7, tier: deep}
-  reviewer:          {provider: deepseek, model: deepseek-flash, tier: deep}       # 复盘会 / 手册修订
-  extractor:         {provider: deepseek, model: deepseek-flash, tier: quick}
+# tier = 回退到 DeepSeek 时用 deep 还是 quick 模型；reasoning（可选 low/medium/high）= 中转 OpenAI 兼容请求的 reasoning_effort，DeepSeek 路径忽略
+role_models:   # 用户要求：四家：grok-4.7 / gpt-6.1-sol / claude-opus-5-5（2026-10-27 接入）/ deepseek-flash（用户所说 deepseek-4.1-flash 在 API 中的 id）
+  market:            {provider: deepseek, model: deepseek-flash, tier: quick, reasoning: medium}
+  sentiment:         {provider: grok, model: grok-4.7, tier: quick, reasoning: medium}
+  news:              {provider: gpt, model: gpt-6.1-sol, tier: quick, reasoning: medium}
+  flows:             {provider: deepseek, model: deepseek-flash, tier: quick, reasoning: medium}
+  bull:              {provider: grok, model: grok-4.7, tier: quick, reasoning: medium}
+  bear:              {provider: grok, model: grok-4.7, tier: quick, reasoning: medium}
+  research_manager:  {provider: claude, model: claude-opus-5-5, tier: deep, reasoning: high}
+  trader:            {provider: gpt, model: gpt-6.1-sol, tier: quick, reasoning: medium}
+  aggressive:        {provider: grok, model: grok-4.7, tier: quick, reasoning: medium}
+  conservative:      {provider: claude, model: claude-opus-5-5, tier: quick, reasoning: medium}
+  neutral:           {provider: gpt, model: gpt-6.1-sol, tier: quick, reasoning: medium}
+  portfolio_manager: {provider: gpt, model: gpt-6.1-sol, tier: deep, reasoning: high}
+  trade_manager:     {provider: claude, model: claude-opus-5-5, tier: deep, reasoning: high}
+  reviewer:          {provider: claude, model: claude-opus-5-5, tier: deep, reasoning: high}
+  extractor:         {provider: deepseek, model: deepseek-flash, tier: quick, reasoning: medium}
   # TradingAgents 内部其余调用（记忆反思等）仍走 llm 段的 deepseek 深/快模型
 
 coins:                                  # TradingAgents 代码 -> OKX USDT 永续（纸面）

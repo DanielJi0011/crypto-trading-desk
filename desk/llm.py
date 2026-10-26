@@ -70,7 +70,7 @@ def price_of(cfg, model: str) -> dict:
     if m in p:
         return p[m]
     from desk.providers import provider_of
-    if provider_of(model) in ("grok", "gpt"):
+    if provider_of(model) in ("grok", "gpt", "claude"):
         return p.get("relay-unknown", p["default"])
     return p["default"]
 
@@ -82,7 +82,7 @@ def price_known(cfg, model: str) -> bool:
     if m in p and m != "relay-unknown":
         return True
     from desk.providers import provider_of
-    return provider_of(model) not in ("grok", "gpt") and "default" in p
+    return provider_of(model) not in ("grok", "gpt", "claude") and "default" in p
 
 
 def cost_usd(cfg, model, inp, cached, out, t=None) -> float:

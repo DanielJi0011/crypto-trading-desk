@@ -1,4 +1,4 @@
-"""按角色选择模型（DeepSeek / 中转的 Grok、GPT），缺密钥时回退 DeepSeek。"""
+"""按角色选择模型（DeepSeek / 中转的 Grok、GPT、Claude），缺密钥时回退 DeepSeek。"""
 from __future__ import annotations
 
 import os
@@ -26,7 +26,7 @@ def resolve(cfg, role: str) -> dict:
         why = f"{role}: {rm['provider']}/{rm['model']} 缺少 {pv['key_env'] if not os.environ.get(pv['key_env']) else pv['base_url_env']} → 回退 DeepSeek {tier_model}"
         return {**ds, "model": tier_model, "fallback": why}
     return {"provider": rm["provider"], "model": os.environ.get(f"TA_MODEL_{role.upper()}") or rm["model"],
-            "base_url": base, "key_env": pv["key_env"], "fallback": None}
+            "base_url": base, "key_env": pv["key_env"], "fallback": None, "reasoning": rm.get("reasoning")}
 
 
 def build(cfg, role: str, tracker=None):
@@ -52,6 +52,9 @@ def build(cfg, role: str, tracker=None):
         kw["api_key"] = os.environ[r["key_env"]]
         kw["timeout"] = 180
         llm = create_llm_client("openai_compatible", r["model"], r["base_url"], **kw).get_llm()
+        # TradingAgents 的 openai_compatible 只对 gpt-5+/o 系列转发 reasoning_effort；中转站对 grok/gpt/claude 均接受，这里直接设置
+        if r.get("reasoning") in ("low", "medium", "high"):
+            llm.reasoning_effort = r["reasoning"]
     _cache[key] = llm
     return llm
 
@@ -68,4 +71,4 @@ def provider_of(model: str) -> str:
     if model in MODEL_PROVIDER:
         return MODEL_PROVIDER[model]
     m = (model or "").lower()
-    return "deepseek" if "deepseek" in m else "grok" if m.startswith("grok") else "gpt" if m.startswith("gpt") else "其他"
+    return "deepseek" if "deepseek" in m else "grok" if m.startswith("grok") else "gpt" if m.startswith("gpt") else "claude" if m.startswith("claude") else "其他"

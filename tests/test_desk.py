@@ -528,3 +528,15 @@ def test_research_empty_llm_no_crash(cfg, monkeypatch):
     x = rep["roles"]["flows"]
     assert "error" not in x and x["tested"] == [] and "无假设" in x["note"]
     assert "无假设" in (research.RDIR / f"report-{rep['week']}.md").read_text(encoding="utf-8")
+
+
+def test_claude_provider_and_reasoning(monkeypatch):
+    import yaml
+    from desk import providers
+    cfg = yaml.safe_load(open("config.yaml", encoding="utf-8"))
+    assert providers.provider_of("claude-opus-5-5") == "claude"
+    monkeypatch.setenv("CLAUDE_RELAY_API_KEY", "x")
+    r = providers.resolve(cfg, "trade_manager")
+    assert r["provider"] == "claude" and r["model"] == "claude-opus-5-5" and r["reasoning"] == "high"
+    monkeypatch.delenv("CLAUDE_RELAY_API_KEY")
+    assert providers.resolve(cfg, "reviewer")["fallback"]

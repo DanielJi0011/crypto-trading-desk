@@ -22,8 +22,8 @@ def _sizing_line(z) -> str:
 
 
 def model_note(r: dict) -> str:
-    """S1：经第三方中转站的角色（grok/gpt 且未回退）在模型分配表中标注。"""
-    relay = "经第三方中转站（提示词与数据经过中转方）" if r.get("provider") in ("grok", "gpt") and not r.get("fallback") else ""
+    """S1：经第三方中转站的角色（grok/gpt/claude 且未回退）在模型分配表中标注。"""
+    relay = "经第三方中转站（提示词与数据经过中转方）" if r.get("provider") in ("grok", "gpt", "claude") and not r.get("fallback") else ""
     return "；".join(x for x in (relay, ("⚠️ " + r["fallback"]) if r.get("fallback") else "") if x)
 
 
@@ -300,7 +300,7 @@ def write(cfg, date, decisions, closed, reviews, weight_changes, pb_events, usag
     L += ["", "## 八、LLM 用量与成本（本次运行）", "",
           f"{calls_text(usage)}；输入 {usage['input']:,} tokens（缓存命中 {usage['cached']:,}），"
           f"输出 {usage['output']:,} tokens；已知价格部分（DeepSeek）估算成本 **${usage['cost_usd']:.4f}**（约 ¥{usage['cost_usd'] * cfg['llm'].get('usd_cny', 7.2):.3f}）"
-          + (f"；另有 {usage['unpriced_calls']} 次中转（grok/gpt）调用单价未知，token 已统计、成本未计入" if usage.get("unpriced_calls") else "") + "。", "",
+          + (f"；另有 {usage['unpriced_calls']} 次中转（grok/gpt/claude）调用单价未知，token 已统计、成本未计入" if usage.get("unpriced_calls") else "") + "。", "",
           "| 环节 | 调用 | 输入 | 缓存命中 | 输出 | 成本 USD |", "|---|---|---|---|---|---|"]
     for k, v in usage["by_stage"].items():
         L.append(f"| {k} | {v['calls']} | {v['input']:,} | {v['cached']:,} | {v['output']:,} | {_cost(v)} |")
