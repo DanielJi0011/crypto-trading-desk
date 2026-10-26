@@ -71,15 +71,18 @@ def portfolio_ctx(book: dict):
 
 
 def position_brief(book: dict, inst_id: str) -> str:
-    """B3：给每个角色的中文持仓说明（方向、张数带符号、均价、止损止盈）。"""
+    """B3：给每个角色的中文持仓说明（方向、张数带符号、均价、止损止盈、浮盈亏）。全员共享，含 upnl。"""
     L = []
     for p in book.get("positions", []):
         sd = "空" if signed_qty(p) < 0 else "多"
         ct = p.get("contracts")
         sct = (-1 if sd == "空" else 1) * float(ct) if ct is not None else None
+        upnl = p.get("upnl")
+        upnl_s = f"，浮盈亏 {float(upnl):+.2f} USDT" if upnl is not None else ""
         L.append(f"- {p.get('inst_id')}：{sd}单（posSide={p.get('pos_side') or p.get('side')}），"
                  f"数量 {signed_qty(p):+g}" + (f"，张数 {sct:+g}" if sct is not None else "")
                  + f"，均价 {p.get('avg_px')}，止损 {p.get('sl_px') or p.get('stop_loss') or '无'}，止盈 {p.get('tp_px') or p.get('take_profit') or '无'}"
+                 + upnl_s
                  + ("（本币）" if p.get("inst_id") == inst_id else ""))
     head = "## 当前模拟盘持仓（数量为负表示空单；空单价格下跌才盈利）\n"
     return head + ("\n".join(L) if L else "- 无持仓")

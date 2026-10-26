@@ -185,11 +185,20 @@ def aggregate(cfg, st: dict, w: dict, mk: dict) -> dict:
     conflict = bool(side and plan["conflict"])
     entry, cond = (plan.get("entry") or last), plan.get("condition") or "now"
     atr = mk.get("atr14")
-    if atr:   # R2：止损按 ATR，止盈按 R 倍数；角色给的止损/目标只作参考
-        stop, tp, _d = sizing.stop_take(side or "long", entry, float(atr), rc)
+    min_rr = float(rc.get("min_rr_after_adjust", 1.5))
+    levels_meta = {"rr": None, "adjusted": False, "baseline_stop": None, "baseline_tp": None}
+    if atr:   # R2：先 ATR+2R 基准，再同向角色 stop/target 加权调整，最后 RR≥min_rr
+        base_stop, base_tp, _d = sizing.stop_take(side or "long", entry, float(atr), rc)
+        levels_meta["baseline_stop"], levels_meta["baseline_tp"] = base_stop, base_tp
+        lv = sizing.wavg_levels(st, w, bulls, side or "long", entry) if bulls else {"stop": None, "target": None}
+        fin = sizing.finalize_sl_tp(side or "long", entry, base_stop, base_tp, lv.get("stop"), lv.get("target"), min_rr)
+        stop, tp = fin["stop"], fin["take_profit"]
+        levels_meta.update(rr=fin["rr"], adjusted=fin["adjusted"])
+        notes.extend(fin["notes"])
     else:     # 无 ATR（仅旧测试/纸面路径）：沿用角色加权
         stop = wavg([(r, float(st[r]["stop"])) for r in bulls if st[r].get("stop") and sg * (entry - float(st[r]["stop"])) > 0])
         tp = wavg([(r, float(st[r]["target"])) for r in bulls if st[r].get("target") and sg * (float(st[r]["target"]) - entry) > 0])
+        levels_meta["rr"] = sizing.rr_ratio(side or "long", entry, stop, tp) if stop and tp else None
     if conflict:
         notes.append(f"入场方案冲突（各组得分 {plan['scores']}，差距 < {float(rc['plan_conflict_pct']):.0%}），不开仓（plan_conflict）")
     hz = plan.get("horizon") or wavg([(r, float(st[r].get("horizon_days") or 0)) for r in bulls])
@@ -205,7 +214,9 @@ def aggregate(cfg, st: dict, w: dict, mk: dict) -> dict:
     return {"S": round(S, 4), "buy": buy, "side": side, "entry_px": entry, "condition": cond, "stop_loss": stop, "take_profit": tp,
             "size_pct": round(size, 3), "horizon_days": int(min(max(round(hz or 5), 1), 30)), "notes": notes,
             "contributors": {r: st[r].get("entry_px") for r in bulls},
-            "plan_group": plan.get("group"), "plan_scores": plan.get("scores"), "plan_conflict": conflict, "valid_voters": nv}
+            "plan_group": plan.get("group"), "plan_scores": plan.get("scores"), "plan_conflict": conflict, "valid_voters": nv,
+            "rr": levels_meta.get("rr"), "levels_adjusted": levels_meta.get("adjusted"),
+            "baseline_stop": levels_meta.get("baseline_stop"), "baseline_tp": levels_meta.get("baseline_tp")}
 
 
 def market_ctx(inst: str) -> dict:
@@ -264,8 +275,10 @@ def _prompt(cfg, coin, mk, pos, bk, st, w, S, texts):
               "此时填写的条件单字段一律忽略；想按条件价位入场时 action=pending 并完整填写 entry_side/entry_trigger_px/entry_condition/entry_stop_loss，"
               "且 entry_size_pct 必须 >0（只作为挂单有效标记，实际仓位按风险定仓）；reduce_fraction 只在 action=reduce 时填写；"
               "invalidation 必填。",
-              "已有持仓且 action=hold 或 reduce 时：new_stop 只能收紧止损；new_tp 可把止盈调近或调远，但必须在现价盈利一侧且不会立即触发（距现价至少 "
-              f"{float((cfg.get('manager') or dict()).get('tp_min_gap_pct', 0.3)):g}%）。",
+              "已有持仓且 action=hold 或 reduce 时：调点与开仓同一套——先 ATR+2R 基准再全员加权；你可用 new_stop/new_tp 做最终微调，"
+              "但 new_stop 只能收紧、new_tp 须在现价盈利一侧且不会立即触发（距现价至少 "
+              f"{float((cfg.get('manager') or dict()).get('tp_min_gap_pct', 0.3)):g}%），且调整后盈亏比 RR（止盈距/止损距，相对均价）不得低于 "
+              f"{float((cfg.get('risk') or dict()).get('min_rr_after_adjust', 1.5)):g}；你保留否决权（hold/risk_scale=0）。",
               "请给出结构化决策。没有足够把握就 hold；止损请依据结构位/ATR 给出具体价位。理由用中文。"]
     return "\n".join(lines)
 
@@ -314,8 +327,7 @@ def decide_and_execute(cfg, coin, trade_date, fs, st, tracker, source="daily") -
     action, size, notes, execd, agg = res["action"], res["size_pct"], res["notes"], res["execution"], res["aggregate"]
     S_pre_tm = S   # 交易经理提示里看到的口径（不含其本人投票）
     S = agg["S"]
-    apply_new_stop(cfg, pos, dec, action, execd, notes)
-    apply_new_tp(cfg, pos, dec, action, execd, notes)
+    apply_position_sl_tp(cfg, pos, st, w, mk, dec, action, execd, notes)
 
     rec = {"decision_id": did, "date": trade_date, "session": record_session(source), "time": settings.now_str(), "inst_id": inst, "ticker": coin["ticker"],
            "price": mk["last"], "market": mk, "consensus": round(S, 4), "consensus_pre_tm": round(S_pre_tm, 4), "weights": w,
@@ -330,8 +342,21 @@ def decide_and_execute(cfg, coin, trade_date, fs, st, tracker, source="daily") -
     return rec
 
 
+def _rr_guard_ok(cfg, pos, new_stop, new_tp, notes, label: str) -> bool:
+    """TM new_* 与加权调点共用：相对均价的 RR 不得低于 risk.min_rr_after_adjust。缺止盈时不拦止损收紧。"""
+    from desk import sizing
+    entry = float(pos.get("avg_px") or 0)
+    stop = new_stop if new_stop is not None else pos.get("sl_px")
+    tp = new_tp if new_tp is not None else pos.get("tp_px")
+    min_rr = float(sizing.rcfg(cfg).get("min_rr_after_adjust", 1.5))
+    ok, msg, _rr = sizing.guard_rr(pos["side"], entry, stop, tp, min_rr)
+    if not ok:
+        notes.append(f"{label} 未执行：{msg}")
+    return ok
+
+
 def apply_new_stop(cfg, pos, dec, action, execd, notes):
-    """交易经理 new_stop：hold 与减仓成功后都执行，只许收紧（多单只上移、空单只下移），放宽由 move_stop 拒绝并写入 notes。
+    """交易经理 new_stop：hold 与减仓成功后都执行，只许收紧（多单只上移、空单只下移），且调后 RR≥min_rr_after_adjust。
     减仓后按剩余张数挂止损单。"""
     from desk import demo_exec
     reduced = action == "reduce" and isinstance(execd, dict) and execd.get("ok")
@@ -340,6 +365,9 @@ def apply_new_stop(cfg, pos, dec, action, execd, notes):
     if pos and dec.new_stop and (action.startswith("hold") or reduced):
         if reduced and execd.get("remaining") is not None:   # 减仓后止损单张数须等于剩余仓位
             pos = {**pos, "contracts": execd["remaining"]}
+        # 与加权调点同一护栏：能算 RR 时必须 ≥ min_rr（止盈取 new_tp 或原 tp）
+        if not _rr_guard_ok(cfg, pos, float(dec.new_stop), getattr(dec, "new_tp", None), notes, "new_stop"):
+            return
         if pos.get("legacy"):
             notes.append("旧纸面仓由旧仓盯盘管理，不改止损")
         elif pos.get("venue") == "okx_demo":
@@ -355,7 +383,7 @@ def apply_new_stop(cfg, pos, dec, action, execd, notes):
 
 def apply_new_tp(cfg, pos, dec, action, execd, notes):
     """交易经理 new_tp：hold 与减仓成功后都执行（参照 apply_new_stop），改同一张止损止盈单，张数与剩余仓位一致。
-    止盈可调近或调远，但须在现价盈利一侧且不立即触发（demo_exec.move_tp 校验）；失败或拒绝写进 notes。"""
+    止盈可调近或调远，但须在现价盈利一侧且不立即触发；调后 RR（相对均价）≥ min_rr_after_adjust。"""
     from desk import demo_exec
     tp = getattr(dec, "new_tp", None)
     if not (pos and tp):
@@ -367,6 +395,8 @@ def apply_new_tp(cfg, pos, dec, action, execd, notes):
         return
     if reduced and execd.get("remaining") is not None:
         pos = {**pos, "contracts": execd["remaining"]}
+    if not _rr_guard_ok(cfg, pos, getattr(dec, "new_stop", None), float(tp), notes, "new_tp"):
+        return
     if pos.get("venue") != "okx_demo":
         notes.append("非模拟盘仓位，new_tp 未执行"); return
     try:
@@ -374,6 +404,105 @@ def apply_new_tp(cfg, pos, dec, action, execd, notes):
     except Exception as e:
         msg = f"模拟盘改止盈失败：{type(e).__name__}: {e}"
     notes.append(msg)
+
+
+def apply_position_sl_tp(cfg, pos, st, w, mk, dec, action, execd, notes):
+    """已开仓调点（早/晚场与开仓同一套）：ATR+2R 基准 → 全员 w×置信度加权 → TM new_* 最终微调；
+    RR≥min_rr_after_adjust；止损只许收紧。无 ATR 时仅走 TM new_*（仍受 RR 护栏）。"""
+    from desk import demo_exec, sizing
+    reduced = action == "reduce" and isinstance(execd, dict) and execd.get("ok")
+    if pos and action == "reduce" and not reduced:
+        if getattr(dec, "new_stop", None):
+            notes.append("减仓未成功，new_stop 未执行")
+        if getattr(dec, "new_tp", None):
+            notes.append("减仓未成功，new_tp 未执行")
+        return
+    if not (pos and (action.startswith("hold") or reduced)):
+        return
+    if reduced and execd.get("remaining") is not None:
+        pos = {**pos, "contracts": execd["remaining"]}
+    if pos.get("legacy"):
+        if getattr(dec, "new_stop", None):
+            notes.append("旧纸面仓由旧仓盯盘管理，不改止损")
+        return
+
+    rc = sizing.rcfg(cfg)
+    min_rr = float(rc.get("min_rr_after_adjust", 1.5))
+    side = pos["side"]
+    entry = float(pos.get("avg_px") or 0)
+    atr = (mk or {}).get("atr14")
+    proposed_stop = proposed_tp = None
+    if atr and entry > 0:
+        base_stop, base_tp, _ = sizing.stop_take(side, entry, float(atr), rc)
+        stn = {r: _norm_stance(s) for r, s in (st or {}).items()}
+        roles = [r for r in valid_voters(stn) if r in (w or {})]
+        lv = sizing.wavg_levels(stn, w or {}, roles, side, entry)
+        fin = sizing.finalize_sl_tp(side, entry, base_stop, base_tp, lv.get("stop"), lv.get("target"), min_rr)
+        proposed_stop, proposed_tp = fin["stop"], fin["take_profit"]
+        for n in fin["notes"]:
+            notes.append(n)
+
+    tm_stop = getattr(dec, "new_stop", None)
+    tm_tp = getattr(dec, "new_tp", None)
+    final_stop = float(tm_stop) if tm_stop is not None else proposed_stop
+    final_tp = float(tm_tp) if tm_tp is not None else proposed_tp
+
+    # TM 微调也必须过 RR；不过则回退到加权方案（若有），再不行则该维不改
+    if tm_stop is not None or tm_tp is not None:
+        chk_stop = final_stop if final_stop is not None else pos.get("sl_px")
+        chk_tp = final_tp if final_tp is not None else pos.get("tp_px")
+        ok, msg, rr = sizing.guard_rr(side, entry, chk_stop, chk_tp, min_rr)
+        if not ok:
+            notes.append(f"交易经理 new_* 未采纳：{msg}")
+            final_stop = proposed_stop if tm_stop is not None else final_stop
+            final_tp = proposed_tp if tm_tp is not None else final_tp
+            # 若回退后仍是 TM 原值且无加权方案，则该维清空不改
+            if tm_stop is not None and proposed_stop is None:
+                final_stop = None
+            if tm_tp is not None and proposed_tp is None:
+                final_tp = None
+        elif tm_stop is not None or tm_tp is not None:
+            notes.append(f"交易经理最终调点" + (f" 止损→{final_stop:.6g}" if tm_stop is not None and final_stop is not None else "")
+                         + (f" 止盈→{final_tp:.6g}" if tm_tp is not None and final_tp is not None else "")
+                         + (f"（RR={rr:.3f}）" if rr is not None else ""))
+
+    # 执行：止损只在收紧时提交；止盈有变化就提交
+    if final_stop is not None:
+        old = pos.get("sl_px")
+        try:
+            old_f = float(old) if old is not None else None
+        except (TypeError, ValueError):
+            old_f = None
+        tighten = old_f is None or (final_stop > old_f if side == "long" else final_stop < old_f)
+        same = old_f is not None and abs(final_stop - old_f) < 1e-9
+        if same:
+            pass
+        elif not tighten and not (cfg.get("manager") or {}).get("allow_stop_widen"):
+            notes.append(f"加权/TM 止损 {final_stop:.6g} 宽于现止损 {old_f:.6g}，不放宽")
+        elif pos.get("venue") == "okx_demo":
+            try:
+                ok, msg = demo_exec.move_stop(cfg, pos, float(final_stop))
+            except Exception as e:
+                msg = f"模拟盘改止损失败：{e}"
+            notes.append(msg)
+        elif pos.get("trade_id"):
+            ok, msg = ledger.move_stop(cfg, pos["trade_id"], float(final_stop))
+            notes.append(msg)
+
+    if final_tp is not None and pos.get("venue") == "okx_demo":
+        old_tp = pos.get("tp_px")
+        try:
+            same_tp = old_tp is not None and abs(float(final_tp) - float(old_tp)) < 1e-9
+        except (TypeError, ValueError):
+            same_tp = False
+        if not same_tp:
+            try:
+                ok, msg = demo_exec.move_tp(cfg, pos, float(final_tp))
+            except Exception as e:
+                msg = f"模拟盘改止盈失败：{type(e).__name__}: {e}"
+            notes.append(msg)
+    elif final_tp is not None and tm_tp is not None and pos.get("venue") != "okx_demo":
+        notes.append("非模拟盘仓位，new_tp 未执行")
 
 
 def pm_execute(cfg, coin, did, st, w, mk, bk, pos, rationale, source="daily", tm=None, tm_state=None) -> dict:

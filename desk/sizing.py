@@ -2,7 +2,7 @@
 
 R2 入场方案：同向角色按入场条件分为 now / breakout / pullback 三组，按组内 Σ w×conf 选组，入场价只在组内加权；
    两组得分差 < plan_conflict_pct（20%）→ 方案冲突不开仓（plan_conflict）。止损 = clip(stop_atr_mult×ATR14/entry, stop_min, stop_max)，
-   止盈 = 入场 ± tp_r_multiple × 止损距离。角色自己的止损/目标只作参考。
+   止盈 = 入场 ± tp_r_multiple × 止损距离。再按同向角色 stop/target 做 w×置信度加权调整；调整后盈亏比 RR=止盈距/止损距（相对入场）不得低于 min_rr_after_adjust。
 R1 定仓：risk_usd = 权益×risk_per_trade_pct×scale×dd_scale×tm_risk_scale；notional = min(risk_usd/stop_dist, 权益×max_notional, R4 剩余)；
    杠杆取满足保证金上限的最小值（步长 0.5，1 ≤ lev ≤ 新开仓上限与交易经理上限）；不够则按保证金上限反推削减 notional。
 R3 强平缓冲：|强平价 − 止损| ≥ liq_buffer_atr_mult × ATR14，不满足每次降 0.5 倍；1 倍仍不满足 → liq_buffer_reject。
@@ -15,7 +15,7 @@ import math
 RISK_DEFAULTS = {"risk_per_trade_pct": 0.0075, "max_notional_per_trade_pct": 1.0, "max_margin_pct": 0.20, "stop_atr_mult": 1.5,
                  "stop_min_pct": 0.01, "stop_max_pct": 0.08, "tp_r_multiple": 2.0, "liq_buffer_atr_mult": 1.0,
                  "max_open_risk_pct": 0.02, "max_net_directional_pct": 1.2, "cost_buffer_pct": 0.002, "plan_conflict_pct": 0.20,
-                 "max_price_drift_atr": 0.5, "max_daily_bar_age_days": 2}
+                 "max_price_drift_atr": 0.5, "max_daily_bar_age_days": 2, "min_rr_after_adjust": 1.5}
 
 
 def rcfg(cfg) -> dict:
@@ -30,7 +30,92 @@ def stop_take(side: str, entry: float, atr: float, rc: dict) -> tuple[float, flo
     return entry * (1 - sg * d), entry * (1 + sg * float(rc["tp_r_multiple"]) * d), d
 
 
+
+def rr_ratio(side: str, entry: float, stop, tp) -> float | None:
+    """盈亏比 RR = |止盈−入场| / |入场−止损|（相对入场价）。侧向不对或距离≤0 → None。"""
+    if not entry or stop is None or tp is None:
+        return None
+    try:
+        entry, stop, tp = float(entry), float(stop), float(tp)
+    except (TypeError, ValueError):
+        return None
+    sg = 1 if side == "long" else -1
+    sl_dist = sg * (entry - stop)
+    tp_dist = sg * (tp - entry)
+    if sl_dist <= 0 or tp_dist <= 0:
+        return None
+    return tp_dist / sl_dist
+
+
+def wavg_levels(st: dict, w: dict, roles: list, side: str, entry: float) -> dict:
+    """同向/给定角色的 stop、target 按 w×置信度加权。只取相对入场正确一侧。返回 {stop, target, stop_n, target_n}。"""
+    sg = 1 if side == "long" else -1
+
+    def avg(field: str, ok) -> tuple:
+        vals = []
+        for r in roles:
+            v = (st.get(r) or {}).get(field)
+            if v is None or v == "":
+                continue
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                continue
+            if not ok(fv):
+                continue
+            a = float(w.get(r, 0) or 0) * float((st.get(r) or {}).get("confidence") or 0)
+            if a > 0:
+                vals.append((a, fv))
+        den = sum(a for a, _ in vals)
+        return (sum(a * v for a, v in vals) / den if den else None), len(vals)
+
+    stop, sn = avg("stop", lambda v: sg * (entry - v) > 0)
+    target, tn = avg("target", lambda v: sg * (v - entry) > 0)
+    return {"stop": stop, "target": target, "stop_n": sn, "target_n": tn}
+
+
+def finalize_sl_tp(side: str, entry: float, base_stop, base_tp, role_stop=None, role_tp=None, min_rr: float = 1.5) -> dict:
+    """ATR(+2R) 基准 → 角色加权覆盖 → 强制 RR≥min_rr（不够则外推止盈；组合无效则回退基准）。
+    返回 {stop, take_profit, rr, adjusted, notes}。"""
+    notes: list[str] = []
+    stop = role_stop if role_stop is not None else base_stop
+    tp = role_tp if role_tp is not None else base_tp
+    adjusted = role_stop is not None or role_tp is not None
+    if role_stop is not None:
+        notes.append(f"止损按角色加权调整→{float(role_stop):.6g}")
+    if role_tp is not None:
+        notes.append(f"止盈按角色加权调整→{float(role_tp):.6g}")
+    rr = rr_ratio(side, entry, stop, tp)
+    min_rr = float(min_rr)
+    if stop is not None and rr is not None and rr + 1e-12 < min_rr:
+        sg = 1 if side == "long" else -1
+        new_tp = float(entry) + sg * min_rr * abs(float(entry) - float(stop))
+        notes.append(f"调整后 RR={rr:.3f}<{min_rr:g}，止盈外推至 {new_tp:.6g} 以满足 RR≥{min_rr:g}")
+        tp = new_tp
+        rr = min_rr
+        adjusted = True
+    elif adjusted and rr is None and base_stop is not None:
+        notes.append("调整后点位无效（侧向/距离），回退 ATR 基准")
+        stop, tp = base_stop, base_tp
+        rr = rr_ratio(side, entry, stop, tp)
+        adjusted = False
+    return {"stop": stop, "take_profit": tp, "rr": rr, "adjusted": adjusted, "notes": notes}
+
+
+def guard_rr(side: str, entry: float, stop, tp, min_rr: float = 1.5) -> tuple[bool, str, float | None]:
+    """已有持仓调点护栏：能算出 RR 时必须 ≥ min_rr。缺止盈时不拦（只改止损场景）。"""
+    if tp is None or stop is None or not entry:
+        return True, "", None
+    rr = rr_ratio(side, entry, stop, tp)
+    if rr is None:
+        return False, "点位侧向无效，无法计算盈亏比", None
+    if rr + 1e-12 < float(min_rr):
+        return False, f"调整后盈亏比 RR={rr:.3f} < {float(min_rr):g}", rr
+    return True, "", rr
+
+
 def classify(side: str, cond: str | None, entry: float | None, last: float, band: float) -> str:
+
     if cond == "now" or not entry or abs(float(entry) / last - 1) <= band:
         return "now"
     up = float(entry) > last
