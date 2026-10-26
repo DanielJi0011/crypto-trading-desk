@@ -69,6 +69,17 @@ _lock = threading.Lock()
 NOTIFY_TIMEOUT = 30
 NOTIFY_RETRIES = 2
 REVIEW_EVERY = 30   # R10：KILL/HALT 等风险状态检查周期（秒）
+PROC_START_MS = int(time.time() * 1000)   # 本进程启动时间：早于它的事件视为补推/补查
+REPLAY_SLACK_MS = 60_000
+NOTIFIED_FILLS = settings.STATE / "ledger" / "notified_fills.json"   # 已发过成交类通知的 ordId（防重连补推重发）
+COOLDOWN_PATH = settings.STATE / "notify_cooldown.json"   # 非交易故障告警按 event_type 冷却
+# 非交易故障/链路类告警：同一 event_type 冷却窗口（notify.alert_cooldown_hours，默认 6 小时）内最多发一次。
+# 成交/止损/止盈/条件单/开平仓/风控开关/止损覆盖类不在此列，永不冷却。
+ALERT_COOLDOWN_KINDS = {"stale_code", "healthcheck_stale", "evening_missing", "daily_missing", "heartbeat",
+                        "chain_unhealthy", "offsite_backup_failed", "offsite_heartbeat_failed", "disconnect_alert",
+                        "x_feed_missing", "daily_failed", "daily_skipped"}
+DEFAULT_COOLDOWN_H = 6.0
+RUN_BRANCH_DEFAULT = "chore/publish-prep"
 MERGE_KINDS = ("stop_loss", "take_profit", "trigger_fired")   # 触发后不立即通知，等整单成交合并成一条
 
 
@@ -105,7 +116,8 @@ def parse(msg: dict) -> list[dict]:
                     "sz": d.get("fillSz") or d.get("accFillSz"), "px": d.get("fillPx") or d.get("avgPx"),
                     "pnl": d.get("fillPnl") or d.get("pnl"), "ordId": d.get("ordId"), "algoId": d.get("algoId") or None,
                     "state": st, "category": cat, "channel": ch,
-                    "accFillSz": d.get("accFillSz"), "avgPx": d.get("avgPx"), "reduceOnly": d.get("reduceOnly")}
+                    "accFillSz": d.get("accFillSz"), "avgPx": d.get("avgPx"), "reduceOnly": d.get("reduceOnly"),
+                    "uTime": d.get("uTime") or d.get("fillTime")}
             if cat in ("full_liquidation", "partial_liquidation", "adl"):
                 if st in ("filled", "partially_filled"):
                     out.append({**base, "kind": "liquidation", "key": f"liq:{d.get('ordId')}:{st}:{d.get('tradeId') or ''}"})
@@ -300,6 +312,57 @@ def _merge(ev: dict, st: "State") -> dict | None:
     return ev
 
 
+def _notify_section() -> dict:
+    try:
+        import yaml
+        with open(settings.CONFIG, encoding="utf-8") as f:
+            return (yaml.safe_load(f) or {}).get("notify") or {}
+    except Exception:
+        return {}
+
+
+def cooldown_hours() -> float:
+    try:
+        return float(_notify_section().get("alert_cooldown_hours", DEFAULT_COOLDOWN_H))
+    except (TypeError, ValueError):
+        return DEFAULT_COOLDOWN_H
+
+
+def cooldown_claim(kind: str, now: float | None = None, hours: float | None = None, path=None) -> bool:
+    """非交易告警冷却：返回 True 表示可以发送（并登记时间）；冷却窗口内返回 False。交易类事件恒为 True。"""
+    if kind not in ALERT_COOLDOWN_KINDS:
+        return True
+    now = time.time() if now is None else now
+    win = (cooldown_hours() if hours is None else hours) * 3600
+
+    def fn(j):
+        last = float((j.get("last_sent") or {}).get(kind, 0) or 0)
+        if win > 0 and now - last < win:
+            j.setdefault("suppressed", {})[kind] = int((j.get("suppressed") or {}).get(kind, 0)) + 1
+            return False
+        j.setdefault("last_sent", {})[kind] = now
+        return True
+    return _rmw(path or COOLDOWN_PATH, fn)
+
+
+def fill_claim(ev: dict, path=None) -> bool:
+    """成交类通知按 ordId(+kind) 跨进程只发一次；重连补推的同一笔返回 False。无 ordId 时放行。"""
+    oid = ev.get("ordId") or ev.get("algoId")
+    if not oid:
+        return True
+    k = f"{ev.get('kind')}:{oid}"
+
+    def fn(j):
+        d = j.setdefault("ords", {})
+        if k in d:
+            return False
+        d[k] = _now_ms()
+        if len(d) > 5000:
+            j["ords"] = dict(list(d.items())[-5000:])
+        return True
+    return _rmw(path or NOTIFIED_FILLS, fn)
+
+
 def notify(ev: dict) -> bool:
     if ev.get("kind") not in NOTIFY_KINDS:
         return False
@@ -314,6 +377,12 @@ def notify(ev: dict) -> bool:
     h = {"Content-Type": "application/json"}
     if key:
         h["Authorization"] = f"Bearer {key}"; h["X-Webhook-Key"] = key
+    try:
+        if not cooldown_claim(ev.get("kind")):
+            log(f"告警冷却中，跳过 {ev.get('kind')}（notify.alert_cooldown_hours）")
+            return False
+    except Exception as e:
+        log(f"冷却检查失败 {type(e).__name__}，照常发送")
     body = json.dumps(payload(ev), ensure_ascii=False).encode()
     for i in range(1 + NOTIFY_RETRIES):
         try:
@@ -431,7 +500,14 @@ def handle(ev: dict, st: State, cfg=None, rediscuss=None, notifier=notify) -> di
     if nev is None or nev["kind"] in ("position_open", "position_closed"):
         return ev
     try:
+        fpath = st.path.parent / NOTIFIED_FILLS.name
+        if not fill_claim(nev, path=fpath):
+            log(f"重连补推的已通知成交 {nev['kind']} ord={nev.get('ordId')}，跳过 webhook")
+            return ev
         ok = notifier(nev)
+        if ok is False:
+            oid = nev.get("ordId") or nev.get("algoId")
+            _rmw(fpath, lambda j: j.setdefault("ords", {}).pop(f"{nev.get('kind')}:{oid}", None))
         if ok is not False:
             mark_fill(nev, path=st.path)
     except Exception as e:
@@ -513,6 +589,11 @@ def _claim(j, ch: dict) -> dict | None:
     nk = f"{ch['key']}:{ch['act']}"
     pn = j.setdefault("pos_notified", {})
     if nk in pn:
+        return None
+    ev_ms = ch.get("event_ms")
+    if ev_ms and ev_ms < PROC_START_MS - REPLAY_SLACK_MS and any(
+            k.startswith(f"{ch['pos_id']}:") and k.endswith(f":{ch['act']}") for k in pn):
+        pn[nk] = {"at": ch["detected_ms"], "replay_skipped": True}   # 同一 pos_id 同一动作已提醒过的补推
         return None
     mark = (j.get("fill_marks") or {}).get(f"{ch['inst_id']}:{ch['pos_side'] or 'net'}:{ch['act']}")
     ref = ch.get("event_ms") or ch["detected_ms"]
@@ -650,7 +731,21 @@ def git_head() -> str | None:
         return None
 
 
-def check_code_version(now=None, head=None, notifier=None) -> bool:
+def git_branch() -> str | None:
+    import subprocess
+    try:
+        b = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=str(settings.CODE), capture_output=True,
+                           text=True, timeout=10).stdout.strip()
+        return b or None   # detached 时为 "HEAD"
+    except Exception:
+        return None
+
+
+def run_branch() -> str:
+    return str(_notify_section().get("run_branch") or RUN_BRANCH_DEFAULT)
+
+
+def check_code_version(now=None, head=None, notifier=None, branch=None) -> bool:
     """启动时记录代码版本；之后比对 HEAD，不同则说明本进程跑的是旧代码 → 写日志并通知（每小时至多一次）。返回是否旧代码。"""
     now = time.time() if now is None else now
     head = head or git_head()
@@ -658,6 +753,10 @@ def check_code_version(now=None, head=None, notifier=None) -> bool:
         _code_rev["start"] = head
         return False
     if not head or head == _code_rev["start"]:
+        return False
+    br = branch or git_branch()
+    if br != run_branch():   # 未合并分支 / detached 上的 HEAD 变化不告警
+        log(f"HEAD {head[:7]} 不在运行分支 {run_branch()}（当前 {br}），不发 stale_code")
         return False
     if now - _code_rev["alerted"] >= STALE_ALERT_EVERY:
         _code_rev["alerted"] = now

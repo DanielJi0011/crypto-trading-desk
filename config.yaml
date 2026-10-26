@@ -188,6 +188,9 @@ manager:
   tp_min_gap_pct: 0.3                   # 交易经理 new_tp：新止盈须在现价盈利一侧且距现价至少 0.3%，避免改完立即触发（可调近可调远）
 
 # L4 数据质量：输入数据缺失的角色记 data_missing，不进共识也不打分
+notify:                                 # webhook 降噪（每条 webhook 会唤起一次 Grok Bot 任务）
+  alert_cooldown_hours: 6               # 非交易故障告警（stale_code/healthcheck_stale/evening_missing/心跳等）同一 event_type 冷却窗口内最多一次；状态 state/notify_cooldown.json
+  run_branch: chore/publish-prep        # stale_code 只在 HEAD 位于该分支时告警
 alerts:                                 # O2 链路告警（由 scripts/healthcheck.py 每 10 分钟调用 desk/chain_health.py）
   daily_missing_after: "09:30"          # 北京时间该时刻后仍无今日完成标记 → daily_missing（每天一次）
   heartbeat_hours: 0                    # 存活心跳间隔（小时）；0 = 关闭。默认关：外部无人值守接收方，心跳只会制造噪音，且主机整体宕机时本机发不出任何消息，真正的离机存活检测需要外部服务轮询，见风险登记表

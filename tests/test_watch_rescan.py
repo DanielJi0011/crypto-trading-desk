@@ -68,6 +68,7 @@ def test_catchup_uses_subprocess(monkeypatch):
 
 def test_stale_code_alert_hourly(monkeypatch):
     monkeypatch.setattr(W, "_code_rev", {"start": None, "alerted": 0.0})
+    monkeypatch.setattr(W, "git_branch", lambda: W.run_branch())   # HEAD 在运行分支上
     sent = []
     assert not W.check_code_version(now=1000, head="aaa", notifier=sent.append)
     assert not W.check_code_version(now=1100, head="aaa", notifier=sent.append)
