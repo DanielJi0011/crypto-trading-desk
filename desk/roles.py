@@ -4,6 +4,7 @@
 让该角色拿到的 LLM 在每次调用前把"本角色手册"追加到系统提示中（每次调用时实时读取当前版本）。"""
 from __future__ import annotations
 
+import contextvars
 import re
 from pathlib import Path
 
@@ -118,13 +119,47 @@ def _to_messages(inp):
     return inp
 
 
-BRIEFS: dict[str, str] = {}      # 角色 → 本轮专属数据简报（每个币分析前设置）
+_BRIEFS_VAR: contextvars.ContextVar = contextvars.ContextVar("ta_desk_briefs", default=None)
+
+
+class _Briefs:
+    """角色 → 本轮专属数据简报（每个币分析前设置）。
+    并行改造：底层是 ContextVar，每个币的分析线程（copy_context().run）各自持有一份，互不覆盖；
+    LangGraph 在执行节点/工具时会复制调用方上下文，所以图内各角色读到的是本币的简报。
+    串行（单线程）下与原来的模块级 dict 行为一致。只读接口：get / [] / in / items / len。"""
+
+    def _d(self) -> dict:
+        return _BRIEFS_VAR.get() or {}
+
+    def get(self, k, default=None):
+        return self._d().get(k, default)
+
+    def __getitem__(self, k):
+        return self._d()[k]
+
+    def __contains__(self, k):
+        return k in self._d()
+
+    def __len__(self):
+        return len(self._d())
+
+    def __iter__(self):
+        return iter(self._d())
+
+    def items(self):
+        return self._d().items()
+
+    def clear(self):
+        _BRIEFS_VAR.set({})
+
+
+BRIEFS = _Briefs()
 FLOWS_READERS = ("bull", "bear", "research_manager", "trader", "portfolio_manager")
 
 
 def set_briefs(briefs: dict):
-    BRIEFS.clear()
-    BRIEFS.update({k: v for k, v in briefs.items() if v})
+    """整体替换当前上下文的简报（新 dict，不原地改，避免别的线程看到半截状态）。"""
+    _BRIEFS_VAR.set({k: v for k, v in briefs.items() if v})
 
 
 class PlaybookLLM(Runnable):

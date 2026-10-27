@@ -6,7 +6,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from desk import add_position, ledger, okx_data, roles, settings
+from desk import add_position, drift, ledger, okx_data, roles, settings
 from desk import llm as dllm
 from desk.roles import INIT_WEIGHT, ROLE_CN, ROLE_KEYS
 from desk.stances import INVALID_STATUS, normalize as _norm_stance, role_texts, stance_status
@@ -16,7 +16,7 @@ DECISIONS = settings.STATE / "decisions.jsonl"
 # "close" = 交易经理对已有持仓平仓/减仓：是仓位管理动作，不是对未来价格方向的预测 → 共识里记 0，不参与方向打分
 DIR_NUM = {"bullish": 1, "bearish": -1, "neutral": 0, "close": 0}
 ACT_CN = {"hold(交易经理否决)": "不入场（交易经理否决）", "hold(交易经理缺席)": "不开新仓（交易经理缺席）", "buy": "开多", "short": "开空", "hold": "持有/观望", "sell": "平仓", "reduce": "减仓", "pending": "挂条件入场单", "hold(止损冷却)": "不开仓（止损冷却）", "hold(止盈后不追单)": "不开仓（止盈后交易经理否决追单）",
-          "add_long": "同向加多", "add_short": "同向加空", "pending_add": "挂条件加仓单"}
+          "add_long": "同向加多", "add_short": "同向加空", "pending_add": "挂条件加仓单", "hold(价格漂移)": "不下单（价格漂移超阈值）"}
 
 
 # 投票角色：组合经理只负责执行（过护栏、在 OKX 模拟盘下市价单/挂条件单），不投票、不计权重；交易经理作为一个投票角色
@@ -295,6 +295,9 @@ def _prompt(cfg, coin, mk, pos, bk, st, w, S, texts, preview=None):
 def decide_and_execute(cfg, coin, trade_date, fs, st, tracker, source="daily") -> dict:
     inst = coin["inst_id"]
     mk = market_ctx(inst)
+    ap = fs.get("_analysis_px")          # 分析开始时的参考价（run_daily 串行/并行两路都记）；没有则不做漂移检查
+    if ap:
+        mk["_analysis_ref"] = ap
     prices = {inst: mk["last"]}
     from desk import demo_exec
     bk = demo_exec.book(cfg, prices) if demo_exec.is_demo(cfg) else ledger.book(cfg, prices)
@@ -346,7 +349,9 @@ def decide_and_execute(cfg, coin, trade_date, fs, st, tracker, source="daily") -
            "price": mk["last"], "market": mk, "consensus": round(S, 4), "consensus_pre_tm": round(S_pre_tm, 4), "weights": w,
            "ta_signal": fs.get("_signal"), "manager": dec.model_dump(), "final_action": action, "size_pct": size,
            "notes": notes, "execution": execd, "stances": st, "aggregate": agg, "source": source,
-           "pending": res.get("pending"), "tm_status": status, "add_preview": preview,
+           "pending": res.get("pending"), "tm_status": status,
+           "analysis_px": (ap or {}).get("px"), "analysis_px_time": (ap or {}).get("time"),
+           "drift_check": agg.get("drift_check"), "drift_skipped": agg.get("drift_skipped"), "add_preview": preview,
            "tm_label_mismatch": None if absent else tm_label_mismatch(dec.model_dump()),
            "field_missing": None if absent else (tm_field_issues(dec.model_dump())["missing"] or None),
            "stance_field_conflicts": {r: s["field_conflict"] for r, s in st.items() if s.get("field_conflict")} or None,
@@ -549,6 +554,8 @@ def pm_execute(cfg, coin, did, st, w, mk, bk, pos, rationale, source="daily", tm
             pending.cancel(cfg, inst, "交易经理否决")
     elif not agg["buy"]:
         pending.cancel(cfg, inst, "新决策不支持入场")
+    elif drift.skip(cfg, inst, did, mk, agg, notes, "open"):
+        action = "hold(价格漂移)"
     else:
         size = agg["size_pct"]
         sl = agg["stop_loss"]
@@ -826,6 +833,8 @@ def _try_add(cfg, inst, did, agg, mk, bk, pos, st, w, tm, tm_state, source, rati
         return ("hold(交易经理否决)" if tm_state == "veto" else "hold(交易经理缺席)"), None, None, 0.0
     if tp_hold:
         return "hold(止盈后不追单)", None, None, 0.0
+    if drift.skip(cfg, inst, did, mk, agg, notes, "add"):
+        return "hold(价格漂移)", None, None, 0.0
     if _cooldown(cfg, inst, agg, did, notes):
         return "hold(止损冷却)", None, None, 0.0
     gate = pre_trade_gate(cfg, inst, mk)
@@ -960,6 +969,8 @@ def _pm_execute_demo_locked(cfg, coin, did, st, w, mk, bk, pos, rationale, sourc
             action = "hold(止损冷却)"
             if cancel_ok:
                 DX.cancel_triggers(cfg, inst, "止损冷却")
+        elif drift.skip(cfg, inst, did, mk, agg, notes, "open"):
+            action = "hold(价格漂移)"   # 只跳过本次新开仓/挂条件单；旧条件单、持仓不动
         else:
             size, sl, side = 0.0, agg["stop_loss"], agg["side"]
             lev = agg["leverage"] = 1.0

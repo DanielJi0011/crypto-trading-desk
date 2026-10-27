@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import os
+import threading
 
 from desk import settings
 
 FALLBACKS: list[str] = []          # 本次运行发生的回退说明（写入日报）
 MODEL_PROVIDER: dict[str, str] = {}  # 模型名 → 厂商（用于按厂商统计）
 _cache: dict = {}
+_LOCK = threading.RLock()   # 并行分析：首次创建客户端加锁，避免同一角色建两个实例
 
 
 def resolve(cfg, role: str) -> dict:
@@ -34,6 +36,11 @@ def build(cfg, role: str, tracker=None):
     if os.environ.get("TA_DESK_MOCK_LLM") == "1":
         from desk.llm import FakeChatModel
         return FakeChatModel(tier=role, callbacks=[tracker] if tracker else None)
+    with _LOCK:
+        return _build_locked(cfg, role, tracker)
+
+
+def _build_locked(cfg, role: str, tracker=None):
     key = (role, id(tracker))
     if key in _cache:
         return _cache[key]

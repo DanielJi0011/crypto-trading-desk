@@ -84,6 +84,15 @@ coins:                                  # TradingAgents 代码 -> OKX USDT 永�
   - {ticker: ETH-USD, inst_id: ETH-USDT-SWAP, name: 以太坊}
   - {ticker: SOL-USD, inst_id: SOL-USDT-SWAP, name: Solana}
 
+parallel:                               # 三币并行分析（2026-10-28 新增，默认关闭；用户同意后再改 true）
+  enabled: true                         # false：原串行流程（逐币 读账户→分析→立场→决策执行），行为完全不变
+                                        # true：只让各币"分析+立场提取"（等模型的部分）同时跑，三路全开不设上限、不错开启动；
+                                        #       账户在本场开始时由主线程按币顺序读取；决策与下单仍在主线程按 coins 顺序（BTC→ETH→SOL）串行，
+                                        #       护栏在 R8 锁内重读账户计算，与串行一致；重试策略不变（SDK max_retries + llm.retry_delays）
+drift_check:                            # 分析→执行价格漂移检查（2026-10-28 新增；串行/并行两路都生效）
+  enabled: true                         # 分析开始时记参考价 analysis_px，执行前对「新开仓（现价/条件单）和同向加仓」取最新公共行情价比较；
+                                        # 持有/平仓/减仓/止损止盈调整/撤单不受影响；取现价失败不阻断（记 drift_check_price_unavailable 告警）
+  max_pct: 1.0                          # |现价/分析价 - 1| 超过此百分比（%）则跳过该单，记 drift_skipped 并写进日报
 analysts: [market, social, news]        # 加密货币不使用 fundamentals（Yahoo 公司财报对币无意义）
 
 # ---------------- FRED 宏观数据（desk/macro.py）：只注入新闻分析师（news）日常讨论输入 + 日报小节；

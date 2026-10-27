@@ -5,6 +5,7 @@ import datetime as _dt
 import json
 import os
 import sys
+import threading
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -123,10 +124,15 @@ def write_json(path: Path, obj):
     tmp.replace(path)
 
 
+_JSONL_LOCK = threading.Lock()   # 并行分析：同进程多线程追加同一 jsonl 时整行写入，不交错
+
+
 def append_jsonl(path: Path, rec: dict):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
+    line = json.dumps(rec, ensure_ascii=False, default=str) + "\n"
+    with _JSONL_LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
 
 
 def read_jsonl(path: Path) -> list[dict]:

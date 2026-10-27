@@ -5,6 +5,7 @@ import contextvars
 import datetime as _dt
 import json
 import os
+import threading
 import uuid
 from typing import Any
 
@@ -99,6 +100,7 @@ class UsageTracker(BaseCallbackHandler):
         self.path = settings.STATE / "usage" / f"{settings.today()}.jsonl"
         self.calls = []
         self._node = {}
+        self._lock = threading.Lock()   # 并行分析：多线程回调时保护 calls/_node 与 jsonl 追加
 
     @staticmethod
     def _node_name(metadata):
@@ -107,13 +109,16 @@ class UsageTracker(BaseCallbackHandler):
         return top or md.get("langgraph_node")
 
     def on_chat_model_start(self, serialized, messages, *, run_id=None, metadata=None, **kw):
-        self._node[run_id] = self._node_name(metadata)
+        with self._lock:
+            self._node[run_id] = self._node_name(metadata)
 
     def on_llm_start(self, serialized, prompts, *, run_id=None, metadata=None, **kw):
-        self._node[run_id] = self._node_name(metadata)
+        with self._lock:
+            self._node[run_id] = self._node_name(metadata)
 
     def on_llm_end(self, response, *, run_id=None, **kw):
-        node = self._node.pop(run_id, None)
+        with self._lock:
+            node = self._node.pop(run_id, None)
         for gens in response.generations:
             for g in gens:
                 msg = getattr(g, "message", None)
@@ -130,17 +135,21 @@ class UsageTracker(BaseCallbackHandler):
                        "provider": provider_of(model),
                        "input": inp, "cached": cached, "output": out, "reasoning": reasoning,
                        "cost_usd": round(cost_usd(self.cfg, model, inp, cached, out), 6)}
-                self.calls.append(rec)
-                settings.append_jsonl(self.path, rec)
+                with self._lock:
+                    self.calls.append(rec)
+                    settings.append_jsonl(self.path, rec)
 
     def on_llm_error(self, error, *, run_id=None, **kw):
-        rec = {"run_id": RUN_ID, "time": settings.now_str(), "stage": STAGE.get(),
-               "node": self._node.pop(run_id, None), "error": type(error).__name__}
-        self.calls.append(rec)
-        settings.append_jsonl(self.path, rec)
+        with self._lock:
+            rec = {"run_id": RUN_ID, "time": settings.now_str(), "stage": STAGE.get(),
+                   "node": self._node.pop(run_id, None), "error": type(error).__name__}
+            self.calls.append(rec)
+            settings.append_jsonl(self.path, rec)
 
     def summary(self) -> dict:
-        ok = [c for c in self.calls if "error" not in c]
+        with self._lock:
+            calls = list(self.calls)
+        ok = [c for c in calls if "error" not in c]
         by_stage, by_model, by_node, by_provider = {}, {}, {}, {}
         for c in ok:
             for d, k in ((by_stage, c["stage"]), (by_model, c["model"]), (by_node, c.get("node") or c["stage"].split("/")[-1]),
@@ -149,7 +158,7 @@ class UsageTracker(BaseCallbackHandler):
                 x["calls"] += 1; x["input"] += c["input"]; x["cached"] += c["cached"]
                 x["output"] += c["output"]; x["cost_usd"] = round(x["cost_usd"] + c["cost_usd"], 6)
                 x["unpriced_calls"] = x.get("unpriced_calls", 0) + (0 if price_known(self.cfg, c["model"]) else 1)
-        return {"run_id": RUN_ID, "calls": len(ok), "errors": len(self.calls) - len(ok),
+        return {"run_id": RUN_ID, "calls": len(ok), "errors": len(calls) - len(ok),
                 "input": sum(c["input"] for c in ok), "cached": sum(c["cached"] for c in ok),
                 "output": sum(c["output"] for c in ok), "cost_usd": round(sum(c["cost_usd"] for c in ok), 6),
                 "unpriced_calls": sum(1 for c in ok if not price_known(self.cfg, c["model"])),

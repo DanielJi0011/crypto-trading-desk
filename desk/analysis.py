@@ -3,12 +3,15 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 
 from desk import llm as dllm
 from desk import okx_data, roles, settings
 
 log = logging.getLogger("ta-desk.analysis")
 _graph = None
+_GRAPH_LOCK = threading.RLock()     # 并行分析：建图/打补丁只做一次
+_XFEED_LOCK = threading.Lock()     # 并行分析：x_feed 缺失告警“检查标记→写标记”原子化，每场只告警一次
 
 
 _ORIG_MEMORY_STEP = None
@@ -30,6 +33,11 @@ def patch_ta_memory(cfg, cls):
 
 
 def build_graph(cfg, tracker):
+    with _GRAPH_LOCK:
+        return _build_graph(cfg, tracker)
+
+
+def _build_graph(cfg, tracker):
     global _graph
     if _graph is not None:
         return _graph
@@ -147,10 +155,11 @@ def x_feed_missing_alert(trade_date: str, ccy: str) -> bool:
     """L4：X 讨论摘录缺失时每天只告警一次（kind=x_feed_missing），标记文件 state/alerts/x_feed_missing_<日期>。"""
     from desk import sessions
     mark = settings.STATE / "alerts" / f"x_feed_missing_{sessions.key(trade_date, settings.SESSION)}"   # 每场一次
-    if mark.exists():
-        return False
-    mark.parent.mkdir(parents=True, exist_ok=True)
-    mark.write_text(ccy, encoding="utf-8")
+    with _XFEED_LOCK:
+        if mark.exists():
+            return False
+        mark.parent.mkdir(parents=True, exist_ok=True)
+        mark.write_text(ccy, encoding="utf-8")
     try:
         from desk import okx_demo
         okx_demo.log_event("x_feed_missing", date=trade_date, session=settings.SESSION, first_ccy=ccy)

@@ -25,7 +25,7 @@ def main(argv=None):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s",
                         handlers=[logging.StreamHandler(sys.stderr)])
     # 延迟导入：确保 TA_DESK_MOCK_LLM 先生效
-    from desk import analysis, ledger, manager, okx_data, report, review, roles, scoring, stances
+    from desk import analysis, drift, ledger, manager, okx_data, report, review, roles, scoring, stances
     from desk import llm as dllm
 
     cfg = settings.load_config()
@@ -78,25 +78,30 @@ def main(argv=None):
     except Exception as e:
         errors.append(f"宏观数据失败：{type(e).__name__}")
     # 3) 分析 + 决策
-    for coin in ([] if stop else coins):
-        try:
-            prices = {c["inst_id"]: okx_data.last_price(c["inst_id"]) for c in cfg["coins"]}
-            bk = demo_exec.book(cfg, prices) if demo_exec.is_demo(cfg) else ledger.book(cfg, prices)
-            res = analysis.analyze(cfg, coin, date, bk, tracker)
-            fs = res["final_state"]; fs["_signal"] = res["signal"]
-            tok = dllm.STAGE.set(f"{coin['inst_id']}/立场抽取")
+    run_coins = [] if stop else coins
+    if parallel_enabled(cfg) and len(run_coins) > 1:
+        _run_coins_parallel(cfg, run_coins, date, tracker, errors, decisions)
+    else:
+        for coin in run_coins:   # parallel.enabled=false：原串行流程（逐币 读账户→分析→立场→决策执行），行为不变
             try:
-                st = stances.extract(fs, cfg, tracker)
-            finally:
-                dllm.STAGE.reset(tok)
-            rec = manager.decide_and_execute(cfg, coin, date, fs, st, tracker)
-            rec["report_dir"] = res["report_dir"]
-            scoring.record_stances(cfg, rec)
-            decisions.append(rec)
-            print(f"[ta-desk] {coin['inst_id']}: TA评级={res['signal']} 共识={rec['consensus']:+.3f} → {rec['final_action']}", flush=True)
-        except Exception as e:
-            traceback.print_exc()
-            errors.append(f"{coin['inst_id']} 分析/决策失败：{type(e).__name__}: {e}")
+                prices = {c["inst_id"]: okx_data.last_price(c["inst_id"]) for c in cfg["coins"]}
+                bk = demo_exec.book(cfg, prices) if demo_exec.is_demo(cfg) else ledger.book(cfg, prices)
+                ap = drift.stamp(coin["inst_id"])   # 分析开始时的参考价（漂移检查用）
+                res = analysis.analyze(cfg, coin, date, bk, tracker)
+                fs = res["final_state"]; fs["_signal"] = res["signal"]; fs["_analysis_px"] = ap
+                tok = dllm.STAGE.set(f"{coin['inst_id']}/立场抽取")
+                try:
+                    st = stances.extract(fs, cfg, tracker)
+                finally:
+                    dllm.STAGE.reset(tok)
+                rec = manager.decide_and_execute(cfg, coin, date, fs, st, tracker)
+                rec["report_dir"] = res["report_dir"]
+                scoring.record_stances(cfg, rec)
+                decisions.append(rec)
+                print(f"[ta-desk] {coin['inst_id']}: TA评级={res['signal']} 共识={rec['consensus']:+.3f} → {rec['final_action']}", flush=True)
+            except Exception as e:
+                traceback.print_exc()
+                errors.append(f"{coin['inst_id']} 分析/决策失败：{type(e).__name__}: {e}")
     # 4) 刚平仓的（含盯市与今日决策产生的）复盘
     reviewed = {p.stem for p in review.REVIEWS.glob("*.json")} if review.REVIEWS.exists() else set()
     # 本地纸面账本 closed（旧纸面仓）+ OKX 模拟盘已平仓（positions-history 只读 + 本地事件关联 decision_id）
@@ -155,6 +160,81 @@ def main(argv=None):
     print(f"[ta-desk] 日报：{path}", flush=True)
     print(f"[ta-desk] LLM 用量：{usage['calls']} 次调用，输入 {usage['input']:,}（缓存 {usage['cached']:,}），输出 {usage['output']:,}，估算 ${usage['cost_usd']:.4f}", flush=True)
     return 1 if errors and not decisions and not stop else 0
+
+
+def parallel_enabled(cfg) -> bool:
+    """config parallel.enabled（默认 false）。"""
+    return bool((cfg.get("parallel") or {}).get("enabled", False))
+
+
+def _analyze_one(cfg, coin, date, bk, tracker):
+    """阶段一（工作线程内，独立 contextvars 上下文）：分析 + 立场提取。只读，不下单、不改账户。"""
+    from desk import analysis, stances
+    from desk import llm as dllm
+    from desk import drift
+    ap = drift.stamp(coin["inst_id"])   # 分析开始时的参考价（漂移检查用；各线程各自取）
+    res = analysis.analyze(cfg, coin, date, bk, tracker)
+    fs = res["final_state"]; fs["_signal"] = res["signal"]; fs["_analysis_px"] = ap
+    tok = dllm.STAGE.set(f"{coin['inst_id']}/立场抽取")
+    try:
+        st = stances.extract(fs, cfg, tracker)
+    finally:
+        dllm.STAGE.reset(tok)
+    return res, fs, st
+
+
+def _run_coins_parallel(cfg, coins, date, tracker, errors, decisions):
+    """parallel.enabled=true：只让各币"分析 + 立场提取"（等模型的部分）重叠。
+    1) 主线程：预建图/模型客户端/OKX 客户端，按币顺序逐个读账户（与串行同样的读法；此时本场尚未下单）；
+    2) 线程池（每币一路，不设上限，不错开）：analyze + stances.extract，每路 copy_context().run 独立上下文；
+    3) 主线程按 cfg 币种顺序（BTC→ETH→SOL）逐个等待该币分析结果后串行：decide_and_execute（锁内重读账户算护栏）→ record_stances → decisions。
+    单币分析失败按币记入 errors（顺序与串行一致），不影响其他币。"""
+    import contextvars
+    from concurrent.futures import ThreadPoolExecutor
+
+    from desk import analysis, demo_exec, ledger, manager, okx_data, scoring, tools
+    from desk import llm as dllm
+    if (dllm.ta_config(cfg) or {}).get("checkpoint_enabled"):
+        raise RuntimeError("parallel.enabled 要求 TradingAgents checkpoint_enabled=false（检查点会在共享图上重编译 self.graph）")
+    analysis.build_graph(cfg, tracker)          # 预建：图、角色补丁、OKX 数据源/工具补丁，避免线程里懒加载竞态
+    if os.environ.get("TA_DESK_MOCK_LLM") != "1":
+        from desk import providers
+        for role in (cfg.get("role_models") or {}):
+            providers.build(cfg, role, tracker)  # 预建各角色模型客户端（资金流/立场抽取/交易经理等）
+    tools._AS_OF["date"] = date                  # 三币同一交易日；线程内 analyze 写入的是同一值
+    okx_data.client()
+    print(f"[ta-desk] 并行分析开启：{[c['inst_id'] for c in coins]} 同时分析，决策执行仍按顺序串行", flush=True)
+
+    prep: dict = {}
+    for coin in coins:   # 主线程读账户；失败的币记下异常，阶段二按顺序写 errors
+        try:
+            prices = {c["inst_id"]: okx_data.last_price(c["inst_id"]) for c in cfg["coins"]}
+            prep[coin["inst_id"]] = demo_exec.book(cfg, prices) if demo_exec.is_demo(cfg) else ledger.book(cfg, prices)
+        except Exception as e:
+            prep[coin["inst_id"]] = e
+    futs = {}
+    with ThreadPoolExecutor(max_workers=len(coins), thread_name_prefix="ta-coin") as ex:
+        for coin in coins:
+            bk = prep[coin["inst_id"]]
+            if isinstance(bk, Exception):
+                continue
+            ctx = contextvars.copy_context()
+            futs[coin["inst_id"]] = ex.submit(ctx.run, _analyze_one, cfg, coin, date, bk, tracker)
+        # 阶段二：主线程固定顺序串行（流水线：BTC 分析完即可决策，ETH/SOL 分析仍在后台等模型；按顺序 result() 等待）
+        for coin in coins:
+            inst = coin["inst_id"]
+            try:
+                if isinstance(prep[inst], Exception):
+                    raise prep[inst]
+                res, fs, st = futs[inst].result()
+                rec = manager.decide_and_execute(cfg, coin, date, fs, st, tracker)
+                rec["report_dir"] = res["report_dir"]
+                scoring.record_stances(cfg, rec)
+                decisions.append(rec)
+                print(f"[ta-desk] {inst}: TA评级={res['signal']} 共识={rec['consensus']:+.3f} → {rec['final_action']}", flush=True)
+            except Exception as e:
+                traceback.print_exception(e)
+                errors.append(f"{inst} 分析/决策失败：{type(e).__name__}: {e}")
 
 
 if __name__ == "__main__":

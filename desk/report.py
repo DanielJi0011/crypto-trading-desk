@@ -218,6 +218,11 @@ def write(cfg, date, decisions, closed, reviews, weight_changes, pb_events, usag
             L.append("- ⚠️ 交易经理字段缺失：" + "、".join(d["field_missing"]))
         for r, c in (d.get("stance_field_conflicts") or {}).items():
             L.append(f"- ⚠️ {ROLE_CN.get(r, r)} 字段冲突：{c}")
+        if d.get("drift_skipped"):
+            from desk import drift as _DR
+            L.append("- " + _DR.describe(d["drift_skipped"]))
+        elif (d.get("drift_check") or {}).get("ok") is None and d.get("drift_check"):
+            L.append("- ⚠️ 漂移检查取现价失败，未阻断（" + str(d["drift_check"].get("error"))[:80] + "）")
         if d["notes"]:
             L.append("- 代码规则/护栏：" + "；".join(d["notes"]))
         L += [f"- 补记：{x}" for x in notes_by.pop(d["inst_id"], [])]
