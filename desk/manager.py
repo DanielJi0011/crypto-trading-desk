@@ -6,7 +6,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from desk import ledger, okx_data, roles, settings
+from desk import add_position, ledger, okx_data, roles, settings
 from desk import llm as dllm
 from desk.roles import INIT_WEIGHT, ROLE_CN, ROLE_KEYS
 from desk.stances import INVALID_STATUS, normalize as _norm_stance, role_texts, stance_status
@@ -15,7 +15,8 @@ WEIGHTS = settings.STATE / "weights.json"
 DECISIONS = settings.STATE / "decisions.jsonl"
 # "close" = 交易经理对已有持仓平仓/减仓：是仓位管理动作，不是对未来价格方向的预测 → 共识里记 0，不参与方向打分
 DIR_NUM = {"bullish": 1, "bearish": -1, "neutral": 0, "close": 0}
-ACT_CN = {"hold(交易经理否决)": "不入场（交易经理否决）", "hold(交易经理缺席)": "不开新仓（交易经理缺席）", "buy": "开多", "short": "开空", "hold": "持有/观望", "sell": "平仓", "reduce": "减仓", "pending": "挂条件入场单", "hold(止损冷却)": "不开仓（止损冷却）", "hold(止盈后不追单)": "不开仓（止盈后交易经理否决追单）"}
+ACT_CN = {"hold(交易经理否决)": "不入场（交易经理否决）", "hold(交易经理缺席)": "不开新仓（交易经理缺席）", "buy": "开多", "short": "开空", "hold": "持有/观望", "sell": "平仓", "reduce": "减仓", "pending": "挂条件入场单", "hold(止损冷却)": "不开仓（止损冷却）", "hold(止盈后不追单)": "不开仓（止盈后交易经理否决追单）",
+          "add_long": "同向加多", "add_short": "同向加空", "pending_add": "挂条件加仓单"}
 
 
 # 投票角色：组合经理只负责执行（过护栏、在 OKX 模拟盘下市价单/挂条件单），不投票、不计权重；交易经理作为一个投票角色
@@ -233,7 +234,7 @@ def _prompt(cfg, coin, mk, pos, bk, st, w, S, texts):
     lines = [f"你是加密货币交易台的交易经理，负责对 {coin['name']}（OKX 永续 {coin['inst_id']}）做今日最终执行决策。",
              f"标的是 OKX USDT 永续合约（OKX 模拟盘 Demo Trading 执行，逐仓），可以做多也可以做空，新开仓杠杆上限 {__import__('desk.config_safety', fromlist=['x']).max_open_leverage(cfg):g} 倍（代码强制）。",
              f"硬性规则（代码会强制，违反会被拒单）：单笔保证金≤权益 {g['max_position_pct']}%，总名义≤权益 {g.get('max_total_notional_pct') or g['max_total_exposure_pct'] * ledger.swap_cfg(cfg)['leverage_max']:g}%，"
-             f"开仓必须带止损（做多在下方、做空在上方）且止损距离≤{g['max_stop_loss_pct']}%，止损必须先于强平价触发，止损只能收紧，每币一仓不加仓。",
+             f"开仓必须带止损（做多在下方、做空在上方）且止损距离≤{g['max_stop_loss_pct']}%，止损必须先于强平价触发，止损只能收紧，" + ("每币一仓；同向加仓允许（加仓腿独立止盈止损，原仓不动；已有风险+加仓风险≤单笔上限，不足按剩余削减；反向不反手须先平仓）。" if add_position.enabled(cfg) else "每币一仓不加仓。"),
              "", "## 行情（OKX，已收盘日线）",
              f"最新价 {mk['last']:.6g}；最近日线 {mk['bar_date']} 收 {mk['close']:.6g}；5日 {mk['ret_5d']:+.2f}%；20日 {mk['ret_20d']:+.2f}%；"
              f"ATR14 {mk['atr14']:.6g}（{mk['atr14'] / mk['last'] * 100:.2f}%）；20日高 {mk['hi_20']:.6g} 低 {mk['lo_20']:.6g}",
@@ -270,7 +271,9 @@ def _prompt(cfg, coin, mk, pos, bk, st, w, S, texts):
               "条件单直接挂在 OKX 模拟盘，由交易所按最新价触发。注意：你只是投票角色之一，最终方向、仓位、入场价与止损由各角色"
               "按历史权重加权聚合决定，投资组合经理只负责执行（过护栏后在 OKX 模拟盘下市价单或挂 trigger 条件单，均附止损止盈）。"
               "仓位由代码按风险定仓（单笔止损亏损上限×共识强度×回撤缩放），size_pct 已废弃不再影响下单；你可以用 risk_scale（0~1，只降不升，0=否决）表达把握程度；"
-              "leverage 只作上限。已有持仓时不要填写条件入场。",
+              "leverage 只作上限。" + ("已有持仓时：同向加仓用 buy/short（现价）或 pending（条件加仓，entry_side 须与持仓同向），"
+                                    "加仓腿按加仓入场价独立挂止盈止损（原仓止盈止损不动）；不同意加仓请 action=hold 并在理由中写明（共识太弱或预算已满等）。"
+                                    if add_position.enabled(cfg) else "已有持仓时不要填写条件入场。"),
               "", "字段一致性（必须遵守，代码以动作标签为准）：action=hold = 观望/不入场（不算多空票，会被视为否决，本币不开仓、撤旧条件单），"
               "此时填写的条件单字段一律忽略；想按条件价位入场时 action=pending 并完整填写 entry_side/entry_trigger_px/entry_condition/entry_stop_loss，"
               "且 entry_size_pct 必须 >0（只作为挂单有效标记，实际仓位按风险定仓）；reduce_fraction 只在 action=reduce 时填写；"
@@ -417,7 +420,7 @@ def apply_position_sl_tp(cfg, pos, st, w, mk, dec, action, execd, notes):
         if getattr(dec, "new_tp", None):
             notes.append("减仓未成功，new_tp 未执行")
         return
-    if not (pos and (action.startswith("hold") or reduced)):
+    if not (pos and (action.startswith("hold") or reduced or action == "pending_add")):
         return
     if reduced and execd.get("remaining") is not None:
         pos = {**pos, "contracts": execd["remaining"]}
@@ -695,6 +698,102 @@ def pre_trade_gate(cfg, inst, mk) -> str | None:
     return None
 
 
+def _try_add(cfg, inst, did, agg, mk, bk, pos, st, w, tm, tm_state, source, rationale, notes, tp_hold):
+    """同向加仓：共识同向 → 交易经理可否决 → 按加仓入场价独立算止盈止损（ATR+2R+全员加权，RR≥1.5）→
+    与新开仓同一 sizing.size（止损=本腿止损）→ 原仓风险+本腿风险≤单笔上限（不足削减）→ 现价/条件加仓。
+    本腿独立挂 reduceOnly 保护，原仓止盈止损不动。返回 (action, execd, pend, size_pct)。"""
+    from desk import demo_exec as DX, okx_demo, sizing
+    side = pos["side"]
+    agg["add"] = None
+    if tm_state in ("veto", "absent"):
+        why = ((getattr(tm, "rationale", "") or "").strip()[:120] if tm is not None else "") or "交易经理缺席"
+        notes.append(f"同向加仓：交易经理{'否决' if tm_state == 'veto' else '缺席'}，不加仓（原因：{why}；共识 S={agg['S']:+.3f}）")
+        okx_demo.log_event("add_vetoed", inst_id=inst, decision_id=did, tm_state=tm_state, reason=why)
+        return ("hold(交易经理否决)" if tm_state == "veto" else "hold(交易经理缺席)"), None, None, 0.0
+    if tp_hold:
+        return "hold(止盈后不追单)", None, None, 0.0
+    if _cooldown(cfg, inst, agg, did, notes):
+        return "hold(止损冷却)", None, None, 0.0
+    gate = pre_trade_gate(cfg, inst, mk)
+    if gate:
+        notes.append(f"执行前复核未通过（{gate}），本次不加仓")
+        return "hold", None, None, 0.0
+    cur_sl, cur_tp = pos.get("sl_px"), pos.get("tp_px")
+    if cur_sl in (None, ""):
+        notes.append("现有持仓没有止损，不加仓")
+        return "hold", None, None, 0.0
+    now = agg["condition"] == "now"
+    add_px = float(mk["last"]) if now else float(agg["entry_px"])
+    rc = sizing.rcfg(cfg)
+    lv = sizing.wavg_levels(st, w, valid_voters(st), side, add_px)
+    plan = add_position.plan_sl_tp(rc, side, add_px, mk.get("atr14"), lv.get("stop"), lv.get("target"))
+    if plan["stop"] is None:
+        notes.append("加仓腿止损无效，不加仓"); notes += plan["notes"]
+        return "hold", None, None, 0.0
+    notes += plan["notes"]
+    sz_info = demo_size(cfg, {**agg, "entry_px": add_px, "stop_loss": float(plan["stop"])}, mk, bk, tm, inst)
+    if not sz_info.get("ok"):
+        notes.append(f"同向加仓定仓拒绝：{sz_info.get('reason')}")
+        okx_demo.log_event("add_rejected", inst_id=inst, decision_id=did, reasons=[sz_info.get("reason")])
+        return "hold", None, None, 0.0
+    r = DX.reg(); legs = (r.get("positions") or {}).get(inst, {}).get("legs")
+    a = add_position.budget(rc, pos, add_px, float(plan["stop"]), sz_info,
+                            float(bk["live_equity"] if bk.get("live_equity") else bk["equity"]),
+                            float(cfg["guardrails"]["max_position_pct"]), float(cfg["guardrails"].get("min_order_usd", 0)),
+                            legs=legs)
+    a.update(add_px=add_px, mode=("now" if now else "trigger"), base_sl=cur_sl, base_tp=cur_tp,
+             final_sl=plan["stop"], final_tp=plan["take_profit"], rr=plan["rr"])
+    agg["add"] = a
+    if not a["ok"]:
+        notes.append(add_position.describe(a))
+        okx_demo.log_event(a["reason"], inst_id=inst, decision_id=did, side=side, **{k: a.get(k) for k in ("existing_risk", "cap", "budget_left")})
+        if a["reason"] == "add_budget_full":
+            notes.append(f"交易经理/组合经理：同向加仓预算已满（现有风险 {a['existing_risk']:.2f} ≥ 上限 {a['cap']:.2f}），不加仓")
+        return "hold", None, None, 0.0
+    ct = float(okx_demo.instrument(inst)["ctVal"])
+    sz = okx_demo.contracts(inst, a["notional"] / add_px)
+    if not sz:
+        a.update(ok=False, reason="size_too_small"); notes.append(add_position.describe(a))
+        return "hold", None, None, 0.0
+    a["sz"] = sz
+    qty_add = float(sz) * ct
+    notes.append(add_position.describe(a))
+    if now:
+        ok, info = DX.add_now(cfg, bk, inst, pos, sz, plan["stop"], plan["take_profit"], did, add_px, a)
+        execd = {"type": "add", "ok": ok, **info}
+        if not ok:
+            notes.append("加仓护栏拒单：" + "；".join(info["reasons"]))
+            return "hold(护栏拒单)", execd, None, 0.0
+        notes.append(f"同向加仓 {sz} 张 @≈{add_px:.6g}（独立腿），本腿止损 {plan['stop']:.6g}、止盈 "
+                     f"{format(plan['take_profit'], '.6g') if plan['take_profit'] is not None else '无'}，RR {plan['rr']}；"
+                     f"原仓止损 {cur_sl}、止盈 {cur_tp} 不动")
+        return ("add_long" if side == "long" else "add_short"), execd, None, round(qty_add * add_px / float(pos.get("leverage") or 1) / bk["equity"] * 100, 4)
+    exp = (tm.entry_expire_hours if tm is not None and getattr(tm, "entry_expire_hours", None) else None) \
+        or cfg.get("pending", {}).get("default_expire_hours", 24)
+    meta = {"base_contracts": pos["contracts"], "base_avg": pos["avg_px"], "base_sl": float(cur_sl), "base_tp": cur_tp,
+            "base_qty": pos["qty"], "add_px": add_px, "risk_cap_usd": a["cap"],
+            "final_sl": plan["stop"], "final_tp": plan["take_profit"], "existing_risk": a["existing_risk"], "add_risk": a["add_risk"],
+            "algoId": None}
+    ok, info = DX.place_add_trigger(cfg, bk, inst, pos, {
+        "decision_id": did, "source": source, "side": side, "trigger_px": add_px, "condition": agg["condition"],
+        "stop_loss": plan["stop"], "take_profit": plan["take_profit"], "size_pct": 0, "horizon_days": agg["horizon_days"],
+        "expire_hours": float(exp), "consensus": agg["S"],
+        "reason": ("同向加仓：" + ((tm.entry_reason if tm is not None else "") or rationale or ""))[:200]}, sz, meta)
+    if not ok:
+        notes.append("条件加仓单护栏拒单：" + "；".join(info["reasons"]))
+        return "hold(护栏拒单)", None, None, 0.0
+    # 把 algoId 写回 add meta，便于成交复核识别本腿
+    r = DX.reg()
+    if info.get("algoId") and info["algoId"] in r.get("triggers", {}):
+        ad = (r["triggers"][info["algoId"]].get("add") or {})
+        ad["algoId"] = info["algoId"]
+        r["triggers"][info["algoId"]]["add"] = ad
+        DX.save_reg(r)
+    notes.append(f"条件加仓单 {info['algoId']}：{'多' if side == 'long' else '空'} {'≥' if agg['condition'] == 'gte' else '≤'} "
+                 f"{add_px:.6g}，{sz} 张；本腿止损 {plan['stop']:.6g}、止盈 {plan['take_profit']}；原仓止损止盈不动；成交时复核预算")
+    return "pending_add", None, info, 0.0
+
+
 def _pm_execute_demo_locked(cfg, coin, did, st, w, mk, bk, pos, rationale, source="daily", tm=None, tm_state=None) -> dict:
     """OKX 模拟盘直连版组合经理执行（禁止实盘，见 desk/demo_exec.py）：聚合 → 护栏（模拟盘数据）→ 现价市价单
     或 OKX trigger 条件单（均附带止损止盈）。不写本地纸面账本 / 本地 pending。任何模拟盘错误只记入 notes 与 demo_events。"""
@@ -714,9 +813,14 @@ def _pm_execute_demo_locked(cfg, coin, did, st, w, mk, bk, pos, rationale, sourc
             elif tm is not None and tm.action == "reduce":
                 f = _reduce_fraction(tm, notes)
                 execd = DX.reduce(cfg, pos, f, f"经理决策减仓{f:.0%}"); action = "reduce"
+            elif agg["buy"] and agg.get("side") != pos["side"]:
+                notes.append("共识方向与现有持仓相反：不反手（须先平仓）→ 持有")
+            elif agg["buy"] and not add_position.enabled(cfg):
+                notes.append("该币已有模拟盘持仓，不加仓/不反手 → 持有（risk.allow_add_position=false）")
             elif agg["buy"]:
-                notes.append("该币已有模拟盘持仓，不加仓/不反手 → 持有")
-            if cancel_ok:
+                action, execd, pend, size = _try_add(cfg, inst, did, agg, mk, bk, pos, st, w, tm, tm_state, source, rationale,
+                                                     notes, tp_hold)
+            if cancel_ok and action != "pending_add":
                 DX.cancel_triggers(cfg, inst, "已有持仓")
         elif tm_state in ("veto", "absent"):
             # 交易经理否决/缺席：不下现价单、不挂条件单；按 cancel_pending_on_new_decision 撤该币旧条件单（受保护的不撤）

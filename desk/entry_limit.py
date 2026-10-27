@@ -135,6 +135,16 @@ def _full_check(cfg, e) -> list:
     try:
         bk = DX.book(cfg)
         inst = e["inst"]
+        held = next((p for p in bk["positions"] if p["inst_id"] == inst and not p.get("legacy")), None)
+        if e.get("add") and held:
+            # 条件加仓单：现有持仓（含本单已成交部分）保留在视图里，按加仓模式检查待补的部分
+            bk = {**bk, "pending_entries": [p for p in (bk.get("pending_entries") or []) if p["inst_id"] != inst],
+                  "triggers": [t for t in bk["triggers"] if t["instId"] != inst]}
+            ct = float(_ct(inst)["ctVal"])
+            px = float(X.get("/api/v5/market/ticker", instId=inst)["data"][0]["last"])
+            rs, _ = DX.check_open(cfg, bk, inst, _num(e.get("remain")) * ct, px, e.get("stop_loss"), e["side"],
+                                  float(held.get("leverage") or e.get("lever") or 1), add=held)
+            return [str(x) for x in rs]
         bk = {**bk, "positions": [p for p in bk["positions"] if p["inst_id"] != inst],
               "pending_entries": [p for p in (bk.get("pending_entries") or []) if p["inst_id"] != inst],
               "triggers": [t for t in bk["triggers"] if t["instId"] != inst]}
@@ -189,7 +199,10 @@ def _place_oco(e, sz) -> str:
 
 
 def _protect_total(aid, e):
-    """按总仓位重挂一张 OCO：先挂新的（覆盖全部持仓），再撤旧的（避免中间出现裸仓）。"""
+    """普通入场：按总仓位重挂一张 OCO（先挂新再撤旧）。
+    条件加仓单（e.add）：只为本腿成交张数挂独立保护，不撤任何既有保护单。"""
+    if e.get("add"):
+        return _protect_add_leg(aid, e)
     total = _position_contracts(e)
     if total <= 0:
         X.log_event("entry_limit_protect_skip", algoId=aid, inst_id=e["inst"], why="无持仓")
@@ -206,6 +219,20 @@ def _protect_total(aid, e):
     if old:
         X.post("/api/v5/trade/cancel-algos", [{"instId": e["inst"], "algoId": a["algoId"]} for a in old])
         X.log_event("entry_limit_old_sltp_cancelled", algoId=aid, inst_id=e["inst"], cancelled=[a["algoId"] for a in old])
+    return new_id
+
+
+def _protect_add_leg(aid, e):
+    """加仓腿保护：张数=本笔已成交（accFillSz，无则 remain），不撤旧保护单。"""
+    sz = _num(e.get("accFillSz")) or _num(e.get("sz")) or _num(e.get("remain"))
+    if sz <= 0:
+        X.log_event("entry_limit_add_protect_skip", algoId=aid, inst_id=e["inst"], why="无成交张数")
+        return None
+    old_ids = {str(a.get("algoId")) for a in _close_algos_for(e)}
+    new_id = _place_oco({**e, "aid": aid}, X._dec(sz))
+    still = {str(a.get("algoId")) for a in _close_algos_for(e)}
+    X.log_event("entry_limit_add_leg_protect", algoId=aid, inst_id=e["inst"], new_algoId=new_id, sz=X._dec(sz),
+                old_kept=sorted(old_ids & still), old_lost=sorted(old_ids - still))
     return new_id
 
 

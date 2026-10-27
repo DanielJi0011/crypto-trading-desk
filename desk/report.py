@@ -201,8 +201,12 @@ def write(cfg, date, decisions, closed, reviews, weight_changes, pb_events, usag
               f"止损 {_px(m.get('stop_loss'))}，止盈 {_px(m.get('take_profit'))}，周期 {m.get('horizon_days')} 天，置信 {m.get('confidence')}",
               f"- 失效条件：{m.get('invalidation') or '—'}",
               f"- 理由：{m.get('rationale')}"]
+        _add = (d.get("aggregate") or {}).get("add")
+        if _add:
+            from desk import add_position as _AP
+            L.append("- 同向加仓决定：" + _AP.describe(_add))
         if d.get("tm_status") == "veto":
-            L.append("- **交易经理否决**：本币不下现价单、不挂条件单；按 cancel_pending_on_new_decision 撤旧条件单（受保护的不撤），已有持仓不动")
+            L.append("- **交易经理否决**：本币不下现价单、不挂条件单、不加仓；按 cancel_pending_on_new_decision 撤旧条件单（受保护的不撤），已有持仓不动")
         elif d.get("tm_status") == "absent":
             L.append("- **交易经理缺席，不开新仓**：调用失败，这一票不计入共识（不按中性 0.5 计），也不算否决")
         if d.get("tm_label_mismatch") or (d.get("tm_status") is None and _mm(m)):

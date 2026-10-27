@@ -245,7 +245,9 @@ def clip_to_risk(cfg, bk, inst, sz, px, sl, decision_id=None):
     return new
 
 
-def check_open(cfg, bk, inst, qty, px, sl, side, lev):
+def check_open(cfg, bk, inst, qty, px, sl, side, lev, add: dict | None = None):
+    """开仓护栏。add=本币现有持仓（同向加仓模式，risk.allow_add_position）：不查单币一仓、同币加仓不算新仓；
+    保证金按合并后整仓；强平按加仓后均价与原杠杆；单笔风险 = 现有风险（现止损到均价，盈利区按 0）+ 加仓风险。其余护栏不变。"""
     from desk import ledger
     g, sw = cfg["guardrails"], ledger.swap_cfg(cfg)
     reasons, checks = [], {}
@@ -263,6 +265,11 @@ def check_open(cfg, bk, inst, qty, px, sl, side, lev):
         fail(f"[LEVERAGE] 杠杆 {lev} 超出新开仓上限 1~{lev_cap:g}")
     notional = qty * px; margin = notional / max(lev, 1e-9)
     checks.update(notional_usd=round(notional, 4), margin_usd=round(margin, 4), leverage=lev, equity=round(eq, 4))
+    if add is not None:
+        if add.get("side") != side:
+            fail("[ADD] 加仓方向与持仓相反（不反手，须先平仓）")
+        margin = margin + float(add.get("margin") or 0)   # 单笔保证金上限按合并后整仓
+        checks["margin_after_add_usd"] = round(margin, 4)
     if qty <= 0 or px <= 0:
         fail("[SIZE] 数量与价格必须为正")
     if margin > eq * g["max_position_pct"] / 100 + 1e-9:
@@ -276,14 +283,18 @@ def check_open(cfg, bk, inst, qty, px, sl, side, lev):
     trig_insts = {t["instId"] for t in bk["triggers"]}
     held_insts = {p["inst_id"] for p in bk["positions"]}
     n_open = len(bk["positions"]) + len((trig_insts | pend_insts) - held_insts - {inst})
+    if add is not None and inst in held_insts:
+        n_open -= 1   # 同币加仓不算新仓
     if inst in pend_insts:
         fail("[ONE_PER_COIN] 该币有未完结的入场子单（视同已有持仓），不再开仓")
     checks["pending_entry_notional"] = round(sum(p["notional"] for p in pend), 4)
     checks["pending_entry_stop_risk"] = round(sum(p["stop_risk"] for p in pend), 4)
     if n_open >= g.get("max_open_positions", 3):
         fail(f"[MAX_POS] 持仓+其他币挂单 {n_open} 已达上限")
-    if any(p["inst_id"] == inst for p in bk["positions"]):
+    if add is None and any(p["inst_id"] == inst for p in bk["positions"]):
         fail("[ONE_PER_COIN] 该币已有持仓（含旧纸面仓），不加仓")
+    if add is not None and any(p["inst_id"] == inst and p.get("legacy") for p in bk["positions"]):
+        fail("[ADD] 旧纸面仓不加仓")
     trig_notional = sum(float(t["sz"]) * float(X.instrument(t["instId"])["ctVal"]) * float(t["triggerPx"])
                         for t in bk["triggers"] if t["instId"] != inst)
     exp = bk["exposure"] + trig_notional + sum(p["notional"] for p in pend)   # R12：在途入场子单名义计入总敞口
@@ -306,7 +317,12 @@ def check_open(cfg, bk, inst, qty, px, sl, side, lev):
             fail(f"[OPEN_RISK] 在途止损风险将达 {risk_after:.2f}，超过 {eq * float(rc['max_open_risk_pct']):.2f}")
     except Exception as e:
         fail(f"[GUARD_DATA] 组合层敞口计算失败（{type(e).__name__}），拒绝开仓")
-    liq = ledger.liq_price(side, px, max(lev, 1e-9), float(sw["maint_margin_rate"]))
+    liq_px_base = px
+    if add is not None:   # 强平按加仓后均价（原杠杆）
+        from desk import add_position as AP
+        liq_px_base = AP.new_avg(add, qty, px)
+        checks["avg_after_add"] = round(liq_px_base, 6)
+    liq = ledger.liq_price(side, liq_px_base, max(lev, 1e-9), float(sw["maint_margin_rate"]))
     checks["liq_px"] = liq
     if sl is None:
         fail("[STOP_LOSS] 开仓必须附带止损")
@@ -323,6 +339,11 @@ def check_open(cfg, bk, inst, qty, px, sl, side, lev):
             fail(f"[LIQUIDATION] 止损 {sl:.6g} 不会先于强平价 {liq:.6g} 触发")
         cap = risk_cap_usd(cfg, eq)   # 单笔止损亏损上限（risk.risk_per_trade_pct，R1 的上限部分）
         loss = qty * abs(px - sl)
+        if add is not None:   # 现有风险 + 加仓风险 ≤ 单笔上限
+            from desk import add_position as AP, sizing as _sz
+            ex_r = AP.existing_risk(add, _sz.rcfg(cfg))
+            checks.update(existing_risk_usd=round(ex_r, 4), add_risk_usd=round(loss, 4))
+            loss += ex_r
         checks.update(stop_loss_usd=round(loss, 4), risk_cap_usd=round(cap, 4))
         if loss > cap + 1e-6:
             fail(f"[RISK_PER_TRADE] 止损亏损 {loss:.2f} 超过单笔上限 {cap:.2f}（{float(risk_pct(cfg)):.2%}×权益）")
@@ -432,17 +453,129 @@ def place_trigger(cfg, bk, inst, o: dict):
     return True, {**meta, "id": meta["algoId"]}
 
 
+def place_leg_protection(p, sl, tp, contracts) -> str | None:
+    """为加仓腿挂一张只覆盖本腿张数的 reduceOnly 止盈止损；不撤任何既有保护单。返回新 algoId。"""
+    inst = p["inst_id"]
+    sz = X._dec(contracts)
+    body = {"instId": inst, "tdMode": "isolated", "side": "sell" if p["side"] == "long" else "buy",
+            "ordType": "oco" if (sl and tp) else "conditional", "sz": sz, "reduceOnly": True,
+            "algoClOrdId": det_id("addp", inst, p.get("pos_side", "net"), sl, tp, sz, settings.now_str()[:16])}
+    if p.get("pos_side", "net") != "net":
+        body["posSide"] = p["pos_side"]
+    if sl:
+        body.update(slTriggerPx=X._px(inst, sl), slOrdPx="-1", slTriggerPxType="last")
+    if tp:
+        body.update(tpTriggerPx=X._px(inst, tp), tpOrdPx="-1", tpTriggerPxType="last")
+    try:
+        new_id = X.post("/api/v5/trade/order-algo", body)["data"][0].get("algoId")
+    except Exception as e:
+        _alert("add_leg_protect_failed", inst_id=inst, step="place", error=f"{type(e).__name__}: {e}"[:300], sz=sz, sl=sl, tp=tp)
+        return None
+    if not _algo_live(inst, new_id):
+        _alert("add_leg_protect_failed", inst_id=inst, step="confirm", algoId=new_id, kept="all_old")
+        return None
+    X.log_event("add_leg_protect_ok", inst_id=inst, algoId=new_id, sz=sz, sl=sl, tp=tp)
+    return new_id
+
+
+def add_now(cfg, bk, inst, pos, sz, sl, tp, decision_id, ref_px, add_info=None):
+    """同向现价加仓：过加仓模式护栏 → 市价单并附带本腿止盈止损（只覆盖加仓张数）→
+    登记加仓腿。不改杠杆、不撤原仓保护单、不 consolidate。"""
+    from desk import add_position as AP
+    _require()
+    side, lev = pos["side"], float(pos.get("leverage") or 1)
+    qty = float(sz or 0) * float(X.instrument(inst)["ctVal"])
+    reasons, checks = check_open(cfg, bk, inst, qty, ref_px, sl, side, lev, add=pos)
+    if not sz:
+        reasons.append("[SIZE] 不足最小张数")
+    if trigger_orders(inst):
+        reasons.append("[ONE_PER_COIN] 该币仍有（受保护的）条件入场单，不再现价加仓")
+    if pending_entry_orders(inst):
+        reasons.append("[ONE_PER_COIN] 该币有未完结的入场子单，不再现价加仓")
+    if reasons:
+        X.log_event("add_rejected", inst_id=inst, decision_id=decision_id, reasons=reasons)
+        return False, {"reasons": reasons, "checks": checks}
+    ps = pos.get("pos_side") or _ps(side)
+    # 下单前记下原仓保护单，事后核对未被撤
+    old_ids = {str(a.get("algoId")) for a in close_algos(inst) if a.get("posSide") == ps}
+    cl = det_id("add", inst, decision_id or "-", side, sz, settings.now_str()[:16])
+    body = {"instId": inst, "tdMode": "isolated", "side": "buy" if side == "long" else "sell", "ordType": "market", "sz": sz,
+            "clOrdId": cl, "attachAlgoOrds": [_attach(inst, sl, tp, cl)]}
+    if ps != "net":
+        body["posSide"] = ps
+    d = X.post("/api/v5/trade/order", body)["data"][0]
+    # 附带止损止盈由交易所按本单张数生成；若未出现则补挂本腿保护单（仍不撤旧）
+    pid = None
+    try:
+        import time as _t
+        for _ in range(6):
+            now = [a for a in close_algos(inst) if a.get("posSide") == ps and str(a.get("algoId")) not in old_ids]
+            if now:
+                pid = now[0].get("algoId"); break
+            _t.sleep(0.3)
+    except Exception:
+        pass
+    if not pid:
+        pid = place_leg_protection(pos, sl, tp, float(sz))
+    still = {str(a.get("algoId")) for a in close_algos(inst) if a.get("posSide") == ps}
+    if old_ids - still:
+        X.log_event("add_old_protect_missing", inst_id=inst, missing=list(old_ids - still))
+    r = reg()
+    ent = r["positions"].setdefault(inst, {"decision_id": None, "side": side, "opened": pos.get("entry_time")})
+    AP.seed_open_leg(pos, ent)
+    leg = {"kind": "add", "decision_id": decision_id, "side": side, "entry": float(ref_px), "sz": sz, "qty": qty,
+           "sl": sl, "tp": tp, "ordId": d.get("ordId"), "protect_algoId": pid, "time": settings.now_str()}
+    if add_info:
+        for k in ("existing_risk", "add_risk", "budget_left", "clipped", "rr"):
+            if k in add_info:
+                leg[k] = add_info[k]
+    ent.setdefault("legs", []).append(leg)
+    ent.setdefault("adds", []).append({k: leg[k] for k in ("decision_id", "ordId", "sz", "sl", "tp", "entry", "time", "protect_algoId") if k in leg})
+    save_reg(r)
+    X.log_event("add_ok", inst_id=inst, decision_id=decision_id, ordId=d.get("ordId"), sz=sz, side=side, lever=lev, sl=sl, tp=tp,
+                protect_algoId=pid, old_protect_kept=list(old_ids),
+                **({k: add_info.get(k) for k in ("existing_risk", "add_risk", "budget_left", "clipped")} if add_info else {}))
+    return True, {"trade_id": f"DEMO-{inst}-{ps}", "ord_id": d.get("ordId"), "sz": sz, "qty": qty, "px": ref_px, "side": side,
+                  "leverage": lev, "margin": qty * ref_px / lev, "notional": qty * ref_px, "liq_px": checks.get("liq_px"),
+                  "checks": checks, "add": True, "protect_algoId": pid, "sl": sl, "tp": tp,
+                  "old_protect_kept": sorted(old_ids), "leg": leg}
+
+
+def place_add_trigger(cfg, bk, inst, pos, o: dict, sz: str, add_meta: dict):
+    """条件加仓单：加仓模式护栏；附带本腿独立止盈止损。成交后 on_fill 复核预算并确认本腿保护，不撤原仓保护单。"""
+    _require()
+    side, px = pos["side"], float(o["trigger_px"])
+    lev = float(pos.get("leverage") or 1)
+    qty = float(sz or 0) * float(X.instrument(inst)["ctVal"])
+    bk2 = {**bk, "triggers": [t for t in bk["triggers"] if t["instId"] != inst]}
+    reasons, checks = check_open(cfg, bk2, inst, qty, px, o.get("stop_loss"), side, lev, add=pos)
+    if not sz:
+        reasons.append("[SIZE] 不足最小张数")
+    if reasons:
+        X.log_event("add_trigger_rejected", inst_id=inst, decision_id=o.get("decision_id"), reasons=reasons)
+        return False, {"reasons": reasons, "checks": checks}
+    cancel_triggers(cfg, inst, "新条件加仓单替换")
+    if trigger_orders(inst):
+        return False, {"reasons": ["该币已有受保护的条件单，不替换"], "checks": checks}
+    expires = (settings.now() + _dt.timedelta(hours=float(o.get("expire_hours") or 24))).strftime("%Y-%m-%d %H:%M:%S%z")
+    meta = submit_trigger(cfg, inst, {**o, "leverage": lev}, sz, expires, extra={"add": dict(add_meta)}, keep_lev=True)
+    return True, {**meta, "id": meta["algoId"]}
+
+
 TRIGGER_META_KEYS = ("decision_id", "source", "side", "leverage", "trigger_px", "condition", "stop_loss", "take_profit",
                      "size_pct", "horizon_days", "consensus", "reason")
 
 
-def submit_trigger(cfg, inst, o: dict, sz: str, expires: str, force_market: bool = False, extra: dict | None = None) -> dict:
+def submit_trigger(cfg, inst, o: dict, sz: str, expires: str, force_market: bool = False, extra: dict | None = None,
+                   keep_lev: bool = False) -> dict:
     """按给定张数挂一张条件入场单（不重新算仓位、不过护栏——调用方负责先过 check_open）。
     entry_limit.enabled 且非 force_market 时 orderPx=新逻辑限价并登记超时跟踪，否则 orderPx=-1（市价触发）。
     写入登记表 triggers[algoId] 并返回 meta。place_trigger 与 scripts/reprice_triggers_limit.py 共用。"""
     _require()
     side, lev, px = o["side"], float(o.get("leverage") or 1), float(o["trigger_px"])
-    ps = _ps(side); _set_lev(inst, lev, ps)
+    ps = _ps(side)
+    if not keep_lev:   # 加仓单：逐仓 set-leverage 作用于整仓，沿用现有持仓杠杆，不改
+        _set_lev(inst, lev, ps)
     el = ecfg(cfg)["entry_limit"]
     order_px = "-1"
     if el.get("enabled") and not force_market:
@@ -467,7 +600,8 @@ def submit_trigger(cfg, inst, o: dict, sz: str, expires: str, force_market: bool
         from desk import entry_limit
         entry_limit.register(d["algoId"], inst=inst, side=side, pos_side=ps, sz=sz, order_px=order_px, trigger_px=px,
                              stop_loss=o.get("stop_loss"), take_profit=o.get("take_profit"),
-                             attach_cl=att["attachAlgoClOrdId"], lever=lev, decision_id=o.get("decision_id"))
+                             attach_cl=att["attachAlgoClOrdId"], lever=lev, decision_id=o.get("decision_id"),
+                             **({"add": dict(extra["add"])} if (extra or {}).get("add") else {}))
     try:   # 挂单即时提醒（与开平仓同一 webhook 通道；按 algoId 去重，entry_limit_registered 不再另发）
         from desk.demo_ws import notify_placed
         notify_placed(meta)
@@ -527,7 +661,8 @@ def reduce(cfg, p, fraction, reason):
         return _reduce(cfg, p, fraction, reason)
 
 
-def _reduce(cfg, p, fraction, reason):
+def _reduce(cfg, p, fraction, reason, restitch_protection: bool = True):
+    """restitch_protection=False：只市价减仓，不重挂/不撤保护单（加仓腿复核减仓用，避免 consolidate 原仓保护）。"""
     lot = float(X.instrument(p["inst_id"])["lotSz"])
     part = math.floor(p["contracts"] * fraction / lot + 1e-9) * lot
     if part <= 0:
@@ -537,8 +672,9 @@ def _reduce(cfg, p, fraction, reason):
     if p.get("pos_side", "net") != "net":
         body["posSide"] = p["pos_side"]
     X.post("/api/v5/trade/order", body)
-    _replace_close_algos(p, p.get("sl_px"), p.get("tp_px"), X._dec(p["contracts"] - part))
-    X.log_event("reduce_ok", inst_id=p["inst_id"], sz=X._dec(part), reason=reason)
+    if restitch_protection:
+        _replace_close_algos(p, p.get("sl_px"), p.get("tp_px"), X._dec(p["contracts"] - part))
+    X.log_event("reduce_ok", inst_id=p["inst_id"], sz=X._dec(part), reason=reason, restitch=restitch_protection)
     return {"type": "reduce", "ok": True, "trade_id": p["trade_id"], "px": p["price"], "pnl": p["upnl"] * fraction,
             "remaining": float(X._dec(p["contracts"] - part))}   # 剩余张数：减仓后改止损时按此张数挂单
 

@@ -33,6 +33,7 @@ ENFORCED = {
     "risk.max_daily_loss_pct": ["desk/equity_guard.py"],
     "risk.max_drawdown_pct": ["desk/equity_guard.py"],
     "risk.risk_per_trade_pct": ["desk/demo_exec.py", "desk/sizing.py"],
+    "risk.allow_add_position": ["desk/add_position.py"],
     "risk.max_notional_per_trade_pct": ["desk/sizing.py"],
     "risk.max_margin_pct": ["desk/sizing.py"],
     "risk.stop_atr_mult": ["desk/sizing.py"],

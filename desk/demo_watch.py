@@ -90,6 +90,18 @@ def run_once(cfg, source: str = "demo_watch 轮询") -> dict:
         if state == "effective":
             # R12：effective 只代表触发，不代表成交。记 trigger_fired，并记下子单 ordId，成交由子单状态确认（entry_filled）
             child = h[0].get("ordId") or (h[0].get("ordIdList") or [None])[0]
+            if m.get("add"):
+                # 条件加仓单：保留原开仓登记，成交后由 add_position.on_fill 复核预算并确认本腿独立保护单（不撤原仓保护）
+                r.setdefault("add_fills", {})[aid] = {**m["add"], "inst_id": m["inst_id"], "child_ordId": child,
+                                                      "decision_id": m.get("decision_id"), "fired": settings.now_str()}
+                r["positions"].setdefault(m["inst_id"], {"decision_id": m.get("decision_id"), "side": m.get("side"),
+                                                         "opened": settings.now_str()}).setdefault("adds", []).append(
+                    {"decision_id": m.get("decision_id"), "from_algo": aid, "child_ordId": child, "time": settings.now_str()})
+                X.log_event("add_trigger_fired", inst_id=m["inst_id"], algoId=aid, ordId=child)
+                _adv(aid, "triggered", inst_id=m["inst_id"], child_ordId=child)
+                log(f"条件加仓单 {aid} {m['inst_id']} 已触发（子单 {child}），成交后复核预算")
+                r["triggers"].pop(aid)
+                continue
             r["positions"][m["inst_id"]] = {"decision_id": m.get("decision_id"), "side": m.get("side"), "opened": settings.now_str(),
                                             "from_algo": aid, "child_ordId": child, "horizon_days": float(m.get("horizon_days") or 5),
                                             "deadline": (now + _dt.timedelta(days=float(m.get("horizon_days") or 5))).strftime("%Y-%m-%d %H:%M:%S%z")}
@@ -135,6 +147,15 @@ def run_once(cfg, source: str = "demo_watch 轮询") -> dict:
             _notify("position_expired", inst_id=inst, message=f"{inst} 持有期到期，已平仓（只通知，不再讨论）")
             r = DX.reg()
     DX.save_reg(r)
+    # 2a) 条件加仓单成交复核（预算 + 本腿独立保护单），须在止损覆盖检查之前
+    if r.get("add_fills"):
+        try:
+            from desk import add_position
+            for aid, res in add_position.on_fill(cfg, r):
+                log(f"条件加仓 {aid} 成交复核：{res}")
+        except Exception as e:
+            log(f"条件加仓复核失败 {type(e).__name__}: {e}")
+        DX.save_reg(r)
     # 2b) R11 止损覆盖：每个持仓必须有覆盖全部张数的止损（缺失告警；按配置自动重挂）
     try:
         from desk import stop_coverage
