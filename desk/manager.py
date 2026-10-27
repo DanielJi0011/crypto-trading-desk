@@ -229,7 +229,7 @@ def market_ctx(inst: str) -> dict:
             "atr14": float(tr.tail(14).mean()), "hi_20": float(h.tail(20).max()), "lo_20": float(l.tail(20).min())}
 
 
-def _prompt(cfg, coin, mk, pos, bk, st, w, S, texts):
+def _prompt(cfg, coin, mk, pos, bk, st, w, S, texts, preview=None):
     g = cfg["guardrails"]
     lines = [f"你是加密货币交易台的交易经理，负责对 {coin['name']}（OKX 永续 {coin['inst_id']}）做今日最终执行决策。",
              f"标的是 OKX USDT 永续合约（OKX 模拟盘 Demo Trading 执行，逐仓），可以做多也可以做空，新开仓杠杆上限 {__import__('desk.config_safety', fromlist=['x']).max_open_leverage(cfg):g} 倍（代码强制）。",
@@ -250,6 +250,12 @@ def _prompt(cfg, coin, mk, pos, bk, st, w, S, texts):
                      f"浮盈亏 {pos['upnl']:+.2f} USDT，到期 {pos['deadline']}")
     else:
         lines.append("本币无持仓。")
+    if pos and add_position.enabled(cfg):
+        lines += ["", "## 加仓预览（代码按加仓规则预算，只是信息）",
+                  describe_add_preview(preview) if preview else "加仓预览：未能计算（无数据），不影响决策流程。",
+                  "判断是否加仓时，不要拿原仓止损止盈或原仓均价去类比（例如「离原仓止损仅 N 点」不是否决加仓的理由）："
+                  "加仓是新订单，该腿按加仓入场价独立设止损止盈、只覆盖加仓张数，原仓点位不动；请看上面加仓预览里该腿自己的止损距离、RR 与预算。"
+                  "最终是否加仓仍由你决定，你的否决权不变（hold/risk_scale=0）。"]
     from desk import analysis as _an
     lines += ["", _an.pending_brief(bk)]
     lines += ["", f"## 各角色观点（权重为历史表现给出；加权共识 S={S:+.3f}，范围 -1~+1）",
@@ -305,12 +311,16 @@ def decide_and_execute(cfg, coin, trade_date, fs, st, tracker, source="daily") -
         did = f"{pre}{inst.split('-')[0]}-{k}"; k += 1
         if did not in used:
             break
+    try:
+        preview = add_preview(cfg, inst, mk, bk, pos, st, w, S)
+    except Exception as e:   # 预览只是信息，算不出不阻断
+        preview = {"items": [], "error": f"预览计算失败（{type(e).__name__}）", "base_sl": (pos or {}).get("sl_px"), "base_tp": (pos or {}).get("tp_px")} if pos else None
     tok = dllm.STAGE.set(f"{inst}/交易经理")
     try:
         # L5：交易经理也读自己的角色手册（playbooks/trade_manager 当前版本）
         model = roles.PlaybookLLM(dllm.make_llm(cfg, "deep", tracker, role="trade_manager").with_structured_output(ManagerDecision),
                                   "trade_manager")
-        dec = model.invoke(_prompt(cfg, coin, mk, pos, bk, st, w, S, texts))
+        dec = model.invoke(_prompt(cfg, coin, mk, pos, bk, st, w, S, texts, preview))
         if isinstance(dec, dict):
             dec = ManagerDecision(**dec)
         absent = False
@@ -336,7 +346,7 @@ def decide_and_execute(cfg, coin, trade_date, fs, st, tracker, source="daily") -
            "price": mk["last"], "market": mk, "consensus": round(S, 4), "consensus_pre_tm": round(S_pre_tm, 4), "weights": w,
            "ta_signal": fs.get("_signal"), "manager": dec.model_dump(), "final_action": action, "size_pct": size,
            "notes": notes, "execution": execd, "stances": st, "aggregate": agg, "source": source,
-           "pending": res.get("pending"), "tm_status": status,
+           "pending": res.get("pending"), "tm_status": status, "add_preview": preview,
            "tm_label_mismatch": None if absent else tm_label_mismatch(dec.model_dump()),
            "field_missing": None if absent else (tm_field_issues(dec.model_dump())["missing"] or None),
            "stance_field_conflicts": {r: s["field_conflict"] for r, s in st.items() if s.get("field_conflict")} or None,
@@ -696,6 +706,110 @@ def pre_trade_gate(cfg, inst, mk) -> str | None:
             okx_demo.log_event("price_drift_skip", inst_id=inst, analysis_px=mk["last"], now_px=now_px, limit=round(lim, 6))
             return "price_drift_skip"
     return None
+
+
+def add_preview(cfg, inst, mk, bk, pos, st, w, S=None) -> dict | None:
+    """交易经理决策前的「加仓预览」（只读信息，不下单、不改点位）。
+    已有持仓且 allow_add_position 开启时，对各角色提出的同向入场价与现价，按加仓入场价独立算本腿止损/止盈/RR
+    （add_position.plan_sl_tp），并用 add_position.budget 预算加仓张数与「原仓风险+本腿风险」是否在单笔上限内。
+    任一步算不出来只写原因，不抛错。无持仓或开关关闭返回 None。"""
+    if not pos or pos.get("legacy") or not add_position.enabled(cfg):
+        return None
+    from desk import sizing, okx_demo
+    side = pos["side"]
+    want = "bullish" if side == "long" else "bearish"
+    out = {"side": side, "base_sl": pos.get("sl_px"), "base_tp": pos.get("tp_px"), "items": [], "error": None}
+    try:
+        rc = sizing.rcfg(cfg)
+        last = float(mk["last"])
+        cands = [("现价", last)]
+        for r in ROLE_KEYS:
+            s = _norm_stance((st or {}).get(r) or {})
+            px = s.get("entry_px")
+            if s.get("direction") != want or px in (None, ""):
+                continue
+            try:
+                px = float(px)
+            except (TypeError, ValueError):
+                continue
+            if px > 0:
+                cands.append((ROLE_CN.get(r, r), px))
+        merged: dict = {}
+        for who, px in cands:
+            k = round(px, 8)
+            merged.setdefault(k, {"px": px, "by": []})["by"].append(who)
+        vv = valid_voters(st or {})
+        try:
+            legs = (DXreg().get("positions") or {}).get(inst, {}).get("legs")
+        except Exception:
+            legs = None
+        S0 = float(S if S is not None else consensus(st or {}, w or {}))
+        S_use = (1 if side == "long" else -1) * max(abs(S0), 1e-6)
+        for k, m in merged.items():
+            px = m["px"]
+            it = {"by": m["by"], "add_px": px, "stop": None, "tp": None, "rr": None, "sz": None,
+                  "existing_risk": None, "add_risk": None, "cap": None, "within_budget": None, "reason": None, "notes": []}
+            out["items"].append(it)
+            try:
+                lv = sizing.wavg_levels(st or {}, w or {}, vv, side, px) if vv else {}
+                plan = add_position.plan_sl_tp(rc, side, px, mk.get("atr14"), lv.get("stop"), lv.get("target"))
+                it["notes"] = list(plan.get("notes") or [])
+                if plan["stop"] is None:
+                    it["reason"] = "加仓腿止损无效"; continue
+                it.update(stop=plan["stop"], tp=plan["take_profit"], rr=plan["rr"])
+                if "live_equity" not in bk:
+                    it["reason"] = "非模拟盘账户，无法按风险定仓预算张数"; continue
+                sz_info = demo_size(cfg, {"S": S_use, "side": side, "entry_px": px, "stop_loss": float(plan["stop"])}, mk, bk, None, inst)
+                if not sz_info.get("ok"):
+                    it["reason"] = f"定仓拒绝：{sz_info.get('reason')}"; continue
+                a = add_position.budget(rc, pos, px, float(plan["stop"]), sz_info,
+                                        float(bk["live_equity"] if bk.get("live_equity") else bk["equity"]),
+                                        float(cfg["guardrails"]["max_position_pct"]),
+                                        float(cfg["guardrails"].get("min_order_usd", 0)), legs=legs)
+                it.update(existing_risk=a.get("existing_risk"), add_risk=a.get("add_risk"), cap=a.get("cap"),
+                          clipped=a.get("clipped"), clip_by=a.get("clip_by"))
+                if not a["ok"]:
+                    it.update(within_budget=False, reason=a.get("reason")); continue
+                sz = okx_demo.contracts(inst, a["notional"] / px)
+                if not sz:
+                    it.update(within_budget=False, reason="size_too_small"); continue
+                it.update(sz=sz, within_budget=(float(a["existing_risk"]) + float(a["add_risk"]) <= float(a["cap"]) + 1e-6))
+            except Exception as e:
+                it["reason"] = f"预览计算失败（{type(e).__name__}: {str(e)[:80]}）"
+    except Exception as e:
+        out["error"] = f"预览计算失败（{type(e).__name__}: {str(e)[:120]}）"
+    return out
+
+
+def DXreg() -> dict:
+    from desk import demo_exec as DX
+    return DX.reg()
+
+
+def _fmt(v) -> str:
+    return "—" if v is None else (format(float(v), ".6g") if isinstance(v, (int, float)) else str(v))
+
+
+def describe_add_preview(pv: dict | None) -> str:
+    """加仓预览文本（交易经理提示词与日报共用）。"""
+    if not pv:
+        return ""
+    head = (f"加仓预览（仅供决策参考，不下单不改点位；加仓腿按加仓入场价独立算止损止盈，只覆盖加仓张数；"
+            f"原仓止损 {_fmt(pv.get('base_sl'))}、止盈 {_fmt(pv.get('base_tp'))} 不动）")
+    if pv.get("error"):
+        return head + "：" + pv["error"]
+    rows = []
+    for it in pv.get("items") or []:
+        s = (f"{'/'.join(it['by'])} 入场 {_fmt(it['add_px'])}：本腿止损 {_fmt(it['stop'])}、止盈 {_fmt(it['tp'])}、"
+             f"RR {('%.2f' % it['rr']) if it.get('rr') is not None else '—'}、加仓 {it['sz'] or '—'} 张")
+        if it.get("cap") is not None:
+            s += (f"、原仓风险 {float(it['existing_risk'] or 0):.2f}+本腿风险 {float(it['add_risk'] or 0):.2f}"
+                  f" / 上限 {float(it['cap']):.2f} USDT（0.75%预算"
+                  + ("内" if it.get("within_budget") else "不足") + (f"，已削减：{'、'.join(it.get('clip_by') or [])}" if it.get("clipped") else "") + "）")
+        if it.get("reason"):
+            s += f"；算不出/不可加：{it['reason']}"
+        rows.append(s)
+    return head + "：" + ("；".join(rows) if rows else "无可预览的同向入场价")
 
 
 def _try_add(cfg, inst, did, agg, mk, bk, pos, st, w, tm, tm_state, source, rationale, notes, tp_hold):

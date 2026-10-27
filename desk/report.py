@@ -201,6 +201,9 @@ def write(cfg, date, decisions, closed, reviews, weight_changes, pb_events, usag
               f"止损 {_px(m.get('stop_loss'))}，止盈 {_px(m.get('take_profit'))}，周期 {m.get('horizon_days')} 天，置信 {m.get('confidence')}",
               f"- 失效条件：{m.get('invalidation') or '—'}",
               f"- 理由：{m.get('rationale')}"]
+        if d.get("add_preview"):
+            from desk.manager import describe_add_preview as _dap
+            L.append("- " + _dap(d["add_preview"]))
         _add = (d.get("aggregate") or {}).get("add")
         if _add:
             from desk import add_position as _AP
