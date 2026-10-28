@@ -196,6 +196,7 @@ manager:
   max_size_pct: 20                      # 交易经理建议仓位的上限（再受护栏约束）
   allow_stop_widen: false               # 已有持仓只允许上移止损，不允许放宽
   tp_min_gap_pct: 0.3                   # 交易经理 new_tp：新止盈须在现价盈利一侧且距现价至少 0.3%，避免改完立即触发（可调近可调远）
+  tm_hold_keep_sltp: true               # 2026-10-28 用户决定：交易经理 hold 且 new_stop/new_tp 都留空 → 保持原止损止盈，不套全员加权调点；false=旧行为
 
 # L4 数据质量：输入数据缺失的角色记 data_missing，不进共识也不打分
 notify:                                 # webhook 降噪（每条 webhook 会唤起一次 Grok Bot 任务）
