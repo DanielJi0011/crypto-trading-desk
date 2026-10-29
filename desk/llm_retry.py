@@ -41,22 +41,24 @@ def _stage():
         return None
 
 
-def call(fn, *a, **k):
-    """按 DELAYS 退避重试 fn；不可重试的错误直接抛出。"""
-    for i in range(len(DELAYS) + 1):
+def call(fn, *a, delays=None, any_error=False, **k):
+    """按 DELAYS 退避重试 fn；不可重试的错误直接抛出。
+    delays：本次调用专用退避序列（缺省用全局 DELAYS）；any_error=True 时任何异常都重试（持有期到期判断用）。"""
+    ds = list(DELAYS if delays is None else delays)
+    for i in range(len(ds) + 1):
         try:
             return fn(*a, **k)
         except Exception as e:
-            if not retryable(e):
+            if not (any_error or retryable(e)):
                 raise
             msg = f"{type(e).__name__}: {str(e)[:200]}"
-            if i >= len(DELAYS):
+            if i >= len(ds):
                 FAILURES.append({"stage": _stage(), "attempts": i + 1, "error": msg})
                 log.error("LLM 调用重试 %d 次后仍失败（%s）：%s", i, _stage(), msg)
                 raise
-            RETRIES.append({"stage": _stage(), "attempt": i + 1, "wait": DELAYS[i], "error": msg})
-            log.warning("LLM 调用可重试错误（%s），第 %d 次重试，%ss 后：%s", _stage(), i + 1, DELAYS[i], msg)
-            SLEEP(DELAYS[i])
+            RETRIES.append({"stage": _stage(), "attempt": i + 1, "wait": ds[i], "error": msg})
+            log.warning("LLM 调用可重试错误（%s），第 %d 次重试，%ss 后：%s", _stage(), i + 1, ds[i], msg)
+            SLEEP(ds[i])
 
 
 def install(cfg=None):

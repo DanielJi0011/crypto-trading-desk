@@ -39,7 +39,7 @@ class DemoError(RuntimeError):
     pass
 
 
-EVENT_SOURCES = ("strategy", "rediscuss", "ops", "test")   # O3：事件来源；每日下单数护栏只统计 strategy 与 rediscuss
+EVENT_SOURCES = ("strategy", "rediscuss", "ops", "test", "expiry")   # O3：事件来源；每日下单数护栏只统计 strategy 与 rediscuss（expiry=持有期到期全员讨论，不计入）
 
 
 def event_source() -> str:

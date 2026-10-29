@@ -115,8 +115,9 @@ def test_healthcheck_stale(iso):
     sent = []
     (iso / "healthcheck_state.json").write_text(json.dumps({"last_run": 1000.0}))
     assert chain_health.healthcheck_stale(1000 + 600, lambda e: sent.append(e["kind"])) is False
-    assert chain_health.healthcheck_stale(1000 + 1801, lambda e: sent.append(e["kind"])) is True
-    assert chain_health.healthcheck_stale(1000 + 2400, lambda e: sent.append(e["kind"])) is False
+    assert chain_health.healthcheck_stale(1000 + 1801, lambda e: sent.append(e["kind"])) is False   # 2026-10-29：阈值 60 分钟
+    assert chain_health.healthcheck_stale(1000 + 3601, lambda e: sent.append(e["kind"])) is True
+    assert chain_health.healthcheck_stale(1000 + 4200, lambda e: sent.append(e["kind"])) is False
     assert sent == ["healthcheck_stale"]
     from desk import demo_ws
     for k in ["daily_missing", "daily_done", "healthcheck_stale", "kill_on", "kill_off", "halt_on", "halt_off", "chain_unhealthy", "heartbeat"]:
@@ -149,3 +150,15 @@ def test_kill_drill_tag(iso):
     assert m[0][0] == "kill_on" and m[0][1].startswith("【演练】")
     assert m[1][0] == "kill_off" and m[1][1].startswith("【演练】")
     assert m[2][0] == "kill_on" and "演练" not in m[2][1]
+
+
+def test_healthcheck_stale_threshold_from_config(iso):
+    from desk import chain_health
+    assert settings.load_config()["alerts"]["healthcheck_stale_minutes"] == 60
+    assert chain_health.stale_limit_s({"alerts": {}}) == 3600          # 缺字段默认 60 分钟
+    (iso / "healthcheck_state.json").write_text(json.dumps({"last_run": 1000.0}))
+    sent = []
+    cfg = {"alerts": {"healthcheck_stale_minutes": 60}}
+    assert chain_health.healthcheck_stale(1000 + 1801, sent.append, cfg=cfg) is False   # 30 分钟抖动不再误报
+    assert chain_health.healthcheck_stale(1000 + 3601, sent.append, cfg=cfg) is True
+    assert chain_health.healthcheck_stale(1000 + 100, sent.append, cfg={"alerts": {"healthcheck_stale_minutes": 1}}) is False

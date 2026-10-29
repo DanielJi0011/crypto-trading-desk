@@ -65,3 +65,10 @@ def _no_real_send_no_real_state(monkeypatch, tmp_path):
 # 这样在没有 .venv 的检出（如导出副本、worktree）里也能跑。
 import os as _os, sys as _sys
 _os.environ.setdefault("TA_DESK_PYTHON", _sys.executable)
+
+
+@pytest.fixture(autouse=True)
+def _no_expiry_discuss_spawn(monkeypatch):
+    """测试不得真的启动持有期到期全员讨论子进程（需要的用例自行替换 SPAWN 观察参数）。"""
+    from desk import expiry_discuss
+    monkeypatch.setattr(expiry_discuss, "SPAWN", lambda args, logfile: None)

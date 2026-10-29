@@ -50,5 +50,6 @@ def test_expiry_only_notifies(monkeypatch, tmp_path):
     monkeypatch.setattr(demo_ws, "notify", lambda ev: sent.append(ev["kind"]))
     monkeypatch.setattr(monitor, "schedule_rediscuss", lambda *a: redis.append(1))
     cfg = settings.load_config(); cfg["execution"]["protected_algo_ids"] = []
+    cfg["expiry_extend"]["mode"] = "off"   # 本用例测旧行为（到期直接平仓只通知）；全员讨论见 test_expiry_full_discussion.py
     demo_watch.run_once(cfg)
     assert sent == ["trigger_expired", "position_expired"] and redis == []

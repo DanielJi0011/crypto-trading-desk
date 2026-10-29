@@ -20,6 +20,7 @@ from desk import demo_exec as DX
 from desk import okx_demo as X
 from desk import settings
 from desk import entry_state as ES
+from desk import expiry as EXP
 
 
 RESCAN_MS = 24 * 3600 * 1000   # 止损/止盈回扫窗口：最近 24 小时
@@ -40,6 +41,95 @@ def _notify(kind, **kw):
 
 def _parse(s):
     return _dt.datetime.strptime(s, "%Y-%m-%d %H:%M:%S%z")
+
+
+def _expiry(cfg, r, inst, m, pos, now):
+    """2026-10-29 用户决定：到期（或到期前一个检查周期内）由交易经理判断延期或平仓；失败/达上限回退旧行为（到期平仓）。
+    结论与通知标记先写入登记再执行，重启后不重复判断、不重复通知。平仓后只通知，不触发再讨论。"""
+    r.setdefault("positions", {})[inst] = m   # r 可能已在本轮被重新读取，确保写回的是当前这条登记
+    if EXP.mode(cfg) == "full_discussion":
+        return _expiry_full(cfg, r, inst, m, pos, now)
+    v = EXP.judge(cfg, inst, pos, m, now)
+    DX.save_reg(r)                        # 先落盘结论（含跨轮尝试计数）
+    if v["action"] == "extend":
+        EXP.apply_extend(m, v); DX.save_reg(r)
+        X.log_event("expiry_extended", inst_id=inst, days=v["days"], new_deadline=m["deadline"],
+                    orig_deadline=m.get("orig_deadline"), extensions=m["extensions"], reason=v["reason"])
+        log(f"{inst} 持有期延期 {v['days']:g} 天至 {m['deadline']}：{v['reason']}")
+        _notify("position_extended", inst_id=inst,
+                message=f"{inst} 持有期到期：交易经理延期 {v['days']:g} 天（新到期 {m['deadline']}，止损止盈不变），原因：{v['reason']}")
+        return r
+    if now < _parse(m["deadline"]):       # 提前窗口内判了平仓：等真正到期再平（结论已记，不重复调用）
+        return r
+    DX.close(cfg, pos, "持有期到期"); log(f"{inst} 持有期到期，已平仓：{v['reason']}")
+    X.log_event("expiry_closed", inst_id=inst, deadline=v.get("deadline"), reason=v["reason"])
+    _notify("position_expired", inst_id=inst, message=f"{inst} 持有期到期，已平仓（{v['reason']}；只通知，不再讨论）")
+    return DX.reg()
+
+
+def _expiry_close(cfg, inst, pos, deadline, reason, now, **ev):
+    if now < _parse(deadline):          # 提前窗口内：等真正到期再平
+        return None
+    DX.close(cfg, pos, "持有期到期"); log(f"{inst} 持有期到期，已平仓：{reason}")
+    X.log_event("expiry_closed", inst_id=inst, deadline=deadline, reason=reason, mode="full_discussion", **ev)
+    _notify("position_expired", inst_id=inst, message=f"{inst} 持有期到期，已平仓（{reason}）")
+    return DX.reg()
+
+
+def _expiry_full(cfg, r, inst, m, pos, now):
+    """2026-10-30 用户决定：到期对该币跑一次与早晚报相同的全员讨论（后台子进程 desk.expiry_discuss，不阻塞本轮与止损检查；
+    讨论期间原止损止盈保护单不动）。每个 deadline 只触发一次：expiry_discussed_for 标记先落盘再启动。
+    结果由本进程（登记唯一写者）应用：持有/调整 → 延期（deadline=原到期+本次决策 horizon_days）；失败/超时 → 回退到期平仓；
+    达 max_extensions → 不讨论直接平仓。讨论结论为平仓的，由组合经理在讨论进程内平仓并通知。"""
+    from desk import expiry_discuss as ED
+    c, key = EXP.ecfg(cfg), m["deadline"]
+    if m.get("expiry_discussed_for") != key:
+        n = int(m.get("extensions") or 0)
+        if n >= int(c["max_extensions"]):
+            return _expiry_close(cfg, inst, pos, key, f"已达延期上限（{n} 次），不再讨论，到期平仓", now) or r
+        if ED.schedule(cfg, r, inst, m, DX.save_reg):
+            X.log_event("expiry_discussion_started", inst_id=inst, deadline=key, extensions=n)
+            log(f"{inst} 持有期到期 {key}：后台启动全员讨论")
+            _notify("expiry_discussion_started", inst_id=inst,
+                    message=f"{inst} 持有期到期（{key}）：开始全员讨论（延期/平仓/调整），讨论期间止损止盈保护单不变")
+        return r
+    d = m.get("expiry_discussion") or {}
+    if d.get("applied") == key:
+        return r
+    res = ED.read_result(inst, key)
+    if res is None:
+        try:
+            started = _parse(d.get("started") or key)
+        except Exception:
+            started = now
+        if now - started < _dt.timedelta(minutes=float(c["discussion_timeout_minutes"])):
+            return r                      # 讨论进行中
+        res = ED.write_result_once(inst, key, {"status": "failed", "reason": f"全员讨论超过 {c['discussion_timeout_minutes']} 分钟无结果，回退到期平仓"})
+    if res.get("status") == "done" and res.get("outcome") == "closed":
+        d["applied"] = key; m["expiry_discussion"] = d; DX.save_reg(r)
+        return r                          # 已在讨论进程内平仓并通知；登记由持仓消失分支清理
+    if res.get("status") == "done":
+        days = float(res.get("horizon_days") or 5) or 5.0
+        nd = (_parse(key) + _dt.timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S%z")
+        EXP.apply_extend(m, {"deadline": key, "new_deadline": nd, "days": days, "reason": res.get("reason"), "time": settings.now_str()})
+        m["horizon_days"] = days
+        d.update(applied=key, status="done"); m["expiry_discussion"] = d
+        DX.save_reg(r)
+        X.log_event("expiry_extended", inst_id=inst, days=days, new_deadline=nd, orig_deadline=m.get("orig_deadline"),
+                    extensions=m["extensions"], reason=res.get("reason"), mode="full_discussion", outcome=res.get("outcome"),
+                    final_action=res.get("final_action"), consensus=res.get("consensus"), decision_id=res.get("decision_id"))
+        log(f"{inst} 全员讨论：{res.get('reason')} → 延期 {days:g} 天至 {nd}")
+        _notify("position_extended", inst_id=inst,
+                message=f"{inst} 持有期到期全员讨论：{res.get('reason')}，延期 {days:g} 天（新到期 {nd}，决策 {res.get('decision_id')}）")
+        return r
+    if res.get("status") == "gone":
+        d["applied"] = key; m["expiry_discussion"] = d; DX.save_reg(r)
+        return r
+    # failed：回退旧行为（到期平仓）
+    out = _expiry_close(cfg, inst, pos, key, res.get("reason") or "全员讨论失败，回退到期平仓", now, discussion_failed=True)
+    if out is None:
+        return r
+    return out
 
 
 def run_once(cfg, source: str = "demo_watch 轮询") -> dict:
@@ -140,12 +230,12 @@ def run_once(cfg, source: str = "demo_watch 轮询") -> dict:
                 _adv(k, "canceled", inst_id=inst)
             r["positions"].pop(inst)
             continue
-        if m.get("deadline") and now >= _parse(m["deadline"]):
-            if halt:
-                log(f"{inst} 持有期到期，HALT 生效不平仓"); X.log_event("halt_skip_close", inst_id=inst); continue
-            DX.close(cfg, held[inst], "持有期到期"); log(f"{inst} 持有期到期，已平仓")
-            _notify("position_expired", inst_id=inst, message=f"{inst} 持有期到期，已平仓（只通知，不再讨论）")
-            r = DX.reg()
+        if m.get("deadline") and EXP.due(cfg, m, now):
+            if halt:   # HALT：不平仓，也不调用交易经理（只读）
+                if now >= _parse(m["deadline"]):
+                    log(f"{inst} 持有期到期，HALT 生效不平仓"); X.log_event("halt_skip_close", inst_id=inst)
+                continue
+            r = _expiry(cfg, r, inst, m, held[inst], now)
     DX.save_reg(r)
     # 2a) 条件加仓单成交复核（预算 + 本腿独立保护单），须在止损覆盖检查之前
     if r.get("add_fills"):

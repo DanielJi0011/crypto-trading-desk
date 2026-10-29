@@ -197,6 +197,7 @@ manager:
   allow_stop_widen: false               # 已有持仓只允许上移止损，不允许放宽
   tp_min_gap_pct: 0.3                   # 交易经理 new_tp：新止盈须在现价盈利一侧且距现价至少 0.3%，避免改完立即触发（可调近可调远）
   tm_hold_keep_sltp: true               # 2026-10-28 用户决定：交易经理 hold 且 new_stop/new_tp 都留空 → 保持原止损止盈，不套全员加权调点；false=旧行为
+  tm_hold_keep_single_sltp: true        # 2026-10-29 用户决定：交易经理 hold 只给 new_stop 或只给 new_tp 时，没给的那一项保持原值（不套加权）；给的那项过原护栏，不过则保持原值；false=旧行为（另一项走加权）
 
 # L4 数据质量：输入数据缺失的角色记 data_missing，不进共识也不打分
 notify:                                 # webhook 降噪（每条 webhook 会唤起一次 Grok Bot 任务）
@@ -205,6 +206,7 @@ notify:                                 # webhook 降噪（每条 webhook 会唤
 alerts:                                 # O2 链路告警（由 scripts/healthcheck.py 每 10 分钟调用 desk/chain_health.py）
   daily_missing_after: "09:30"          # 北京时间该时刻后仍无今日完成标记 → daily_missing（每天一次）
   heartbeat_hours: 0                    # 存活心跳间隔（小时）；0 = 关闭。默认关：外部无人值守接收方，心跳只会制造噪音，且主机整体宕机时本机发不出任何消息，真正的离机存活检测需要外部服务轮询，见风险登记表
+  healthcheck_stale_minutes: 60         # 2026-10-29 用户决定：healthcheck 上次运行超过 N 分钟 → healthcheck_stale 告警（原 30 分钟，心跳 30 分钟一次时正常抖动会误报）
 sessions:                               # 每日两场（desk/sessions.py）；日期一律按北京日期
   morning:                              # 早场：沿用原 O1 窗口
     tz: Asia/Shanghai                   # 早场按北京时间定义
@@ -284,3 +286,13 @@ research:
   min_t_oos: 1.65                # 样本外超额收益 t 值门槛（单侧约 5%）
   cost_cap_usd: 0.50             # 每周研究的 LLM 成本上限（按已知价格估算）
   token_cap: 400000              # 每周研究 token 上限（中转价格未知时也能封顶）
+
+expiry_extend:                          # 2026-10-30 用户决定：持有期到期对该币跑一次与早晚报相同的全员讨论（desk/expiry_discuss.py）
+  enabled: true                         # false = 旧行为（到期直接平仓），等同 mode: off
+  mode: full_discussion                 # full_discussion（默认，全员讨论）| simple（62648d3 交易经理简化问答，desk/expiry.py）| off（到期直接平仓）
+  max_extensions: 2                     # 总延期次数上限（所有模式）；达到后到期不再讨论，直接平仓
+  discussion_timeout_minutes: 45        # full_discussion：后台讨论超过此时长仍无结果 → 视为失败，回退到期平仓
+  max_extend_days: 3                    # 仅 simple 模式：累计延期天数上限（full_discussion 延期天数取本次决策 horizon_days，缺省 5）
+  pre_window_minutes: 5                 # 到期前一个检查周期（demo_watch 5 分钟一轮）内即可开始讨论/判断；判平仓的等真正到期再平
+  retry_delays: [2, 5, 10]              # 仅 simple 模式：交易经理调用失败重试 3 次的退避秒数（full_discussion 沿用 llm_retry.install 全局重试）
+  max_round_attempts: 3                 # 仅 simple 模式： 跨轮尝试上限（轮次超时打断也计数）；超过回退到期平仓

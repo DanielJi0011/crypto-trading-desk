@@ -437,6 +437,20 @@ def hold_keep_sltp(cfg, dec, action, tm_absent=False) -> bool:
     return getattr(dec, "new_stop", None) is None and getattr(dec, "new_tp", None) is None
 
 
+HOLD_SINGLE_NOTE = "交易经理持有只给单项调点，未给的一项保持原值（不套加权）"
+
+
+def hold_keep_single(cfg, dec, action, tm_absent=False) -> bool:
+    """2026-10-29 用户决定：交易经理（实际到场）hold 且 new_stop、new_tp 只给了一项 → 给的按其值（过原护栏），没给的保持原值。
+    子开关 manager.tm_hold_keep_single_sltp（缺省 True）；主开关 tm_hold_keep_sltp 关闭时一并回到旧行为。"""
+    M = cfg.get("manager") or {}
+    if not bool(M.get("tm_hold_keep_sltp", True)) or not bool(M.get("tm_hold_keep_single_sltp", True)):
+        return False
+    if tm_absent or getattr(dec, "action", None) != "hold" or not str(action).startswith("hold"):
+        return False
+    return (getattr(dec, "new_stop", None) is None) != (getattr(dec, "new_tp", None) is None)
+
+
 def apply_position_sl_tp(cfg, pos, st, w, mk, dec, action, execd, notes, tm_absent=False):
     """已开仓调点（早/晚场与开仓同一套）：ATR+2R 基准 → 全员 w×置信度加权 → TM new_* 最终微调；
     RR≥min_rr_after_adjust；止损只许收紧。无 ATR 时仅走 TM new_*（仍受 RR 护栏）。"""
@@ -460,13 +474,16 @@ def apply_position_sl_tp(cfg, pos, st, w, mk, dec, action, execd, notes, tm_abse
     if hold_keep_sltp(cfg, dec, action, tm_absent):
         notes.append(HOLD_KEEP_NOTE)
         return
+    single = hold_keep_single(cfg, dec, action, tm_absent)
+    if single:
+        notes.append(HOLD_SINGLE_NOTE)
     rc = sizing.rcfg(cfg)
     min_rr = float(rc.get("min_rr_after_adjust", 1.5))
     side = pos["side"]
     entry = float(pos.get("avg_px") or 0)
     atr = (mk or {}).get("atr14")
-    proposed_stop = proposed_tp = None
-    if atr and entry > 0:
+    proposed_stop = proposed_tp = None   # single：不算加权方案 → 未给的一项为 None=保持原值；给的一项护栏不过也回退 None=保持原值
+    if atr and entry > 0 and not single:
         base_stop, base_tp, _ = sizing.stop_take(side, entry, float(atr), rc)
         stn = {r: _norm_stance(s) for r, s in (st or {}).items()}
         roles = [r for r in valid_voters(stn) if r in (w or {})]
@@ -679,7 +696,9 @@ def _cooldown(cfg, inst, agg, did, notes) -> bool:
 
 
 def record_session(source) -> str:
-    """决策记录的场次：止盈/止损后再讨论记 rediscuss（不再误记为 morning），其余按当前场次。"""
+    """决策记录的场次：止盈/止损后再讨论记 rediscuss（不再误记为 morning），持有期到期全员讨论记 expiry，其余按当前场次。"""
+    if str(source).startswith("expiry"):
+        return "expiry"
     return "rediscuss" if str(source).startswith(("post_tp", "post_stop")) else settings.SESSION
 
 

@@ -104,8 +104,21 @@ def _stub_watch(monkeypatch, tmp_path):
 def test_demo_watch_kill_still_closes_expired(flags, monkeypatch, tmp_path):
     w, calls = _stub_watch(monkeypatch, tmp_path)
     (flags / "KILL").write_text("x")
-    assert w.run_once(settings.load_config())["ok"]
+    cfg = settings.load_config(); cfg["expiry_extend"]["mode"] = "off"   # off：KILL 下到期照常平仓
+    assert w.run_once(cfg)["ok"]
     assert calls == {"close": 1, "el": 1, "rediscuss": 1}
+
+
+def test_demo_watch_kill_full_discussion_still_runs(flags, monkeypatch, tmp_path):
+    """KILL 与早晚报同一口径：到期照常全员讨论（平仓/减仓/收紧止损允许，开仓由 check_open 的 [KILL] 护栏拒绝）。"""
+    from desk import expiry_discuss as ED
+    monkeypatch.setattr(ED, "DIR", tmp_path / "ed")
+    sp = []
+    monkeypatch.setattr(ED, "SPAWN", lambda args, logfile: sp.append(args))
+    w, calls = _stub_watch(monkeypatch, tmp_path)
+    (flags / "KILL").write_text("x")
+    assert w.run_once(settings.load_config())["ok"]
+    assert len(sp) == 1 and calls["close"] == 0
 
 
 def test_demo_watch_halt_freezes_writes(flags, monkeypatch, tmp_path):

@@ -141,6 +141,10 @@ def write(cfg, date, decisions, closed, reviews, weight_changes, pb_events, usag
         ev = [e for e in settings.read_jsonl(_od.EVENTS) if str(e.get("time", "")).startswith(date) and e.get("event") != "verify_ok"]
         if ev:
             L += ["", "今日模拟盘事件：", ""] + [f"- {e['time'][11:19]} **{e['event']}** " + str({k: v for k, v in e.items() if k not in ('time', 'event')}) for e in ev[-40:]]
+        from desk import expiry as _exp
+        _el = _exp.report_lines(date)
+        if _el:
+            L += [""] + _el
     pe = {} if demo else _pend.load()
     if pe:
         L += ["| 品种 | 方向 | 杠杆 | 条件 | 触发价 | 止损 | 止盈 | 保证金% | 共识S | 来源 | 到期 | 理由 |", "|---|---|---|---|---|---|---|---|---|---|---|---|"]

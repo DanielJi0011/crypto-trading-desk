@@ -42,11 +42,60 @@ def test_hold_with_tm_levels_uses_them(monkeypatch):
     assert manager.HOLD_KEEP_NOTE not in notes
 
 
-def test_hold_with_only_new_stop_still_weighted_tp(monkeypatch):
+def test_hold_with_only_new_stop_keeps_tp(monkeypatch):
+    """2026-10-29：只给 new_stop → 止损按交易经理，止盈保持原值（不再套加权 112）。"""
     moves, pos, st, w, mk = _setup(monkeypatch)
     notes = []
     manager.apply_position_sl_tp(settings.load_config(), pos, st, w, mk,
                                  NS(action="hold", new_stop=95.0, new_tp=None), "hold", None, notes)
+    assert moves["stop"] == [pytest.approx(95.0)] and moves["tp"] == []
+    assert manager.HOLD_SINGLE_NOTE in notes
+
+
+def test_hold_with_only_new_tp_keeps_stop(monkeypatch):
+    moves, pos, st, w, mk = _setup(monkeypatch)
+    notes = []
+    manager.apply_position_sl_tp(settings.load_config(), pos, st, w, mk,
+                                 NS(action="hold", new_stop=None, new_tp=118.0), "hold", None, notes)
+    assert moves["stop"] == [] and moves["tp"] == [pytest.approx(118.0)]
+
+
+def test_hold_single_value_violating_rr_keeps_original(monkeypatch):
+    """只给 new_tp=101：RR=(101-100)/(100-90)=0.1<1.5 → 该项保持原值并记原因，另一项也不动。"""
+    moves, pos, st, w, mk = _setup(monkeypatch)
+    notes = []
+    manager.apply_position_sl_tp(settings.load_config(), pos, st, w, mk,
+                                 NS(action="hold", new_stop=None, new_tp=101.0), "hold", None, notes)
+    assert moves == {"stop": [], "tp": []} and any("未采纳" in n for n in notes)
+
+
+def test_hold_single_stop_widen_rejected(monkeypatch):
+    """止损只能收紧：只给 new_stop=85（宽于 90）→ 不放宽，止盈不动。"""
+    moves, pos, st, w, mk = _setup(monkeypatch)
+    notes = []
+    manager.apply_position_sl_tp(settings.load_config(), pos, st, w, mk,
+                                 NS(action="hold", new_stop=85.0, new_tp=None), "hold", None, notes)
+    assert moves == {"stop": [], "tp": []}
+
+
+def test_hold_single_switch_off_old_weighted(monkeypatch):
+    moves, pos, st, w, mk = _setup(monkeypatch)
+    cfg = settings.load_config()
+    assert cfg["manager"]["tm_hold_keep_single_sltp"] is True
+    dec = NS(action="hold", new_stop=95.0, new_tp=None)
+    cfg["manager"].pop("tm_hold_keep_single_sltp")
+    assert manager.hold_keep_single(cfg, dec, "hold") is True       # 缺字段 → 默认新行为
+    cfg["manager"]["tm_hold_keep_single_sltp"] = False
+    notes = []
+    manager.apply_position_sl_tp(cfg, pos, st, w, mk, dec, "hold", None, notes)
+    assert moves["stop"] == [pytest.approx(95.0)] and moves["tp"] == [pytest.approx(112.0)]
+
+
+def test_reduce_with_single_value_still_weighted(monkeypatch):
+    moves, pos, st, w, mk = _setup(monkeypatch)
+    notes = []
+    manager.apply_position_sl_tp(settings.load_config(), pos, st, w, mk,
+                                 NS(action="reduce", new_stop=95.0, new_tp=None), "reduce", {"ok": True, "remaining": 1}, notes)
     assert moves["stop"] == [pytest.approx(95.0)] and moves["tp"] == [pytest.approx(112.0)]
 
 

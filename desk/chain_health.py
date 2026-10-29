@@ -8,7 +8,7 @@ run(cfg, now) 由 scripts/healthcheck.py 每轮调用（每 10 分钟）：
   下单意图对账有超过 30 分钟仍未定论的记录；按问题去重，同一问题 1 小时内最多一次。
 - 进程守护：demo_ws、demo_watch 不在运行 → chain_unhealthy（proc_*），只告警不拉起。
 - heartbeat：alerts.heartbeat_hours > 0 时每 N 小时发一次“链路存活”；默认 0 = 关闭（见 config.yaml 注释）。
-healthcheck_stale(now) 由 demo_ws 心跳调用：healthcheck 上次运行超过 30 分钟 → healthcheck_stale，1 小时最多一次。
+healthcheck_stale(now) 由 demo_ws 心跳调用：healthcheck 上次运行超过 alerts.healthcheck_stale_minutes（默认 60）分钟 → healthcheck_stale，1 小时最多一次。
 所有通知走 demo_ws.notify（受 TA_NOTIFY_DISABLED 总开关控制）；状态写 state/chain_health.json。
 """
 from __future__ import annotations
@@ -23,6 +23,7 @@ PATH = settings.STATE / "chain_health.json"
 HC_STATE = settings.STATE / "healthcheck_state.json"
 STALE_S = 1800
 DEDUP_S = 3600
+HC_STALE_MIN_DEFAULT = 60   # healthcheck_stale 专用；STALE_S 仍用于 demo_ws 心跳/对账 30 分钟判断
 
 
 def acfg(cfg) -> dict:
@@ -177,17 +178,28 @@ def run(cfg, now: _dt.datetime | None = None, notifier=None) -> list:
     return sent
 
 
-def healthcheck_stale(now_ts: float | None = None, notifier=None) -> bool:
+def stale_limit_s(cfg=None) -> float:
+    """healthcheck_stale 阈值（秒）：config alerts.healthcheck_stale_minutes，默认 60 分钟（2026-10-29 用户决定，原 30 分钟）。"""
+    try:
+        if cfg is None:
+            cfg = settings.load_config()
+        return float(((cfg or {}).get("alerts") or {}).get("healthcheck_stale_minutes", HC_STALE_MIN_DEFAULT)) * 60
+    except Exception:
+        return HC_STALE_MIN_DEFAULT * 60
+
+
+def healthcheck_stale(now_ts: float | None = None, notifier=None, cfg=None) -> bool:
     now_ts = now_ts or time.time()
     try:
         last = json.loads(HC_STATE.read_text()).get("last_run", 0)
     except Exception:
         last = 0
-    if last and now_ts - last <= STALE_S:
+    lim = stale_limit_s(cfg)
+    if last and now_ts - last <= lim:
         return False
     st = _load()
     if not _dedup(st, "healthcheck_stale", now_ts):
         return False
     _save(st)
-    _send("healthcheck_stale", "健康检查超过 30 分钟未运行（state/healthcheck_state.json）", notifier)
+    _send("healthcheck_stale", f"健康检查超过 {lim / 60:g} 分钟未运行（state/healthcheck_state.json）", notifier)
     return True
