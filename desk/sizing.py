@@ -17,7 +17,42 @@ RISK_DEFAULTS = {"risk_per_trade_pct": 0.0075, "max_notional_per_trade_pct": 1.0
                  "max_open_risk_pct": 0.02, "max_net_directional_pct": 1.2, "cost_buffer_pct": 0.002, "plan_conflict_pct": 0.20,
                  "max_price_drift_atr": 0.5, "max_daily_bar_age_days": 2, "min_rr_after_adjust": 1.5}
 
-SIZING_DEFAULTS = {"no_entry_not_now_vote": True, "pending_action_field": True, "same_px_tol_pct": 0.05}
+SIZING_DEFAULTS = {"no_entry_not_now_vote": True, "pending_action_field": True, "same_px_tol_pct": 0.05,
+                   # 2026-10-30 止损止盈锚定修正（feat/sltp-anchor-fix），false=旧行为
+                   "sltp_anchor_entry": True, "sltp_anchor_max_mult": 1.25,
+                   "sltp_rr_tighten_stop_first": True,
+                   "sltp_tp_cap": True, "sltp_tp_cap_mult": 1.2,
+                   "sltp_exclude_self_levels": True}
+
+
+def anchor_opts(cfg, rc: dict | None = None, atr=None, entry=None) -> dict:
+    """finalize_sl_tp 的新规则参数（按 sizing 段开关）。base_dist=stop_take 的基准止损距离（价格单位）。"""
+    sc = scfg(cfg)
+    rc = rc or rcfg(cfg)
+    base = None
+    if atr and entry:
+        _s, _t, d = stop_take("long", float(entry), float(atr), rc)
+        base = d * float(entry)
+    return {"base_dist": base,
+            "anchor_mult": float(sc["sltp_anchor_max_mult"]) if sc["sltp_anchor_entry"] else None,
+            "tighten_first": bool(sc["sltp_rr_tighten_stop_first"]),
+            "tp_cap_mult": float(sc["sltp_tp_cap_mult"]) if sc["sltp_tp_cap"] else None,
+            "tp_r": float(rc["tp_r_multiple"])}
+
+
+def drop_self_levels(st: dict, pos: dict | None, tol_pct: float = 0.05) -> tuple[dict, list]:
+    """规则 4：对已有持仓调点加权时，角色 target/stop 与现有持仓止盈/止损同价（容差 same_px_tol_pct）→ 排除该项，
+    避免把现有点位原样回收进加权（自我强化）。返回 (新立场字典, 被排除的 [(角色, 字段, 值)])。"""
+    out, dropped = {}, []
+    tp, sl = (pos or {}).get("tp_px"), (pos or {}).get("sl_px")
+    for r, s in (st or {}).items():
+        s2 = dict(s or {})
+        for f, ref in (("target", tp), ("stop", sl)):
+            v = s2.get(f)
+            if v not in (None, "") and ref not in (None, "") and same_px(v, ref, tol_pct):
+                dropped.append((r, f, v)); s2[f] = None
+        out[r] = s2
+    return out, dropped
 
 
 def scfg(cfg) -> dict:
@@ -81,9 +116,14 @@ def wavg_levels(st: dict, w: dict, roles: list, side: str, entry: float) -> dict
     return {"stop": stop, "target": target, "stop_n": sn, "target_n": tn}
 
 
-def finalize_sl_tp(side: str, entry: float, base_stop, base_tp, role_stop=None, role_tp=None, min_rr: float = 1.5) -> dict:
+def finalize_sl_tp(side: str, entry: float, base_stop, base_tp, role_stop=None, role_tp=None, min_rr: float = 1.5,
+                   base_dist=None, anchor_mult=None, tighten_first: bool = False, tp_cap_mult=None, tp_r: float = 2.0) -> dict:
     """ATR(+2R) 基准 → 角色加权覆盖 → 强制 RR≥min_rr（不够则外推止盈；组合无效则回退基准）。
-    返回 {stop, take_profit, rr, adjusted, notes}。"""
+    2026-10-30 新规则（参数均缺省=旧行为，由 anchor_opts 按开关给出；base_dist=基准止损距离，价格单位）：
+      anchor_mult：止损相对 entry 的距离 > anchor_mult×base_dist → 收紧到该上限（只收紧）；
+      tp_cap_mult：止盈距离 ≤ tp_cap_mult×tp_r×base_dist（封顶）；
+      tighten_first：RR 不足时先把止损收紧到基准距离（只收紧），再按需要外推止盈（不超过封顶）；仍不足如实记录。
+    返回 {stop, take_profit, rr, adjusted, notes, rr_short}。"""
     notes: list[str] = []
     stop = role_stop if role_stop is not None else base_stop
     tp = role_tp if role_tp is not None else base_tp
@@ -92,21 +132,46 @@ def finalize_sl_tp(side: str, entry: float, base_stop, base_tp, role_stop=None, 
         notes.append(f"止损按角色加权调整→{float(role_stop):.6g}")
     if role_tp is not None:
         notes.append(f"止盈按角色加权调整→{float(role_tp):.6g}")
+    sg = 1 if side == "long" else -1
+    e = float(entry)
+    bd = float(base_dist) if base_dist else None
+    rr_short = None
+    if bd and anchor_mult and stop is not None and sg * (e - float(stop)) > anchor_mult * bd + 1e-9:
+        ns = e - sg * anchor_mult * bd
+        notes.append(f"止损 {float(stop):.6g} 距入场 {abs(e - float(stop)) / e:.2%} 超过基准距离 {bd / e:.2%} 的 {anchor_mult:g} 倍，"
+                     f"按实际入场价 {e:.6g} 收紧至 {ns:.6g}")
+        stop, adjusted = ns, True
+    cap = tp_cap_mult * tp_r * bd if (bd and tp_cap_mult) else None
+    if cap and tp is not None and sg * (float(tp) - e) > cap + 1e-9:
+        nt = e + sg * cap
+        notes.append(f"止盈 {float(tp):.6g} 距入场超过基准止盈距离的 {tp_cap_mult:g} 倍，封顶至 {nt:.6g}")
+        tp, adjusted = nt, True
     rr = rr_ratio(side, entry, stop, tp)
     min_rr = float(min_rr)
     if stop is not None and rr is not None and rr + 1e-12 < min_rr:
-        sg = 1 if side == "long" else -1
-        new_tp = float(entry) + sg * min_rr * abs(float(entry) - float(stop))
-        notes.append(f"调整后 RR={rr:.3f}<{min_rr:g}，止盈外推至 {new_tp:.6g} 以满足 RR≥{min_rr:g}")
-        tp = new_tp
-        rr = min_rr
-        adjusted = True
+        if tighten_first and bd and sg * (e - float(stop)) > bd + 1e-9:
+            ns = e - sg * bd
+            notes.append(f"调整后 RR={rr:.3f}<{min_rr:g}，先把止损收紧到基准距离 {ns:.6g}")
+            stop, adjusted = ns, True
+            rr = rr_ratio(side, entry, stop, tp)
+        if rr is not None and rr + 1e-12 < min_rr:
+            new_tp = e + sg * min_rr * abs(e - float(stop))
+            if cap and sg * (new_tp - e) > cap + 1e-9:
+                new_tp = e + sg * cap
+                rr2 = rr_ratio(side, entry, stop, new_tp)
+                notes.append(f"调整后 RR={rr:.3f}<{min_rr:g}，止盈外推受封顶限制至 {new_tp:.6g}，RR 仍为 {rr2:.3f}<{min_rr:g}（如实记录）")
+                rr_short = rr2
+                tp, rr = new_tp, rr2
+            else:
+                notes.append(f"调整后 RR={rr:.3f}<{min_rr:g}，止盈外推至 {new_tp:.6g} 以满足 RR≥{min_rr:g}")
+                tp, rr = new_tp, min_rr
+            adjusted = True
     elif adjusted and rr is None and base_stop is not None:
         notes.append("调整后点位无效（侧向/距离），回退 ATR 基准")
         stop, tp = base_stop, base_tp
         rr = rr_ratio(side, entry, stop, tp)
         adjusted = False
-    return {"stop": stop, "take_profit": tp, "rr": rr, "adjusted": adjusted, "notes": notes}
+    return {"stop": stop, "take_profit": tp, "rr": rr, "adjusted": adjusted, "notes": notes, "rr_short": rr_short}
 
 
 def guard_rr(side: str, entry: float, stop, tp, min_rr: float = 1.5) -> tuple[bool, str, float | None]:

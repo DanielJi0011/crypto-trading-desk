@@ -203,12 +203,20 @@ manager:
   tm_pending_override: true             # 2026-10-30 改动 3：早晚场与止损后再讨论中，交易经理投 pending 且点位完整、方向与共识一致 → 改挂交易经理条件单，不追现价（止盈后再讨论沿用原规则）；若已有同向同价位挂单则保留原单，只按 new 止损/止盈规则改点；false=旧行为
   tm_pending_drift_exempt: true         # 2026-10-30：交易经理条件单不因 1% 价格漂移被跳过（现价已越过触发价时仍跳过）；现价单、加仓仍受漂移检查；false=旧行为（条件单也会被漂移跳过）
   tm_required_for_open: true            # 2026-10-30 用户决定：最后由交易经理拍板（职能等同原项目组合经理）；交易经理无结论（调用重试后仍失败/空输出/解析失败）或未给同向现价单、完整条件单 → 本次不开仓不加仓，日报写明原因；不再回退现价+ATR+2R 基准开仓；持仓管理（止损、到期回退平仓）不变；false=旧行为
+  tm_pending_keep_sltp: true            # 2026-10-30 规则 3：交易经理投 pending/条件加仓且 new_stop/new_tp 都留空 → 原仓保持原点位（不重新加权、不外推止盈），日报写"保持原点位"；false=旧行为（仅 hold 保持）
 
 # 入场方案分组（desk/sizing.py choose_plan，2026-10-30 新增）
 sizing:
   no_entry_not_now_vote: true           # 改动 1：没写入场价、也没明确写入场条件=现价的同向角色只算方向票，不算现价组的票；所有同向角色都没写价时回退为现价入场；false=旧行为
   pending_action_field: true            # 改动 2：立场行「对现有挂单=保留/改价/撤销/改现价」；已有同向挂单时，没写入场价也没写该字段的同向角色按「保留」（以挂单触发价参与分组）；false=忽略该字段与现有挂单
   same_px_tol_pct: 0.05                 # 交易经理条件单与现有挂单触发价相差 ≤0.05% 视为同价位（保留原单不重挂）
+  # 2026-10-30 止损止盈锚定修正（feat/sltp-anchor-fix）；基准止损距离 = risk.stop_atr_mult×ATR14（夹在 stop_min/max_pct 内）
+  sltp_anchor_entry: true               # 规则 1：现价入场/已有持仓调点时，止损相对实际入场价（或均价）距离超过基准的 sltp_anchor_max_mult 倍 → 收紧到该上限；条件单只用触发价校验记录、不改点；false=旧行为
+  sltp_anchor_max_mult: 1.25            # 规则 1：止损距离上限 = 1.25×基准止损距离
+  sltp_rr_tighten_stop_first: true      # 规则 2：RR<min_rr_after_adjust 时先把止损收紧到基准距离（只收紧），仍不足再外推止盈；false=旧行为（只外推止盈）
+  sltp_tp_cap: true                     # 规则 2：止盈距离封顶；封顶后 RR 仍不足如实记录（notes / aggregate.rr_short），不放弃开仓；false=旧行为（止盈无上限）
+  sltp_tp_cap_mult: 1.2                 # 规则 2：止盈距离上限 = 1.2×tp_r_multiple×基准止损距离
+  sltp_exclude_self_levels: true        # 规则 4：已有持仓调点加权时，角色 target/stop 与现有止盈/止损同价（same_px_tol_pct）→ 排除该项（防自我强化）；false=旧行为
 
 # L4 数据质量：输入数据缺失的角色记 data_missing，不进共识也不打分
 notify:                                 # webhook 降噪（每条 webhook 会唤起一次 Grok Bot 任务）

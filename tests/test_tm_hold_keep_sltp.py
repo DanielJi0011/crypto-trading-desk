@@ -4,6 +4,19 @@ from types import SimpleNamespace as NS
 
 from desk import manager, settings
 
+# feat/sltp-anchor-fix：本文件断言旧的止损止盈加权行为（止损 96 > 1.25×基准、止盈不封顶），显式关闭新规则开关
+@pytest.fixture(autouse=True)
+def _old_sltp_rules(monkeypatch):
+    orig = settings.load_config
+
+    def _load():
+        cfg = orig()
+        cfg.setdefault("sizing", {}).update(sltp_anchor_entry=False, sltp_rr_tighten_stop_first=False,
+                                            sltp_tp_cap=False, sltp_exclude_self_levels=False)
+        return cfg
+    monkeypatch.setattr(settings, "load_config", _load)
+
+
 
 def _setup(monkeypatch):
     moves = {"stop": [], "tp": []}

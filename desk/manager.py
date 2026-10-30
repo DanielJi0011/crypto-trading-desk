@@ -295,9 +295,17 @@ def aggregate(cfg, st: dict, w: dict, mk: dict, existing: dict | None = None, tm
             lv = {"stop": tmp["stop"], "target": tmp["tp"]}
         else:
             lv = sizing.wavg_levels(st, w, bulls, side or "long", entry) if bulls else {"stop": None, "target": None}
-        fin = sizing.finalize_sl_tp(side or "long", entry, base_stop, base_tp, lv.get("stop"), lv.get("target"), min_rr)
+        ao = sizing.anchor_opts(cfg, rc, atr, entry)
+        if cond != "now":
+            # 条件单：点位是为该触发价设计的，保持原逻辑（不收紧/不封顶），只用触发价做基准校验并记录
+            if ao["anchor_mult"] and lv.get("stop") is not None and ao["base_dist"] \
+                    and abs(entry - float(lv["stop"])) > ao["anchor_mult"] * ao["base_dist"] + 1e-9:
+                notes.append(f"条件单止损 {float(lv['stop']):.6g} 距触发价 {abs(entry - float(lv['stop'])) / entry:.2%}，"
+                             f"超过基准距离 {ao['base_dist'] / entry:.2%} 的 {ao['anchor_mult']:g} 倍（仅校验记录，按交易经理点位）")
+            ao = {}
+        fin = sizing.finalize_sl_tp(side or "long", entry, base_stop, base_tp, lv.get("stop"), lv.get("target"), min_rr, **ao)
         stop, tp = fin["stop"], fin["take_profit"]
-        levels_meta.update(rr=fin["rr"], adjusted=fin["adjusted"])
+        levels_meta.update(rr=fin["rr"], adjusted=fin["adjusted"], rr_short=fin.get("rr_short"))
         notes.extend(fin["notes"])
     elif tmp is not None:   # 无 ATR + 方案一：只用交易经理的点位
         stop, tp = tmp["stop"], tmp["tp"]
@@ -327,7 +335,7 @@ def aggregate(cfg, st: dict, w: dict, mk: dict, existing: dict | None = None, tm
             "plan_implied_keep": plan.get("implied_keep") or None, "plan_cancel_votes": plan.get("cancel_votes") or None,
             "plan_no_entry_fallback_now": plan.get("no_entry_fallback_now") or None,
             "existing_trigger_px": (ex or {}).get("trigger_px"), "entry_by_tm": tmp is not None,
-            "rr": levels_meta.get("rr"), "levels_adjusted": levels_meta.get("adjusted"),
+            "rr": levels_meta.get("rr"), "levels_adjusted": levels_meta.get("adjusted"), "rr_short": levels_meta.get("rr_short"),
             "baseline_stop": levels_meta.get("baseline_stop"), "baseline_tp": levels_meta.get("baseline_tp")}
 
 
@@ -622,6 +630,22 @@ def hold_keep_sltp(cfg, dec, action, tm_absent=False) -> bool:
     return getattr(dec, "new_stop", None) is None and getattr(dec, "new_tp", None) is None
 
 
+PENDING_KEEP_NOTE = "交易经理投条件单/条件加仓且未给新止损止盈：原仓保持原点位（不重新加权、不外推止盈）"
+
+
+def pending_keep_position_sltp(cfg, dec, action, tm_absent=False) -> bool:
+    """2026-10-30（feat/sltp-anchor-fix 规则 3）：交易经理（实际到场）投 pending（含条件加仓 pending_add、或条件单未挂出仍为 hold），
+    且 new_stop/new_tp 都留空 → 原仓保持原点位。开关 manager.tm_pending_keep_sltp（缺省 True）；主开关 tm_hold_keep_sltp 关闭时一并关闭。"""
+    M = cfg.get("manager") or {}
+    if not bool(M.get("tm_hold_keep_sltp", True)) or not bool(M.get("tm_pending_keep_sltp", True)):
+        return False
+    if tm_absent or getattr(dec, "action", None) != "pending":
+        return False
+    if not (str(action).startswith("hold") or str(action) in ("pending", "pending_add")):
+        return False
+    return getattr(dec, "new_stop", None) is None and getattr(dec, "new_tp", None) is None
+
+
 HOLD_SINGLE_NOTE = "交易经理持有只给单项调点，未给的一项保持原值（不套加权）"
 
 
@@ -659,6 +683,9 @@ def apply_position_sl_tp(cfg, pos, st, w, mk, dec, action, execd, notes, tm_abse
     if hold_keep_sltp(cfg, dec, action, tm_absent):
         notes.append(HOLD_KEEP_NOTE)
         return
+    if pending_keep_position_sltp(cfg, dec, action, tm_absent):
+        notes.append(PENDING_KEEP_NOTE)
+        return
     single = hold_keep_single(cfg, dec, action, tm_absent)
     if single:
         notes.append(HOLD_SINGLE_NOTE)
@@ -672,8 +699,15 @@ def apply_position_sl_tp(cfg, pos, st, w, mk, dec, action, execd, notes, tm_abse
         base_stop, base_tp, _ = sizing.stop_take(side, entry, float(atr), rc)
         stn = {r: _norm_stance(s) for r, s in (st or {}).items()}
         roles = [r for r in valid_voters(stn) if r in (w or {})]
+        sc = sizing.scfg(cfg)
+        if sc["sltp_exclude_self_levels"]:   # 规则 4：与现有止盈/止损同价的角色点位不回收进加权
+            stn, dropped = sizing.drop_self_levels(stn, pos, float(sc["same_px_tol_pct"]))
+            if dropped:
+                notes.append("加权排除与现有点位同价的角色点位（防自我强化）："
+                             + "、".join(f"{r}.{'止盈' if f == 'target' else '止损'}={float(v):g}" for r, f, v in dropped))
         lv = sizing.wavg_levels(stn, w or {}, roles, side, entry)
-        fin = sizing.finalize_sl_tp(side, entry, base_stop, base_tp, lv.get("stop"), lv.get("target"), min_rr)
+        fin = sizing.finalize_sl_tp(side, entry, base_stop, base_tp, lv.get("stop"), lv.get("target"), min_rr,
+                                    **sizing.anchor_opts(cfg, rc, atr, entry))
         proposed_stop, proposed_tp = fin["stop"], fin["take_profit"]
         for n in fin["notes"]:
             notes.append(n)
