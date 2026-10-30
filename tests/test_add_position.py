@@ -139,6 +139,7 @@ def test_manager_tm_veto_states_reason(base, monkeypatch):
 
 
 def test_manager_budget_full_skip(base, monkeypatch):
+    base.setdefault("add_position", {})["tm_decides_add"] = False   # 2026-10-30 起默认交易经理决定；本测试显式设旧值（预算硬拒）
     res, c = _mgr(monkeypatch, base, sz_info={"ok": True, "risk_usd": 100.0, "notional": 10000.0, "clipped": []})
     assert not c["add_now"] and res["aggregate"]["add"]["reason"] == "add_budget_full"
 

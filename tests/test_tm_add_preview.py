@@ -38,6 +38,7 @@ MK = {"last": 2380.0, "atr14": 90.0, "bar_date": "2026-10-27", "close": 2380.0, 
 
 
 def test_preview_independent_leg_not_base_stop(base):
+    base.setdefault("add_position", {})["tm_decides_add"] = False   # 2026-10-30 起默认交易经理决定；本测试显式设旧值（预算硬拒）
     p = _pos()
     pv = MG.add_preview(base, INST, MK, _bk(p), p, _st(), {"trader": 1.0, "portfolio_manager": 1.0}, -0.5)
     it = next(i for i in pv["items"] if i["add_px"] == 2400.0)
@@ -60,6 +61,7 @@ def test_preview_readonly_no_orders(base, monkeypatch):
 
 
 def test_preview_budget_full_reason(base):
+    base.setdefault("add_position", {})["tm_decides_add"] = False   # 2026-10-30 起默认交易经理决定；本测试显式设旧值（预算硬拒）
     p = _pos(qty=50.0)   # 原仓风险远超 0.75%
     pv = MG.add_preview(base, INST, MK, _bk(p), p, _st(), {"trader": 1.0}, -0.5)
     assert all(i["within_budget"] is False and i["reason"] == "add_budget_full" for i in pv["items"])
@@ -101,4 +103,4 @@ def test_report_shows_preview():
           "items": [{"by": ["交易员"], "add_px": 2400.0, "stop": 2535.0, "tp": 2197.5, "rr": 1.5, "sz": "3",
                      "existing_risk": 95.0, "add_risk": 400.0, "cap": 750.0, "within_budget": True, "reason": None}]}
     s = MG.describe_add_preview(pv)
-    assert "交易员 入场 2400" in s and "本腿止损 2535" in s and "0.75%预算内" in s
+    assert "交易员 入场 2400" in s and "本腿止损 2535" in s and "单笔风险预算内" in s

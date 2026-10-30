@@ -75,6 +75,7 @@ def test_risk_clip_and_reject(monkeypatch, tmp_path):
     monkeypatch.setattr(X, "_inst_cache", {"BTC-USDT-SWAP": INSTR})
     monkeypatch.setattr(DX, "today_realized", lambda: 0.0); monkeypatch.setattr(DX, "today_orders", lambda: 0)
     cfg = settings.load_config()
+    cfg["risk"]["risk_per_trade_pct"] = 0.0075   # 显式旧值（2026-10-30 起配置为 0.015，见 test_risk_1p5.py）
     bk = {"equity": 100000, "live_equity": 100000, "positions": [], "triggers": [], "exposure": 0, "pending_entries": []}
     # 名义 20000、止损 5% → 亏损 1000 > 750 → 削到 0.15 币（名义 15000，亏损 750）
     sz = DX.clip_to_risk(cfg, bk, "BTC-USDT-SWAP", "20", 100000, 95000)
@@ -90,5 +91,6 @@ def test_risk_clip_property(monkeypatch, tmp_path, sz, px, sl):
     monkeypatch.setattr(X, "EVENTS", tmp_path / "ev.jsonl")
     monkeypatch.setattr(X, "_inst_cache", {"BTC-USDT-SWAP": INSTR})
     cfg = settings.load_config()
+    cfg["risk"]["risk_per_trade_pct"] = 0.0075   # 显式旧值
     out = DX.clip_to_risk(cfg, {"equity": 100000}, "BTC-USDT-SWAP", sz, px, sl)
     assert float(out or 0) * 0.01 * abs(px - sl) <= 750 + 1e-6 and float(out or 0) <= float(sz)

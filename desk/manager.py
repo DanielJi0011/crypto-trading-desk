@@ -353,7 +353,7 @@ def _prompt(cfg, coin, mk, pos, bk, st, w, S, texts, preview=None):
     lines = [f"你是加密货币交易台的交易经理，负责对 {coin['name']}（OKX 永续 {coin['inst_id']}）做今日最终执行决策。",
              f"标的是 OKX USDT 永续合约（OKX 模拟盘 Demo Trading 执行，逐仓），可以做多也可以做空，新开仓杠杆上限 {__import__('desk.config_safety', fromlist=['x']).max_open_leverage(cfg):g} 倍（代码强制）。",
              f"硬性规则（代码会强制，违反会被拒单）：单笔保证金≤权益 {g['max_position_pct']}%，总名义≤权益 {g.get('max_total_notional_pct') or g['max_total_exposure_pct'] * ledger.swap_cfg(cfg)['leverage_max']:g}%，"
-             f"开仓必须带止损（做多在下方、做空在上方）且止损距离≤{g['max_stop_loss_pct']}%，止损必须先于强平价触发，止损只能收紧，" + ("每币一仓；同向加仓允许（加仓腿独立止盈止损，原仓不动；已有风险+加仓风险≤单笔上限，不足按剩余削减；反向不反手须先平仓）。" if add_position.enabled(cfg) else "每币一仓不加仓。"),
+             f"开仓必须带止损（做多在下方、做空在上方）且止损距离≤{g['max_stop_loss_pct']}%，止损必须先于强平价触发，止损只能收紧，" + ("每币一仓；同向加仓允许（加仓视为新订单，加仓腿独立止盈止损，原仓不动；" + ("是否加仓由你权衡决定：加仓风险预算只作参考数据不否决，加仓只受硬护栏约束（合并后单笔保证金、总名义、总在途风险、止损、当日亏损、紧急停止）" if add_position.tm_decides(cfg) else "已有风险+加仓风险≤单笔上限，不足按剩余削减") + "；反向不反手须先平仓）。" if add_position.enabled(cfg) else "每币一仓不加仓。"),
              "", "## 行情（OKX，已收盘日线）",
              f"最新价 {mk['last']:.6g}；最近日线 {mk['bar_date']} 收 {mk['close']:.6g}；5日 {mk['ret_5d']:+.2f}%；20日 {mk['ret_20d']:+.2f}%；"
              f"ATR14 {mk['atr14']:.6g}（{mk['atr14'] / mk['last'] * 100:.2f}%）；20日高 {mk['hi_20']:.6g} 低 {mk['lo_20']:.6g}",
@@ -373,7 +373,7 @@ def _prompt(cfg, coin, mk, pos, bk, st, w, S, texts, preview=None):
         lines += ["", "## 加仓预览（代码按加仓规则预算，只是信息）",
                   describe_add_preview(preview) if preview else "加仓预览：未能计算（无数据），不影响决策流程。",
                   "判断是否加仓时，不要拿原仓止损止盈或原仓均价去类比（例如「离原仓止损仅 N 点」不是否决加仓的理由）："
-                  "加仓是新订单，该腿按加仓入场价独立设止损止盈、只覆盖加仓张数，原仓点位不动；请看上面加仓预览里该腿自己的止损距离、RR 与预算。"
+                  "加仓是新订单，该腿按加仓入场价独立设止损止盈、只覆盖加仓张数，原仓点位不动；请看上面加仓预览里该腿自己的止损距离、RR、预算参考与硬护栏可加张数。"
                   "最终是否加仓仍由你决定，你的否决权不变（hold/risk_scale=0）。"]
     from desk import analysis as _an
     lines += ["", _an.pending_brief(bk)]
@@ -1046,6 +1046,16 @@ def pre_trade_gate(cfg, inst, mk) -> str | None:
     return None
 
 
+def _add_hard_kw(cfg, sz_info, eq) -> dict:
+    """加仓硬护栏参数：总名义上限与剩余额度（持仓+其他币条件单+在途子单，同 demo_size 的 book_exposure）。"""
+    g = cfg["guardrails"]
+    max_tot = float(g.get("max_total_notional_pct") or g.get("max_total_exposure_pct", 60) * float(ledger.swap_cfg(cfg)["leverage_max"]))
+    ex = sz_info.get("exposure") or {}
+    now = float(ex.get("long") or 0) + float(ex.get("short") or 0)
+    return {"tm_decides": add_position.tm_decides(cfg), "total_room": eq * max_tot / 100 - now,
+            "max_total_pct": max_tot, "total_now": now}
+
+
 def add_preview(cfg, inst, mk, bk, pos, st, w, S=None) -> dict | None:
     """交易经理决策前的「加仓预览」（只读信息，不下单、不改点位）。
     已有持仓且 allow_add_position 开启时，对各角色提出的同向入场价与现价，按加仓入场价独立算本腿止损/止盈/RR
@@ -1100,12 +1110,17 @@ def add_preview(cfg, inst, mk, bk, pos, st, w, S=None) -> dict | None:
                 sz_info = demo_size(cfg, {"S": S_use, "side": side, "entry_px": px, "stop_loss": float(plan["stop"])}, mk, bk, None, inst)
                 if not sz_info.get("ok"):
                     it["reason"] = f"定仓拒绝：{sz_info.get('reason')}"; continue
-                a = add_position.budget(rc, pos, px, float(plan["stop"]), sz_info,
-                                        float(bk["live_equity"] if bk.get("live_equity") else bk["equity"]),
+                eq_ = float(bk["live_equity"] if bk.get("live_equity") else bk["equity"])
+                a = add_position.budget(rc, pos, px, float(plan["stop"]), sz_info, eq_,
                                         float(cfg["guardrails"]["max_position_pct"]),
-                                        float(cfg["guardrails"].get("min_order_usd", 0)), legs=legs)
+                                        float(cfg["guardrails"].get("min_order_usd", 0)), legs=legs,
+                                        **_add_hard_kw(cfg, sz_info, eq_))
                 it.update(existing_risk=a.get("existing_risk"), add_risk=a.get("add_risk"), cap=a.get("cap"),
-                          clipped=a.get("clipped"), clip_by=a.get("clip_by"))
+                          clipped=a.get("clipped"), clip_by=a.get("clip_by"), tm_decides=a.get("tm_decides"),
+                          hard_max_notional=a.get("hard_max_notional"), hard_limit=a.get("hard_limit"),
+                          hard_max_sz=okx_demo.contracts(inst, float(a.get("hard_max_notional") or 0) / px) or "0",
+                          margin_after_pct=a.get("margin_after_pct"), total_after_pct=a.get("total_after_pct"),
+                          max_total_pct=a.get("max_total_pct"))
                 if not a["ok"]:
                     it.update(within_budget=False, reason=a.get("reason")); continue
                 sz = okx_demo.contracts(inst, a["notional"] / px)
@@ -1142,8 +1157,15 @@ def describe_add_preview(pv: dict | None) -> str:
              f"RR {('%.2f' % it['rr']) if it.get('rr') is not None else '—'}、加仓 {it['sz'] or '—'} 张")
         if it.get("cap") is not None:
             s += (f"、原仓风险 {float(it['existing_risk'] or 0):.2f}+本腿风险 {float(it['add_risk'] or 0):.2f}"
-                  f" / 上限 {float(it['cap']):.2f} USDT（0.75%预算"
-                  + ("内" if it.get("within_budget") else "不足") + (f"，已削减：{'、'.join(it.get('clip_by') or [])}" if it.get("clipped") else "") + "）")
+                  f" / 预算上限 {float(it['cap']):.2f} USDT（单笔风险预算"
+                  + ("内" if it.get("within_budget") else "超出") + ("，仅参考不否决，是否加仓由你决定" if it.get("tm_decides") else "")
+                  + (f"，已削减：{'、'.join(it.get('clip_by') or [])}" if it.get("clipped") else "") + "）")
+        if it.get("hard_max_notional") is not None:
+            s += (f"、按硬护栏最多还能加 {it.get('hard_max_sz') or '0'} 张（名义 {float(it['hard_max_notional']):.2f} USDT，受 {it.get('hard_limit')} 约束）")
+        if it.get("margin_after_pct") is not None:
+            s += f"、加仓后本币保证金占权益 {float(it['margin_after_pct']):.2f}%"
+        if it.get("total_after_pct") is not None:
+            s += f"、总名义占权益 {float(it['total_after_pct']):.2f}%（上限 {float(it.get('max_total_pct') or 0):g}%）"
         if it.get("reason"):
             s += f"；算不出/不可加：{it['reason']}"
         rows.append(s)
@@ -1191,10 +1213,10 @@ def _try_add(cfg, inst, did, agg, mk, bk, pos, st, w, tm, tm_state, source, rati
         okx_demo.log_event("add_rejected", inst_id=inst, decision_id=did, reasons=[sz_info.get("reason")])
         return "hold", None, None, 0.0
     r = DX.reg(); legs = (r.get("positions") or {}).get(inst, {}).get("legs")
-    a = add_position.budget(rc, pos, add_px, float(plan["stop"]), sz_info,
-                            float(bk["live_equity"] if bk.get("live_equity") else bk["equity"]),
+    eq_ = float(bk["live_equity"] if bk.get("live_equity") else bk["equity"])
+    a = add_position.budget(rc, pos, add_px, float(plan["stop"]), sz_info, eq_,
                             float(cfg["guardrails"]["max_position_pct"]), float(cfg["guardrails"].get("min_order_usd", 0)),
-                            legs=legs)
+                            legs=legs, **_add_hard_kw(cfg, sz_info, eq_))
     a.update(add_px=add_px, mode=("now" if now else "trigger"), base_sl=cur_sl, base_tp=cur_tp,
              final_sl=plan["stop"], final_tp=plan["take_profit"], rr=plan["rr"])
     agg["add"] = a
@@ -1227,7 +1249,7 @@ def _try_add(cfg, inst, did, agg, mk, bk, pos, st, w, tm, tm_state, source, rati
     meta = {"base_contracts": pos["contracts"], "base_avg": pos["avg_px"], "base_sl": float(cur_sl), "base_tp": cur_tp,
             "base_qty": pos["qty"], "add_px": add_px, "risk_cap_usd": a["cap"],
             "final_sl": plan["stop"], "final_tp": plan["take_profit"], "existing_risk": a["existing_risk"], "add_risk": a["add_risk"],
-            "algoId": None}
+            "tm_decides": bool(a.get("tm_decides")), "algoId": None}
     ok, info = DX.place_add_trigger(cfg, bk, inst, pos, {
         "decision_id": did, "source": source, "side": side, "trigger_px": add_px, "condition": agg["condition"],
         "stop_loss": plan["stop"], "take_profit": plan["take_profit"], "size_pct": 0, "horizon_days": agg["horizon_days"],

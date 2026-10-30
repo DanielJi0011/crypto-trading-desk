@@ -3,7 +3,9 @@
 加仓当成一笔新订单：按加仓入场价独立算止盈止损（ATR+2R + 全员加权，RR≥min_rr），
 只覆盖加仓张数；原仓的止盈止损与张数完全不动，不撤原仓 reduceOnly 保护单。
 
-风险预算：原仓止损风险（各已开腿之和；无腿登记时退回「现止损到均价 × 张数，盈利区按 0」）
+2026-10-30 用户决定（add_position.tm_decides_add，默认 true）：是否加仓由交易经理决定，下面的预算只作参考不否决，
+加仓只受硬护栏（合并保证金、总名义、R4、止损、当日亏损、KILL）约束；false 恢复下述旧预算硬拒。
+风险预算（旧行为）：原仓止损风险（各已开腿之和；无腿登记时退回「现止损到均价 × 张数，盈利区按 0」）
 + 本笔加仓止损风险 ≤ 单笔上限（0.75%×权益×共识/回撤/交易经理缩放）。
 预算不足则削减加仓量；剩余低于最小下单量 → 不加仓（add_budget_full）。
 
@@ -21,6 +23,15 @@ def _sg(side: str) -> int:
 
 def enabled(cfg) -> bool:
     return bool((cfg.get("risk") or {}).get("allow_add_position", True))
+
+
+def tm_decides(cfg) -> bool:
+    """add_position.tm_decides_add（默认 true，2026-10-30 用户决定）：是否加仓由交易经理权衡后决定。
+    true：加仓风险预算（min(risk_usd, 权益×risk_per_trade_pct) − 现有风险）只作给交易经理的参考数据，不削减、不否决；
+    加仓只受硬护栏约束（合并后单笔保证金 max_position_pct、总名义 max_total_notional_pct、R4 在途风险/同向净名义、
+    必须有止损、当日亏损停开仓、KILL/HALT）。交易经理仍可否决；交易经理无结论仍不加仓（manager.tm_required_for_open）。
+    false：恢复旧行为（预算不足削减，预算满 add_budget_full 拒绝）。"""
+    return bool((cfg.get("add_position") or {}).get("tm_decides_add", True))
 
 
 def existing_risk(pos: dict, rc: dict, legs: list | None = None) -> float:
@@ -47,14 +58,22 @@ def new_avg(pos: dict, add_qty: float, add_px: float) -> float:
 
 
 def budget(rc: dict, pos: dict, add_px: float, add_sl: float, sz_info: dict, equity: float,
-           max_position_pct: float, min_order_usd: float, legs: list | None = None) -> dict:
-    """在 sizing.size 结果上，按「原仓风险 + 本笔加仓止损风险」扣预算。dist 用加仓入场价到本笔止损。"""
+           max_position_pct: float, min_order_usd: float, legs: list | None = None,
+           tm_decides: bool = False, total_room: float | None = None, max_total_pct: float | None = None,
+           total_now: float | None = None) -> dict:
+    """在 sizing.size 结果上算加仓张数。dist 用加仓入场价到本笔止损。
+    预算（cap = min(risk_usd, 权益×risk_per_trade_pct)，existing_risk，budget_left）始终计算并输出。
+    tm_decides=False（旧行为）：按预算削减，预算满 → add_budget_full 拒绝。
+    tm_decides=True（2026-10-30 用户决定）：预算只作参考（over_budget 标记），不削减不拒绝；
+    只按硬护栏削减：合并后保证金 ≤ max_position_pct%、总名义剩余额度 total_room（含挂单/在途子单）、
+    R4 剩余额度（sizing.size 已按 sz_info.room 削减）。hard_max_notional = 按硬护栏还能加的最大名义。"""
     side = pos["side"]
     cap = min(float(sz_info["risk_usd"]), float(equity) * float(rc["risk_per_trade_pct"]))
     ex = existing_risk(pos, rc, legs)
     left = cap - ex
     info = {"existing_risk": round(ex, 4), "cap": round(cap, 4), "stop_ref": add_sl, "base_sl": pos.get("sl_px"),
-            "clipped": False, "clip_by": [], "notional_want": round(float(sz_info.get("notional") or 0), 4)}
+            "clipped": False, "clip_by": [], "notional_want": round(float(sz_info.get("notional") or 0), 4),
+            "tm_decides": bool(tm_decides)}
     if add_sl in (None, ""):
         return {**info, "ok": False, "reason": "no_stop", "notional": 0.0, "add_risk": 0.0, "budget_left": round(left, 4)}
     if _sg(side) * (float(add_px) - float(add_sl)) <= 0:
@@ -62,19 +81,46 @@ def budget(rc: dict, pos: dict, add_px: float, add_sl: float, sz_info: dict, equ
     dist = abs(float(add_px) - float(add_sl)) / float(add_px) + float(rc["cost_buffer_pct"])
     want = float(sz_info.get("notional") or 0)
     by_budget = max(0.0, left) / dist
-    notional = min(want, by_budget)
-    if by_budget < want - 1e-9:
-        info["clipped"] = True; info["clip_by"].append("add_risk_budget")
     lev = float(pos.get("leverage") or 1)
     m_room = float(equity) * float(max_position_pct) / 100 - float(pos.get("margin") or 0)
+    # 硬护栏可加最大名义（不含预算）：合并保证金、总名义、R4（sz_info.room 为 R4 剩余名义）
+    hard = [("max_position_pct(合并保证金)", max(0.0, m_room * lev))]
+    if total_room is not None:
+        hard.append(("max_total_notional_pct", max(0.0, float(total_room))))
+    if sz_info.get("room") is not None:
+        hard.append((str(sz_info.get("room_limit") or "R4"), max(0.0, float(sz_info["room"]))))
+    hard_lim, hard_max = min(hard, key=lambda x: x[1])
+    info.update(hard_max_notional=round(hard_max, 4), hard_limit=hard_lim, by_budget_notional=round(by_budget, 4))
+    notional = want
+    if not tm_decides:
+        notional = min(want, by_budget)
+        if by_budget < want - 1e-9:
+            info["clipped"] = True; info["clip_by"].append("add_risk_budget")
     if notional / lev > m_room + 1e-9:
         notional = max(0.0, m_room * lev)
         info["clipped"] = True; info["clip_by"].append("max_position_pct(合并保证金)")
+    if total_room is not None and notional > float(total_room) + 1e-9:
+        notional = max(0.0, float(total_room))
+        info["clipped"] = True; info["clip_by"].append("max_total_notional_pct")
     add_risk = notional * dist
-    out = {**info, "notional": notional, "add_risk": round(add_risk, 4), "budget_left": round(left - add_risk, 4), "dist": dist}
+    margin_after = float(pos.get("margin") or 0) + notional / lev
+    out = {**info, "notional": notional, "add_risk": round(add_risk, 4), "budget_left": round(left - add_risk, 4), "dist": dist,
+           "over_budget": bool(ex + add_risk > cap + 1e-6),
+           "margin_after_pct": round(margin_after / float(equity) * 100, 3) if equity else None}
+    if total_now is not None and equity:
+        out["total_after_pct"] = round((float(total_now) + notional) / float(equity) * 100, 3)
+    if max_total_pct is not None:
+        out["max_total_pct"] = float(max_total_pct)
     if notional < max(float(min_order_usd), 1e-9):
-        reason = "add_budget_full" if (left <= 0 or "add_risk_budget" in info["clip_by"]) else (
-            "add_margin_full" if info["clip_by"] else "size_too_small")
+        if tm_decides:
+            if hard_max >= max(float(min_order_usd), 1e-9):
+                reason = "size_too_small"
+            else:
+                reason = {"max_total_notional_pct": "add_total_notional_full", "max_open_risk_pct": "add_open_risk_full",
+                          "max_net_directional_pct": "add_net_directional_full"}.get(hard_lim, "add_margin_full")
+        else:
+            reason = "add_budget_full" if (left <= 0 or "add_risk_budget" in info["clip_by"]) else (
+                "add_margin_full" if info["clip_by"] else "size_too_small")
         return {**out, "ok": False, "reason": reason, "notional": 0.0, "add_risk": 0.0, "budget_left": round(left, 4)}
     return {**out, "ok": True, "reason": None}
 
@@ -113,9 +159,16 @@ def describe(a: dict) -> str:
     """日报/notes：预算 + 原仓止盈止损与加仓腿止盈止损分开写。"""
     if not a:
         return ""
-    s = (f"加仓风险预算：现有风险 {a.get('existing_risk', 0):.2f}，新增风险 {a.get('add_risk', 0):.2f}，"
+    s = (("加仓风险预算（仅参考，交易经理决定，不作否决）" if a.get("tm_decides") else "加仓风险预算")
+         + f"：现有风险 {a.get('existing_risk', 0):.2f}，新增风险 {a.get('add_risk', 0):.2f}，"
          f"上限 {a.get('cap', 0):.2f}，剩余预算 {a.get('budget_left', 0):.2f} USDT，"
          + (f"已削减（{'、'.join(a.get('clip_by') or [])}）" if a.get("clipped") else "未削减"))
+    if a.get("hard_max_notional") is not None:
+        s += f"；硬护栏可加最大名义 {a['hard_max_notional']:.2f}（受 {a.get('hard_limit')} 约束）"
+    if a.get("margin_after_pct") is not None:
+        s += f"；加仓后保证金占权益 {a['margin_after_pct']:.2f}%"
+    if a.get("total_after_pct") is not None:
+        s += f"、总名义占权益 {a['total_after_pct']:.2f}%"
     if a.get("base_sl") is not None or a.get("base_tp") is not None:
         s += (f"；原仓止损 {a.get('base_sl')}、止盈 {a.get('base_tp')}（不动）")
     if a.get("final_sl") is not None:
@@ -200,7 +253,8 @@ def recheck(cfg, inst: str, m: dict) -> dict:
     res = {"result": "ok", "contracts": cur, "add_sz": add_sz, "sl": sl, "tp": tp,
            "existing_risk": round(ex, 4), "add_risk": round(add_risk, 4), "cap": round(cap, 4), "reduced": None,
            "old_protect_before": sorted(old_ids)}
-    if ex + add_risk > cap + 1e-6 and sl is not None:
+    res["tm_decides"] = bool(m.get("tm_decides"))
+    if ex + add_risk > cap + 1e-6 and sl is not None and not m.get("tm_decides"):
         per_ct = abs(entry - float(sl)) * ct
         need = (ex + add_risk - cap) / per_ct if per_ct > 0 else add_sz
         lot = float(X.instrument(inst)["lotSz"])

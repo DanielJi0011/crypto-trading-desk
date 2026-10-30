@@ -81,7 +81,8 @@ def test_paper_open_guardrails(cfg, led):
     assert info["qty"] == pytest.approx(200 / (100 * 1.0005), rel=1e-6)
     b = led.book(cfg, {"BTC-USDT-SWAP": 100.0})
     assert b["cash"] < 800 and abs(b["equity"] - 1000) < 1.0     # 只损失费用+滑点
-    # 单笔 >20%
+    # 单笔 >20%（2026-10-30 起配置为 33%，本测试显式设旧值 20）
+    cfg["guardrails"]["max_position_pct"] = 20
     ok, info = led.open_position(cfg, "ETH-USDT-SWAP", 250, 95.0, None, 5, "D2", "t", 1000)
     assert not ok and any("POSITION" in r for r in info["reasons"])
     # 无止损

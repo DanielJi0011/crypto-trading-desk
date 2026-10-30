@@ -37,6 +37,7 @@ def test_net_directional_rejects_same_side_only(base):
 
 
 def test_open_risk_rejects(base):
+    base["risk"]["max_open_risk_pct"] = 0.02   # 显式旧值（2026-10-30 起配置为 0.04）
     bk = _bk([_pos("ETH-USDT-SWAP", "short", 30000, 2000, None)])   # 无止损按 8% 估：2400 > 2000
     r, ch = DX.check_open(base, bk, "BTC-USDT-SWAP", 0.01, 100000, 99000, "long", 1)
     assert any("[OPEN_RISK]" in x for x in r) and ch["open_risk_after"] > 2000

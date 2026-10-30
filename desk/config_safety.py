@@ -89,5 +89,11 @@ def validate(cfg) -> None:
     for k in ("max_daily_loss_pct", "max_drawdown_pct", "risk_per_trade_pct"):
         if k in rk and not (0 < float(rk[k]) <= 0.5):
             errs.append(f"risk.{k}={rk[k]} 超出 (0, 0.5]（单位是小数，0.025 即 2.5%）")
+    # 2026-10-30 用户决定：单笔保证金上限两处联动（guardrails.max_position_pct 为 %，risk.max_margin_pct 为小数），必须一致
+    if "max_position_pct" in g and "max_margin_pct" in rk and abs(float(rk["max_margin_pct"]) * 100 - float(g["max_position_pct"])) > 1e-6:
+        errs.append(f"risk.max_margin_pct={rk['max_margin_pct']} 与 guardrails.max_position_pct={g['max_position_pct']} 不一致（须 ×100 相等）")
+    tot = g.get("max_total_notional_pct")
+    if tot and "max_net_directional_pct" in rk and float(rk["max_net_directional_pct"]) * 100 > float(tot) + 1e-6:
+        errs.append(f"risk.max_net_directional_pct={rk['max_net_directional_pct']} 超过总名义上限 {tot}%（同向净名义不得超过总名义）")
     if errs:
         raise ConfigSafetyError("配置安全校验失败：" + "；".join(errs))
