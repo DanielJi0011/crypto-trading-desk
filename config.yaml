@@ -208,6 +208,10 @@ manager:
   tm_pending_drift_exempt: true         # 2026-10-30：交易经理条件单不因 1% 价格漂移被跳过（现价已越过触发价时仍跳过）；现价单、加仓仍受漂移检查；false=旧行为（条件单也会被漂移跳过）
   tm_required_for_open: true            # 2026-10-30 用户决定：最后由交易经理拍板（职能等同原项目组合经理）；交易经理无结论（调用重试后仍失败/空输出/解析失败）或未给同向现价单、完整条件单 → 本次不开仓不加仓，日报写明原因；不再回退现价+ATR+2R 基准开仓；持仓管理（止损、到期回退平仓）不变；false=旧行为
   tm_pending_keep_sltp: true            # 2026-10-30 规则 3：交易经理投 pending/条件加仓且 new_stop/new_tp 都留空 → 原仓保持原点位（不重新加权、不外推止盈），日报写"保持原点位"；false=旧行为（仅 hold 保持）
+  tm_decides_add_levels: true           # 2026-10-30 用户决定：加仓腿止损止盈以交易经理为准（条件加仓用 entry_stop_loss/entry_take_profit，现价加仓用 stop_loss/take_profit），只过硬护栏（侧向、stop_max_pct、RR≥1.5 不足外推止盈并写明）；未给的项用 ATR 基准；false=旧行为（按角色加权）
+  tm_decides_existing_pending: true     # 2026-10-30 用户决定：现有同向同价位挂单按交易经理 existing_pending（keep/replace）执行；字段留空按理由文字（重挂类词=replace），字段与文字矛盾按字段并标记；keep 时有效期按 entry_expire_hours 自原挂单时刻重算；replace 撤旧挂新、张数按风险重算；false=旧行为（同价位一律保留原单原张数原到期）
+  tm_require_explicit_levels: true      # 2026-10-31 用户决定：交易经理开仓/加仓类决定必须给具体点位（buy/short：entry、stop_loss、take_profit；pending：entry_trigger_px、entry_stop_loss、entry_take_profit），缺任一项视为无有效结论，按 tm_required_for_open 不开仓不加仓并发无结论提醒；持有/平仓/减仓不受影响；false=旧行为（缺项用 ATR 基准补）
+  tm_pending_stop_by_tm: true           # 2026-10-31 用户决定：同价位保留现有挂单（未成交条件单）时止损以交易经理为准，取消「只许收紧」；仍过硬护栏（触发价亏损一侧、距离≤stop_max_pct 8%、RR≥1.5、按原张数单笔风险≤1.5%、保证金≤33%），违反则弃用并写明原因；已开仓位止损只许收紧不变；false=旧行为
 
 # 入场方案分组（desk/sizing.py choose_plan，2026-10-30 新增）
 sizing:

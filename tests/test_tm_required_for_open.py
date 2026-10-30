@@ -73,6 +73,7 @@ def test_report_shows_reason(desk_env, monkeypatch):
 def test_aggregate_no_fallback_open_by_default():
     from desk import manager
     cfg = settings.load_config()
+    cfg["manager"]["tm_require_explicit_levels"] = False  # 旧行为：交易经理缺入场价/止盈时用基准补（2026-10-31 后默认必须给具体点位，见 test_tm_explicit_levels.py）
     st = _st("bearish", entry_px=95.0, cond="lte")
     for tm in (None, _dec(), _dec(action="pending", entry_side="short", entry_trigger_px=103.0), _dec(action="buy", stop_loss=96.0)):
         agg = manager.aggregate(cfg, st, manager.weights(cfg), {"last": 100.0, "atr14": 2.0}, tm=tm)

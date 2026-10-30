@@ -90,6 +90,7 @@ def test_aggregate_entry_from_tm_pending():
 def test_aggregate_fallback_when_tm_incomplete():
     from desk import manager, sizing
     cfg = settings.load_config()
+    cfg["manager"]["tm_require_explicit_levels"] = False  # 旧行为：交易经理缺入场价/止盈时用基准补（2026-10-31 后默认必须给具体点位，见 test_tm_explicit_levels.py）
     cfg["manager"]["tm_required_for_open"] = False   # 旧回退行为（2026-10-30 后默认 true 不开仓，见 test_tm_required_for_open.py）
     st = _st("bearish", entry_px=95.0, cond="lte")
     for tm in (None, _dec(), _dec(action="pending", entry_side="short", entry_trigger_px=103.0)):
@@ -102,6 +103,7 @@ def test_aggregate_fallback_when_tm_incomplete():
 def test_aggregate_bad_tm_stop_uses_baseline():
     from desk import manager
     cfg = settings.load_config()
+    cfg["manager"]["tm_require_explicit_levels"] = False  # 旧行为：交易经理缺入场价/止盈时用基准补（2026-10-31 后默认必须给具体点位，见 test_tm_explicit_levels.py）
     tm = _dec(action="short", stop_loss=95.0, take_profit=90.0, size_pct=5)   # 空单止损在下方：错误一侧
     agg = manager.aggregate(cfg, _st("bearish"), manager.weights(cfg), {"last": 100.0, "atr14": 2.0}, tm=tm)
     assert agg["plan_group"] == "tm" and agg["stop_loss"] > 100.0 and any("弃用" in n for n in agg["notes"])
@@ -184,7 +186,7 @@ def test_veto_and_absent(desk_env):
     assert rec["tm_status"] == "veto", rec["manager"]["rationale"]
     assert rec["tm_vetoed_consensus"] and rec["decision_type"] == "持有"
     assert not calls["open_now"] and not calls["place_trigger"]
-    box["dec"] = _dec(action="short", size_pct=5, stop_loss=104.0, take_profit=92.0)
+    box["dec"] = _dec(action="short", size_pct=5, entry=100.0, stop_loss=104.0, take_profit=92.0)
     rec = manager.decide_and_execute(cfg, cfg["coins"][0], "2026-10-30", {}, _st("bearish"), None)
     assert rec["tm_status"] == "go" and rec["decision_type"] == "开仓" and calls["open_now"]
 

@@ -253,7 +253,7 @@ def test_mock_full_dry_run(cfg, monkeypatch):
             p.unlink()
 
     def hook(schema):
-        return schema(action="buy", size_pct=10, stop_loss=round(ledger.PRICE("BTC-USDT-SWAP") * 0.95, 1), take_profit=None,
+        return schema(action="buy", size_pct=10, entry=82000.0, stop_loss=round(ledger.PRICE("BTC-USDT-SWAP") * 0.95, 1), take_profit=90200.0,
                       invalidation="跌破止损", horizon_days=5, confidence=0.6, rationale="模拟：采纳多数角色看多")
     dllm.FAKE_STRUCTURED["ManagerDecision"] = hook
     monkeypatch.setattr(ledger, "PRICE", lambda inst: 82000.0)

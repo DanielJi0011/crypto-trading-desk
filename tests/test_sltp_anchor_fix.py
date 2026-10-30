@@ -72,7 +72,7 @@ def test_switches_off_restore_old():
 
 
 def _tm(**kw):
-    d = dict(action="short", stop_loss=82300.0, take_profit=76400.0, horizon_days=5, entry_side="short",
+    d = dict(action="short", entry=LAST, stop_loss=82300.0, take_profit=76400.0, horizon_days=5, entry_side="short",
              entry_trigger_px=None, entry_condition=None, entry_stop_loss=None, entry_take_profit=None, entry_size_pct=10.0)
     d.update(kw)
     return NS(**d)

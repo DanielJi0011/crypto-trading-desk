@@ -117,7 +117,7 @@ def wavg_levels(st: dict, w: dict, roles: list, side: str, entry: float) -> dict
 
 
 def finalize_sl_tp(side: str, entry: float, base_stop, base_tp, role_stop=None, role_tp=None, min_rr: float = 1.5,
-                   base_dist=None, anchor_mult=None, tighten_first: bool = False, tp_cap_mult=None, tp_r: float = 2.0) -> dict:
+                   base_dist=None, anchor_mult=None, tighten_first: bool = False, tp_cap_mult=None, tp_r: float = 2.0, src: str = "角色加权") -> dict:
     """ATR(+2R) 基准 → 角色加权覆盖 → 强制 RR≥min_rr（不够则外推止盈；组合无效则回退基准）。
     2026-10-30 新规则（参数均缺省=旧行为，由 anchor_opts 按开关给出；base_dist=基准止损距离，价格单位）：
       anchor_mult：止损相对 entry 的距离 > anchor_mult×base_dist → 收紧到该上限（只收紧）；
@@ -129,9 +129,9 @@ def finalize_sl_tp(side: str, entry: float, base_stop, base_tp, role_stop=None, 
     tp = role_tp if role_tp is not None else base_tp
     adjusted = role_stop is not None or role_tp is not None
     if role_stop is not None:
-        notes.append(f"止损按角色加权调整→{float(role_stop):.6g}")
+        notes.append(f"止损按{src}调整→{float(role_stop):.6g}")
     if role_tp is not None:
-        notes.append(f"止盈按角色加权调整→{float(role_tp):.6g}")
+        notes.append(f"止盈按{src}调整→{float(role_tp):.6g}")
     sg = 1 if side == "long" else -1
     e = float(entry)
     bd = float(base_dist) if base_dist else None
@@ -357,18 +357,28 @@ def size(rc: dict, *, equity: float, S: float, entry: float, stop: float, side: 
 
 
 def pending_keep_sltp(side: str, trigger: float, old_sl, old_tp, new_sl, new_tp, now_px: float,
-                      min_rr: float = 1.5, gap_pct: float = 0.3) -> dict:
+                      min_rr: float = 1.5, gap_pct: float = 0.3, allow_widen: bool = False, stop_max_pct=None,
+                      widen_check=None) -> dict:
     """保留同价位现有条件单时，按交易经理给的 new 止损/止盈改点（2026-10-30 用户规则，纯函数）：
     只给一项另一项保持原值；止损只收紧（做空只下移、做多只上移）且须在触发价亏损一侧；
-    止盈须在触发价盈利一侧且距现价至少 gap_pct%；按触发价算 RR≥min_rr；违规的项保持原值并记原因。"""
+    止盈须在触发价盈利一侧且距现价至少 gap_pct%；按触发价算 RR≥min_rr；违规的项保持原值并记原因。
+    allow_widen=True（2026-10-31，manager.tm_pending_stop_by_tm）：挂单止损以交易经理为准，可放宽，但须距触发价 ≤ stop_max_pct，
+    且 widen_check(sl) 返回 None（单笔风险/保证金等硬护栏）；违反则弃用并写明原因。"""
     sg = 1 if side == "long" else -1
     sl, tp, why = old_sl, old_tp, []
     if new_sl is not None and old_sl is not None and abs(float(new_sl) - float(old_sl)) > 1e-12:
         if sg * (float(trigger) - float(new_sl)) <= 0:
             why.append(f"新止损 {float(new_sl):g} 不在触发价亏损一侧，保持原止损 {float(old_sl):g}")
-        elif sg * (float(new_sl) - float(old_sl)) < 0:
+        elif stop_max_pct is not None and abs(float(trigger) - float(new_sl)) / float(trigger) > float(stop_max_pct) + 1e-12:
+            why.append(f"新止损 {float(new_sl):g} 距触发价 {abs(float(trigger) - float(new_sl)) / float(trigger):.2%} 超过上限 "
+                       f"{float(stop_max_pct):.0%}，弃用，保持原止损 {float(old_sl):g}")
+        elif sg * (float(new_sl) - float(old_sl)) < 0 and not allow_widen:
             why.append(f"新止损 {float(new_sl):g} 比原止损 {float(old_sl):g} 放宽（只允许收紧），保持原止损")
+        elif sg * (float(new_sl) - float(old_sl)) < 0 and widen_check is not None and widen_check(float(new_sl)):
+            why.append(f"新止损 {float(new_sl):g} 以交易经理为准但违反硬护栏（{widen_check(float(new_sl))}），弃用，保持原止损 {float(old_sl):g}")
         else:
+            if sg * (float(new_sl) - float(old_sl)) < 0:
+                why.append(f"挂单止损以交易经理为准：{float(old_sl):g}→{float(new_sl):g}（放宽，已过硬护栏）")
             sl = float(new_sl)
     elif new_sl is not None and old_sl is None:
         sl = float(new_sl)

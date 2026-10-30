@@ -125,7 +125,7 @@ def budget(rc: dict, pos: dict, add_px: float, add_sl: float, sz_info: dict, equ
     return {**out, "ok": True, "reason": None}
 
 
-def plan_sl_tp(rc: dict, side: str, entry: float, atr, role_stop=None, role_tp=None) -> dict:
+def plan_sl_tp(rc: dict, side: str, entry: float, atr, role_stop=None, role_tp=None, src: str = "角色加权") -> dict:
     """加仓腿独立止盈止损：按加仓入场价，ATR+2R 基准 → 角色加权 → RR≥min_rr。与原仓止损止盈无关。"""
     from desk import sizing
     min_rr = float(rc.get("min_rr_after_adjust", 1.5))
@@ -134,7 +134,7 @@ def plan_sl_tp(rc: dict, side: str, entry: float, atr, role_stop=None, role_tp=N
     entry = float(entry)
     if atr and entry > 0:
         bs, bt, _ = sizing.stop_take(side, entry, float(atr), rc)
-        fin = sizing.finalize_sl_tp(side, entry, bs, bt, role_stop, role_tp, min_rr)
+        fin = sizing.finalize_sl_tp(side, entry, bs, bt, role_stop, role_tp, min_rr, src=src)
         stop, tp = fin["stop"], fin["take_profit"]
         notes += fin["notes"]
     else:

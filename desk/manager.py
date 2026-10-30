@@ -40,6 +40,39 @@ def tm_decides_entry(cfg) -> bool:
     return bool(_mcfg(cfg).get("tm_decides_entry", True))
 
 
+def tm_require_levels(cfg) -> bool:
+    """manager.tm_require_explicit_levels（默认 true，2026-10-31 用户决定）：交易经理开仓/加仓类决定（buy/short/pending）
+    必须给出具体入场价、止损、止盈；缺任一项视为无有效结论，按 tm_required_for_open 不开仓不加仓并发无结论提醒。
+    持有/平仓/减仓不受影响。false=旧行为（缺止盈或现价单缺止损时用 ATR 基准补）。"""
+    return bool(_mcfg(cfg).get("tm_require_explicit_levels", True))
+
+
+def tm_pending_stop_by_tm(cfg) -> bool:
+    """manager.tm_pending_stop_by_tm（默认 true，2026-10-31 用户决定）：同价位保留现有挂单（未成交条件单）时止损以交易经理为准，
+    取消「只许收紧」；仍须过硬护栏（触发价亏损一侧、≤stop_max_pct、RR≥min_rr、单笔风险≤risk_per_trade_pct、保证金≤max_margin_pct）。
+    已开仓位的止损只许收紧不变。false=旧行为（挂单止损也只许收紧）。"""
+    return bool(_mcfg(cfg).get("tm_pending_stop_by_tm", True))
+
+
+TM_LEVEL_FIELDS = {"pending": (("entry_trigger_px", "触发价"), ("entry_stop_loss", "止损"), ("entry_take_profit", "止盈")),
+                   "buy": (("entry", "入场价"), ("stop_loss", "止损"), ("take_profit", "止盈")),
+                   "short": (("entry", "入场价"), ("stop_loss", "止损"), ("take_profit", "止盈"))}
+
+
+def tm_missing_levels(tm) -> list:
+    """交易经理开仓/加仓类决定缺的具体点位（中文名列表）；非开仓类动作返回 []。"""
+    out = []
+    for k, cn in TM_LEVEL_FIELDS.get(getattr(tm, "action", None), ()):
+        v = getattr(tm, k, None)
+        try:
+            ok = v not in (None, "") and float(v) > 0
+        except (TypeError, ValueError):
+            ok = False
+        if not ok:
+            out.append(cn)
+    return out
+
+
 def tm_required_for_open(cfg) -> bool:
     """manager.tm_required_for_open（默认 true，2026-10-30 用户决定）：最后由交易经理拍板（职能等同原项目组合经理）。
     交易经理没有生成有效的同向开仓结论（缺席/调用失败/空输出/解析失败，或没给同向的现价单或完整条件单）→ 本次不开仓、不加仓，
@@ -98,6 +131,7 @@ class ManagerDecision(BaseModel):
     entry_size_pct: float | None = Field(default=None, description="条件单保证金占权益百分比（0~20）")
     entry_expire_hours: float | None = Field(default=None, description="条件单有效期（小时），过期自动撤销")
     entry_reason: str = Field(default="", description="为什么选这个入场价位（中文，≤80字）")
+    existing_pending: Literal["keep", "replace"] | None = Field(default=None, description="对本币现有同向条件挂单（提示里列出时填写）：keep=保留原单（张数不变，有效期按 entry_expire_hours 自原挂单时刻重算）；replace=撤旧挂新（张数按风险定仓重算、risk_scale 生效、有效期按 entry_expire_hours 自现在起算）；没有现有挂单就省略")
 
 
 def tm_stance(dec: "ManagerDecision", mk: dict, pos=None) -> dict:
@@ -202,6 +236,13 @@ def tm_entry_plan(cfg, tm, side: str, last: float, atr) -> dict:
     out = {"group": "tm_fallback_now", "entry": last, "condition": "now", "stop": None, "tp": None,
            "horizon": float(getattr(tm, "horizon_days", None) or 5) if tm is not None else None, "notes": notes}
     act = getattr(tm, "action", None)
+    if tm is not None and tm_require_levels(cfg) and act in TM_LEVEL_FIELDS:
+        miss = tm_missing_levels(tm)
+        if miss:
+            out["missing_levels"] = miss
+            notes.append(f"交易经理{'挂条件单' if act == 'pending' else '现价开仓/加仓'}未给具体{'、'.join(miss)}"
+                         "（manager.tm_require_explicit_levels），视为无有效结论")
+            return out
     if tm is not None and act == "pending" and pending_complete(tm) and ("long" if tm.entry_side == "long" else "short") == side:
         out.update(group="tm_pending", entry=float(tm.entry_trigger_px), condition=tm.entry_condition,
                    stop=tm.entry_stop_loss, tp=tm.entry_take_profit)
@@ -276,8 +317,11 @@ def aggregate(cfg, st: dict, w: dict, mk: dict, existing: dict | None = None, tm
         if tmp and side:
             if tmp["group"] == "tm_fallback_now" and tm_required_for_open(cfg):
                 # 交易经理拍板：没有同向有效入场结论 → 不开仓、不加仓（不回退现价 + ATR+2R 基准）
+                if tmp.get("missing_levels"):
+                    notes.extend(n for n in tmp["notes"] if "未给具体" in n)
                 notes.append("交易经理无同向有效入场结论（未给同向现价单或完整条件单），不开仓（manager.tm_required_for_open）")
-                plan = {"group": None, "conflict": False, "scores": {}, "tm_no_conclusion": True}
+                plan = {"group": None, "conflict": False, "scores": {}, "tm_no_conclusion": True,
+                        "missing_levels": tmp.get("missing_levels")}
             else:
                 notes.extend(tmp["notes"])
     else:
@@ -330,6 +374,7 @@ def aggregate(cfg, st: dict, w: dict, mk: dict, existing: dict | None = None, tm
             "size_pct": round(size, 3), "horizon_days": int(min(max(round(hz or 5), 1), 30)), "notes": notes,
             "contributors": {r: st[r].get("entry_px") for r in bulls},
             "tm_no_conclusion": plan.get("tm_no_conclusion") or None,
+            "tm_missing_levels": plan.get("missing_levels") or None,
             "plan_group": plan.get("group"), "plan_scores": plan.get("scores"), "plan_conflict": conflict, "valid_voters": nv,
             "plan_members": plan.get("members"), "plan_direction_only": plan.get("direction_only") or None,
             "plan_implied_keep": plan.get("implied_keep") or None, "plan_cancel_votes": plan.get("cancel_votes") or None,
@@ -399,10 +444,12 @@ def _prompt(cfg, coin, mk, pos, bk, st, w, S, texts, preview=None):
               "开仓时机不再局限于每天 08:00。若你认为现价不适合开仓、但在某个价位愿意开仓，请 action=pending 并填写：",
               "- entry_side：long=做多，short=做空；entry_trigger_px：触发价；entry_condition：gte=价格涨到≥触发价时开仓"
               "（做多突破/做空反弹到阻力），lte=跌到≤触发价时开仓（做多回踩/做空跌破支撑）；",
-              "- entry_stop_loss：成交后的止损价（做多低于触发价、做空高于触发价，距离≤硬性止损上限）；entry_take_profit：止盈价（可省略）；",
+              "- entry_stop_loss：成交后的止损价（做多低于触发价、做空高于触发价，距离≤硬性止损上限）；entry_take_profit：止盈价（必填）；",
               "- entry_size_pct：保证金（%权益）；leverage：杠杆；entry_expire_hours：有效期（小时，过期自动撤销）；entry_reason：为什么选这个价位。",
+              "- existing_pending：已有同向同价位条件单时必须明确填 keep（保留，有效期按 entry_expire_hours 自原挂单时刻重算）或 replace（撤旧按风险重挂、有效期从现在起算），"
+              "并同时给出该挂单的具体触发价、止损、止盈数字（保留挂单时止损止盈以你给的为准，可收紧也可放宽，只过硬护栏）。",
               "条件单直接挂在 OKX 模拟盘，由交易所按最新价触发。"
-              + ("注意：方向由全部投票角色的加权共识决定，入场价、条件单点位、止损、止盈由你定（过代码护栏：止损只收紧、RR≥1.5、止损距离上限、价格漂移检查）；"
+              + ("注意：方向由全部投票角色的加权共识决定，入场价、条件单点位、止损、止盈由你定（过代码护栏：已有持仓止损只收紧、RR≥1.5、止损距离上限、价格漂移检查）；"
                  "投资组合经理只负责执行（过护栏后在 OKX 模拟盘下市价单或挂 trigger 条件单，均附止损止盈）。"
                  if tm_no_vote(cfg) else
                  "注意：你只是投票角色之一，最终方向、仓位、入场价与止损由各角色"
@@ -419,6 +466,12 @@ def _prompt(cfg, coin, mk, pos, bk, st, w, S, texts, preview=None):
               "但 new_stop 只能收紧、new_tp 须在现价盈利一侧且不会立即触发（距现价至少 "
               f"{float((cfg.get('manager') or dict()).get('tp_min_gap_pct', 0.3)):g}%），且调整后盈亏比 RR（止盈距/止损距，相对均价）不得低于 "
               f"{float((cfg.get('risk') or dict()).get('min_rr_after_adjust', 1.5)):g}；你保留否决权（hold/risk_scale=0）。",
+              "## 点位必须具体（硬性要求）",
+              "开仓（buy/short）必须给出具体数字：entry（入场价，现价单写当前价）、stop_loss、take_profit；"
+              "挂单/条件加仓/重挂/保留现有挂单（pending）必须给出具体数字：entry_trigger_px、entry_stop_loss、entry_take_profit。"
+              "不得只写区间、不得写「沿用」「附近」「参考」之类，不得留空；缺任一项代码视为你无有效结论，本次不开仓不加仓并发无结论提醒。",
+              "对现有挂单必须明确 existing_pending=keep 或 replace，并给出具体点位。",
+              "已有持仓 action=hold 时：要调点就在 new_stop/new_tp 写具体数字；不调就留空并在理由中明说「止损止盈不动」（代码保持原值）。",
               "请给出结构化决策。没有足够把握就 hold；止损请依据结构位/ATR 给出具体价位。理由用中文。"]
     return "\n".join(lines)
 
@@ -523,6 +576,8 @@ def decide_and_execute(cfg, coin, trade_date, fs, st, tracker, source="daily") -
         notes.insert(0, gate["note"])
     if absent and tm_required_for_open(cfg):
         notes.insert(0, f"{TM_NO_CONCLUSION_NOTE}（{absent_why}）")
+    elif agg.get("tm_missing_levels"):
+        notes.insert(0, f"{TM_NO_CONCLUSION_NOTE}（交易经理未给具体{'、'.join(agg['tm_missing_levels'])}）")
     S_pre_tm = S   # 交易经理提示里看到的口径（不含其本人投票）
     S = agg["S"]
     apply_position_sl_tp(cfg, pos, st, w, mk, dec, action, execd, notes, tm_absent=absent)
@@ -544,10 +599,11 @@ def decide_and_execute(cfg, coin, trade_date, fs, st, tracker, source="daily") -
         rec["decided_by"] = "trade_manager"
         rec["decision_type"] = decision_type(action, dec, pos, absent)
     settings.append_jsonl(DECISIONS, rec)
-    if absent:   # 交易经理无结论：独立即时提醒（按决策号去重，同一币同一次讨论一次）
+    miss = agg.get("tm_missing_levels") if not absent else None
+    if absent or miss:   # 交易经理无结论（含开仓/加仓缺具体点位）：独立即时提醒（按决策号去重，同一币同一次讨论一次）
         try:
             from desk.demo_ws import notify_tm_no_conclusion
-            notify_tm_no_conclusion(inst, absent_why, did, source)
+            notify_tm_no_conclusion(inst, absent_why if absent else f"交易经理{dec.action}未给具体{'、'.join(miss)}", did, source)
         except Exception:
             pass
     return rec
@@ -993,14 +1049,49 @@ def tm_pending_override(cfg, source, tm, tm_state, agg, notes) -> bool:
     return False
 
 
-def keep_same_trigger(cfg, inst, mk, agg, ex, tm, notes) -> dict:
-    """交易经理条件单与现有同向挂单同价位：保留原单不重挂，只按 new 止损/止盈规则改点（sizing.pending_keep_sltp）。"""
+def pending_widen_guard(cfg, inst, ex, bk):
+    """挂单止损以交易经理为准（tm_pending_stop_by_tm）时的硬护栏：返回 check(sl) -> 原因或 None。
+    按原单张数：单笔风险 = 张数×面值×|触发价−止损| ≤ 权益×risk_per_trade_pct；保证金 = 名义/杠杆 ≤ 权益×max_margin_pct。
+    缺权益/面值/张数 → 无法核验，拒绝放宽（保守）。"""
+    from desk import sizing
+    rc = sizing.rcfg(cfg)
+
+    def check(sl):
+        try:
+            from desk import okx_demo as X
+            eq = float((bk or {}).get("equity") or 0)
+            sz = float(ex.get("sz") or 0)
+            ct = float(X.instrument(inst)["ctVal"])
+            trig = float(ex["trigger_px"])
+        except Exception as e:
+            return f"无法核验单笔风险（{type(e).__name__}）"
+        if eq <= 0 or sz <= 0 or ct <= 0:
+            return "缺权益/张数/面值，无法核验单笔风险"
+        risk = sz * ct * abs(trig - float(sl))
+        cap = eq * float(rc["risk_per_trade_pct"])
+        if risk > cap * (1 + 1e-9):
+            return f"单笔风险 {risk:.2f} USDT 超过上限 {cap:.2f}（{float(rc['risk_per_trade_pct']):.2%}×权益）"
+        lev = float(ex.get("leverage") or 1) or 1
+        mg = sz * ct * trig / lev
+        mcap = eq * float(rc["max_margin_pct"])
+        if mg > mcap * (1 + 1e-9):
+            return f"保证金 {mg:.2f} USDT 超过上限 {mcap:.2f}（{float(rc['max_margin_pct']):.0%}×权益）"
+        return None
+    return check
+
+
+def keep_same_trigger(cfg, inst, mk, agg, ex, tm, notes, bk=None) -> dict:
+    """交易经理条件单与现有同向挂单同价位：保留原单不重挂，只按 new 止损/止盈规则改点（sizing.pending_keep_sltp）。
+    tm_pending_stop_by_tm=true：挂单止损以交易经理为准（可放宽），只过硬护栏。"""
     from desk import demo_exec as DX, sizing
     rc, M = sizing.rcfg(cfg), cfg.get("manager") or {}
+    by_tm = tm_pending_stop_by_tm(cfg)
     r = sizing.pending_keep_sltp(ex["side"], ex["trigger_px"], ex.get("stop_loss"), ex.get("take_profit"),
                                  float(tm.entry_stop_loss) if tm.entry_stop_loss else None,
                                  float(tm.entry_take_profit) if tm.entry_take_profit else None,
-                                 float(mk["last"]), float(rc.get("min_rr_after_adjust", 1.5)), float(M.get("tp_min_gap_pct", 0.3)))
+                                 float(mk["last"]), float(rc.get("min_rr_after_adjust", 1.5)), float(M.get("tp_min_gap_pct", 0.3)),
+                                 **({"allow_widen": True, "stop_max_pct": float(rc["stop_max_pct"]),
+                                     "widen_check": pending_widen_guard(cfg, inst, ex, bk)} if by_tm else {}))
     for x in r["reasons"]:
         notes.append("保留现有条件单改点：" + x)
     info = {"kept": ex["algoId"], "trigger_px": ex["trigger_px"], "side": ex["side"], "old_sl": ex.get("stop_loss"),
@@ -1017,6 +1108,88 @@ def keep_same_trigger(cfg, inst, mk, agg, ex, tm, notes) -> dict:
         notes.append(f"保留现有条件单 {ex['algoId']}（{ex['trigger_px']:g}），止损止盈不变")
     agg.update(stop_loss=info["stop_loss"], take_profit=info["take_profit"], plan_group="tm_pending_keep")
     return info
+
+
+TM_REPLACE_WORDS = ("重挂", "撤旧挂新", "重新挂单", "撤单重挂")
+TM_KEEP_WORDS = ("保留现有挂单", "保留原挂单", "保留原单", "保留旧单", "保留现有条件单", "保留该挂单")
+
+
+def tm_decides_existing(cfg) -> bool:
+    """2026-10-30 用户决定（manager.tm_decides_existing_pending，默认 true）：对现有同向同价位挂单，按交易经理的
+    existing_pending（保留/重挂）执行，保留时有效期按交易经理 entry_expire_hours 重算；false=旧行为（同价位一律保留原单原张数原到期）。"""
+    return bool(_mcfg(cfg).get("tm_decides_existing_pending", True))
+
+
+def tm_existing_pending_action(tm, notes) -> str:
+    """交易经理对现有同向挂单的处理：返回 "keep" 或 "replace"。
+    以结构化字段 existing_pending 为准；字段与理由文字矛盾时按字段执行并在 notes 标记矛盾；
+    字段留空（旧输出）时按理由文字：只写了重挂类词 → replace；两类词都有 → 有歧义，保持原单并标记；其余 → keep。"""
+    fld = getattr(tm, "existing_pending", None)
+    txt = " ".join(str(getattr(tm, k, "") or "") for k in ("rationale", "entry_reason", "invalidation"))
+    rep = [w for w in TM_REPLACE_WORDS if w in txt]
+    kp = [w for w in TM_KEEP_WORDS if w in txt]
+    if fld in ("keep", "replace"):
+        if (fld == "keep" and rep) or (fld == "replace" and kp and not rep):
+            notes.append(f"交易经理结构化字段 existing_pending={fld} 与理由文字（{'、'.join(rep or kp)}）矛盾，按结构化字段执行")
+        return fld
+    if rep and kp:
+        notes.append(f"交易经理理由同时写了重挂（{'、'.join(rep)}）与保留（{'、'.join(kp)}），有歧义，保持现有挂单不动")
+        return "keep"
+    if rep:
+        notes.append(f"交易经理未填 existing_pending，理由文字写明「{rep[0]}」，按重挂执行")
+        return "replace"
+    return "keep"
+
+
+def apply_tm_expiry(cfg, inst, algo_id, tm, notes) -> dict | None:
+    """保留现有挂单时，有效期按交易经理 entry_expire_hours，自原挂单时刻起算（只改登记表 expires，到期由 expiry 模块撤单）。
+    算出的到期已过 → 不改并写明。返回 {old, new} 或 None。"""
+    import datetime as _d
+    from desk import demo_exec as DX
+    h = getattr(tm, "entry_expire_hours", None) if tm is not None else None
+    if not h or not tm_decides_existing(cfg):
+        return None
+    m = (DX.reg().get("triggers") or {}).get(str(algo_id)) or {}
+    created, old = m.get("created"), m.get("expires")
+    if not created:
+        notes.append(f"条件单 {algo_id} 登记表缺挂单时刻，无法按交易经理有效期 {float(h):g} 小时重算，到期保持 {old}")
+        return None
+    fmt = "%Y-%m-%d %H:%M:%S%z"
+    new_dt = _d.datetime.strptime(created, fmt) + _d.timedelta(hours=float(h))
+    new = new_dt.strftime(fmt)
+    if new_dt <= settings.now():
+        notes.append(f"交易经理有效期 {float(h):g} 小时自挂单时刻 {created} 起算已过（{new}），到期保持 {old}，请人工确认")
+        return None
+    if old and abs((_d.datetime.strptime(old, fmt) - new_dt).total_seconds()) < 60:
+        return None
+    DX.set_trigger_expiry(inst, str(algo_id), new, f"交易经理有效期 {float(h):g} 小时")
+    notes.append(f"条件单 {algo_id} 有效期按交易经理 {float(h):g} 小时自挂单时刻起算：到期 {old} → {new}")
+    return {"old": old, "new": new}
+
+
+def tm_add_levels(cfg, tm, side, add_px, atr, notes):
+    """2026-10-30 用户决定（manager.tm_decides_add_levels，默认 true）：加仓腿止损止盈以交易经理为准。
+    交易经理给了同向条件单/现价单点位 → 返回 (stop, tp)（已按 tm_entry_plan 校验侧向与 stop_max_pct，违规项弃用并写明）；
+    没给或开关关闭 → None（回退角色加权）。RR≥min_rr 仍由 plan_sl_tp/finalize_sl_tp 保证（不足外推止盈并写明）。"""
+    if tm is None or not _mcfg(cfg).get("tm_decides_add_levels", True):
+        return None
+    if not any(hasattr(tm, k) for k in ("stop_loss", "entry_stop_loss")):
+        return None   # 无点位字段（旧格式/桩对象）→ 回退
+    try:
+        p = tm_entry_plan(cfg, tm, side, float(add_px), atr)
+    except AttributeError:
+        return None
+    if p["group"] == "tm_fallback_now" or (p["stop"] is None and p["tp"] is None):
+        for n in p["notes"]:
+            if "弃用" in n:
+                notes.append("加仓腿：" + n)
+        return None
+    for n in p["notes"]:
+        if "弃用" in n:
+            notes.append("加仓腿：" + n)
+    notes.append(f"加仓腿止损止盈以交易经理为准：止损 {p['stop'] if p['stop'] is None else format(float(p['stop']), 'g')}、"
+                 f"止盈 {p['tp'] if p['tp'] is None else format(float(p['tp']), 'g')}（未给的项用 ATR 基准，不按角色加权）")
+    return p["stop"], p["tp"]
 
 
 def _trigger_crossed(cond, trig, px) -> bool:
@@ -1201,8 +1374,12 @@ def _try_add(cfg, inst, did, agg, mk, bk, pos, st, w, tm, tm_state, source, rati
     now = agg["condition"] == "now"
     add_px = float(mk["last"]) if now else float(agg["entry_px"])
     rc = sizing.rcfg(cfg)
-    lv = sizing.wavg_levels(st, w, valid_voters(st), side, add_px)
-    plan = add_position.plan_sl_tp(rc, side, add_px, mk.get("atr14"), lv.get("stop"), lv.get("target"))
+    tml = tm_add_levels(cfg, tm, side, add_px, mk.get("atr14"), notes)
+    if tml is not None:
+        plan = add_position.plan_sl_tp(rc, side, add_px, mk.get("atr14"), tml[0], tml[1], src="交易经理")
+    else:
+        lv = sizing.wavg_levels(st, w, valid_voters(st), side, add_px)
+        plan = add_position.plan_sl_tp(rc, side, add_px, mk.get("atr14"), lv.get("stop"), lv.get("target"))
     if plan["stop"] is None:
         notes.append("加仓腿止损无效，不加仓"); notes += plan["notes"]
         return "hold", None, None, 0.0
@@ -1287,6 +1464,12 @@ def _pm_execute_demo_locked(cfg, coin, did, st, w, mk, bk, pos, rationale, sourc
     tm_pend = agg.get("plan_group") in ("tm_pending", "post_tp_tm_pending")
     same_ex = bool(tm_pend and ex and ex.get("side") == agg.get("side") and ex.get("trigger_px")
                    and sizing_same_px(cfg, ex["trigger_px"], agg.get("entry_px")))
+    ex_act = None
+    if same_ex and not pos:
+        ex_act = tm_existing_pending_action(tm, notes) if tm_decides_existing(cfg) else "keep"
+        if ex_act == "replace":
+            notes.append(f"交易经理决定重挂现有条件单 {ex['algoId']}：撤旧挂新，张数按风险定仓重算（risk_scale "
+                         f"{getattr(tm, 'risk_scale', None)}），有效期 {getattr(tm, 'entry_expire_hours', None)} 小时自现在起算")
     try:
         if pos and pos.get("legacy"):
             notes.append("该币是旧纸面仓（由旧仓盯盘管理止损/止盈/强平），本流程不操作、不加仓")
@@ -1329,9 +1512,12 @@ def _pm_execute_demo_locked(cfg, coin, did, st, w, mk, bk, pos, rationale, sourc
             action = "hold(止损冷却)"
             if cancel_ok:
                 DX.cancel_triggers(cfg, inst, "止损冷却")
-        elif same_ex:
+        elif same_ex and ex_act == "keep":
             # 改动 3：交易经理条件单与现有同向挂单同价位 → 保持原单（不重挂、不过漂移跳过），按 new 止损/止盈规则改点
-            pend = keep_same_trigger(cfg, inst, mk, agg, ex, tm, notes); action = "pending"
+            pend = keep_same_trigger(cfg, inst, mk, agg, ex, tm, notes, bk); action = "pending"
+            exp_chg = apply_tm_expiry(cfg, inst, pend.get("algoId") or ex["algoId"], tm, notes)
+            if exp_chg:
+                pend["expires_changed"] = exp_chg
         elif drift.skip(cfg, inst, did, mk, agg, notes, "open") and not _drift_exempt(cfg, inst, did, agg, notes, tm_pend):
             action = "hold(价格漂移)"   # 只跳过本次新开仓/挂条件单；旧条件单、持仓不动
         else:

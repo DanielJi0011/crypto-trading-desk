@@ -823,6 +823,16 @@ def det_id(*parts) -> str:
     return "ta" + hashlib.sha1("|".join(str(x) for x in parts).encode()).hexdigest()[:28]
 
 
+def set_trigger_expiry(inst, algo_id, expires: str, why: str) -> bool:
+    """改登记表里一张条件入场单的到期时刻（本地到期管理，交易所单不动；由 expiry 模块到期撤单）。"""
+    r = reg(); m = (r.get("triggers") or {}).get(str(algo_id))
+    if m is None:
+        return False
+    old = m.get("expires"); m["expires"] = expires; save_reg(r)
+    X.log_event("trigger_expiry_changed", inst_id=inst, algoId=str(algo_id), old=old, new=expires, why=why)
+    return True
+
+
 def cancel_trigger(inst, algo_id, why) -> str:
     """撤指定的一张条件入场单（调用方明确指定 algoId；不看 protected_algo_ids，由调用方决定是否允许）。
     返回撤单后在算法单历史里的状态（canceled / effective / ...）；同时从登记表移除。"""

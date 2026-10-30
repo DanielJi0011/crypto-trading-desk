@@ -20,6 +20,7 @@ import hmac
 import json
 import os
 import random
+import re
 import threading
 import time
 import traceback
@@ -403,13 +404,20 @@ def notify(ev: dict) -> bool:
 PLACED_SEEN = settings.STATE / "ledger" / "trigger_placed_notified.json"   # 独立文件：不受常驻 demo_ws 的 State.save 覆盖
 
 
-def session_label(source=None, session=None) -> str:
-    """来源场次中文：post_stop:* 止损后再讨论；post_tp:* 止盈后再讨论；否则按 settings.SESSION 早场/晚场。"""
+def session_label(source=None, session=None, decision_id=None) -> str:
+    """来源场次中文：post_stop:* 止损后再讨论；post_tp:* 止盈后再讨论；ops:* 人工运维；
+    否则按决策号场次（D-日期-E-* 晚场、D-日期-币 早场），决策号无法判断时才按 settings.SESSION。
+    （2026-10-31 修正：一次性运维脚本进程 SESSION 默认 morning，晚场决策号的挂单曾被误标为 8点早场。）"""
     src = str(source or "")
     if src.startswith("post_stop"):
         return "止损后再讨论"
     if src.startswith("post_tp"):
         return "止盈后再讨论"
+    did = str(decision_id or "")
+    tag = {"morning": "8点早场", "evening": "20:30晚场"}
+    if not session and re.match(r"^D-\d{8}-", did):
+        s = "evening" if re.match(r"^D-\d{8}-E-", did) else "morning"
+        return tag[s] + ("（人工运维重挂）" if src.startswith("ops") else "")
     s = session or getattr(settings, "SESSION", None)
     return {"morning": "8点早场", "evening": "20:30晚场"}.get(s, src or str(s or "未知"))
 
@@ -418,7 +426,7 @@ def placed_event(meta: dict, session=None) -> dict:
     inst = meta.get("inst_id") or meta.get("inst") or ""
     side = meta.get("side")
     cn = {"long": "做多", "short": "做空"}.get(side, str(side))
-    label = session_label(meta.get("source"), session)
+    label = session_label(meta.get("source"), session, meta.get("decision_id"))
     sz = meta.get("sz")
     tp = meta.get("take_profit")
     msg = (f"【挂单提醒】{inst.split('-')[0]} {cn} 入场条件单已挂出：触发价 {meta.get('trigger_px')}，{sz} 张，"
@@ -463,7 +471,7 @@ TM_NC_SEEN = settings.STATE / "ledger" / "tm_no_conclusion_notified.json"   # �
 
 def tm_no_conclusion_event(inst: str, reason, decision_id=None, source=None) -> dict:
     coin = (inst or "").split("-")[0]
-    label = session_label(source)
+    label = session_label(source, None, decision_id)
     msg = f"【交易经理无结论，不开仓】{coin}：{reason or '原因未知'}；决策 {decision_id}；来源 {label}"
     return {"kind": "tm_no_conclusion", "inst_id": inst, "decision_id": decision_id, "session": label, "message": msg}
 
