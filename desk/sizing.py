@@ -17,6 +17,13 @@ RISK_DEFAULTS = {"risk_per_trade_pct": 0.0075, "max_notional_per_trade_pct": 1.0
                  "max_open_risk_pct": 0.02, "max_net_directional_pct": 1.2, "cost_buffer_pct": 0.002, "plan_conflict_pct": 0.20,
                  "max_price_drift_atr": 0.5, "max_daily_bar_age_days": 2, "min_rr_after_adjust": 1.5}
 
+SIZING_DEFAULTS = {"no_entry_not_now_vote": True, "pending_action_field": True, "same_px_tol_pct": 0.05}
+
+
+def scfg(cfg) -> dict:
+    """sizing 段开关（2026-10-30 新增）：no_entry_not_now_vote（改动 1）、pending_action_field（改动 2）默认 true。"""
+    return {**SIZING_DEFAULTS, **((cfg or {}).get("sizing") or {})}
+
 
 def rcfg(cfg) -> dict:
     return {**RISK_DEFAULTS, **(cfg.get("risk") or {})}
@@ -122,19 +129,58 @@ def classify(side: str, cond: str | None, entry: float | None, last: float, band
     return "breakout" if (up if side == "long" else not up) else "pullback"
 
 
-def choose_plan(st: dict, w: dict, roles: list, side: str, last: float, band: float, conflict_pct: float = 0.20) -> dict:
-    """roles=同向角色。返回 {group, entry, condition, horizon, scores, conflict}。"""
+PENDING_ACTIONS = ("keep", "reprice", "cancel", "now")   # 立场行「对现有挂单」：保留/改价/撤销/改现价
+
+
+def same_px(a, b, tol_pct: float = 0.05) -> bool:
+    """两个价位视为同价（默认相差 ≤0.05%）。"""
+    try:
+        return abs(float(a) / float(b) - 1) * 100 <= tol_pct
+    except (TypeError, ValueError, ZeroDivisionError):
+        return False
+
+
+def choose_plan(st: dict, w: dict, roles: list, side: str, last: float, band: float, conflict_pct: float = 0.20,
+                no_entry_not_now: bool = False, existing: dict | None = None) -> dict:
+    """roles=同向角色。返回 {group, entry, condition, horizon, scores, conflict, ...}。
+
+    no_entry_not_now（sizing.no_entry_not_now_vote）：没写入场价、也没明确写现价的角色只算方向票，不进 now 组；
+      若所有同向角色都落到这一类（一个入场方案票都没有），回退旧行为：这些角色计入 now 组（现价入场）。
+    existing（stances.pending_keep_default 开启时由调用方传入的同向现有挂单 {trigger_px, condition}）：
+      没写入场价、也没写「对现有挂单」的角色按「保留」处理，以现有挂单触发价作隐含入场价参与分组；
+      pending_action=keep 以现有挂单为准；reprice 以其入场价为准；cancel 不投入场票；now 计入 now 组。
+      隐含入场价只用于分组，不写回立场（打分仍按原立场的方向/目标/止损）。"""
     groups: dict[str, list] = {"now": [], "breakout": [], "pullback": []}
+    eff: dict[str, float] = {}
+    dir_only, implied, cancelled = [], [], []
+    ex_px = float(existing["trigger_px"]) if existing and existing.get("trigger_px") else None
     for r in roles:
-        e = st[r].get("entry_px")
+        s = st[r]
+        pa = s.get("pending_action")
+        e, cond = s.get("entry_px"), s.get("entry_condition")
+        if pa == "now":
+            cond = "now"
+        elif pa == "cancel" and ex_px:
+            cancelled.append(r); continue
+        elif ex_px and cond != "now" and (pa == "keep" or (not e and pa is None)):
+            e, cond = ex_px, existing.get("condition"); implied.append(r)
         if e and not (0.5 * last < float(e) < 1.5 * last):   # 离谱价位剔除（沿用原规则）
             continue
-        g = classify(side, st[r].get("entry_condition"), e, last, band)
+        if not e and cond != "now" and no_entry_not_now:
+            dir_only.append(r); continue
+        g = classify(side, cond, e, last, band)
         groups[g].append(r)
+        if e:
+            eff[r] = float(e)
+    fallback = False
+    if no_entry_not_now and dir_only and not any(groups.values()):
+        groups["now"] = list(dir_only); dir_only = []; fallback = True   # 全部没写价：保持旧行为（现价入场）
     score = {g: sum(float(w[r]) * float(st[r].get("confidence") or 0) for r in rs) for g, rs in groups.items()}
     ranked = sorted(score.items(), key=lambda x: -x[1])
     top, sec = ranked[0], ranked[1]
-    out = {"scores": {k: round(v, 4) for k, v in score.items()}, "group": top[0], "conflict": False}
+    out = {"scores": {k: round(v, 4) for k, v in score.items()}, "group": top[0], "conflict": False,
+           "direction_only": dir_only, "implied_keep": implied, "cancel_votes": cancelled, "no_entry_fallback_now": fallback,
+           "members": {g: list(rs) for g, rs in groups.items()}}
     if top[1] <= 0:
         return {**out, "group": None}
     if sec[1] > 0 and (top[1] - sec[1]) / top[1] < conflict_pct:
@@ -144,7 +190,7 @@ def choose_plan(st: dict, w: dict, roles: list, side: str, last: float, band: fl
     if top[0] == "now":
         entry = last
     else:
-        entry = sum(float(w[r]) * float(st[r]["confidence"]) * float(st[r]["entry_px"]) for r in rs) / wsum
+        entry = sum(float(w[r]) * float(st[r]["confidence"]) * eff[r] for r in rs) / wsum
     hz = sum(float(w[r]) * float(st[r]["confidence"]) * float(st[r].get("horizon_days") or 0) for r in rs) / wsum
     cond = "now" if (top[0] == "now" or abs(entry / last - 1) <= band) else ("gte" if entry > last else "lte")
     return {**out, "entry": last if cond == "now" else entry, "condition": cond, "horizon": hz}
@@ -243,3 +289,35 @@ def size(rc: dict, *, equity: float, S: float, entry: float, stop: float, side: 
     if notional < max(min_order_usd, 1e-9):
         out.update(ok=False, reason="size_too_small")
     return out
+
+
+def pending_keep_sltp(side: str, trigger: float, old_sl, old_tp, new_sl, new_tp, now_px: float,
+                      min_rr: float = 1.5, gap_pct: float = 0.3) -> dict:
+    """保留同价位现有条件单时，按交易经理给的 new 止损/止盈改点（2026-10-30 用户规则，纯函数）：
+    只给一项另一项保持原值；止损只收紧（做空只下移、做多只上移）且须在触发价亏损一侧；
+    止盈须在触发价盈利一侧且距现价至少 gap_pct%；按触发价算 RR≥min_rr；违规的项保持原值并记原因。"""
+    sg = 1 if side == "long" else -1
+    sl, tp, why = old_sl, old_tp, []
+    if new_sl is not None and old_sl is not None and abs(float(new_sl) - float(old_sl)) > 1e-12:
+        if sg * (float(trigger) - float(new_sl)) <= 0:
+            why.append(f"新止损 {float(new_sl):g} 不在触发价亏损一侧，保持原止损 {float(old_sl):g}")
+        elif sg * (float(new_sl) - float(old_sl)) < 0:
+            why.append(f"新止损 {float(new_sl):g} 比原止损 {float(old_sl):g} 放宽（只允许收紧），保持原止损")
+        else:
+            sl = float(new_sl)
+    elif new_sl is not None and old_sl is None:
+        sl = float(new_sl)
+    if new_tp is not None and (old_tp is None or abs(float(new_tp) - float(old_tp)) > 1e-12):
+        if sg * (float(new_tp) - float(trigger)) <= 0:
+            why.append(f"新止盈 {float(new_tp):g} 不在触发价盈利一侧，保持原止盈 {old_tp}")
+        elif abs(float(new_tp) / float(now_px) - 1) * 100 < float(gap_pct):
+            why.append(f"新止盈 {float(new_tp):g} 距现价 {float(now_px):g} 不足 {float(gap_pct):g}%，保持原止盈 {old_tp}")
+        else:
+            tp = float(new_tp)
+    if (sl, tp) != (old_sl, old_tp) and sl is not None and tp is not None:
+        rr = rr_ratio(side, float(trigger), sl, tp)
+        if rr is None or rr + 1e-12 < float(min_rr):
+            why.append(f"调整后 RR={'无效' if rr is None else f'{rr:.2f}'} < {float(min_rr):g}，止损止盈都保持原值")
+            sl, tp = old_sl, old_tp
+    return {"stop_loss": sl, "take_profit": tp, "changed": (sl, tp) != (old_sl, old_tp), "reasons": why,
+            "rr": rr_ratio(side, float(trigger), sl, tp) if sl is not None and tp is not None else None}

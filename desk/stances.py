@@ -38,6 +38,9 @@ def _num(s):
 
 ENTRY_RE = re.compile(r"入场价\s*[=:：]\s*" + _NUM + r"(?:\s*[；;,，]\s*入场条件\s*[=:：]\s*(突破|回踩|涨到|跌到|现价))?", re.I)
 COND_MAP = {"突破": "gte", "涨到": "gte", "回踩": "lte", "跌到": "lte", "现价": "now"}
+# 2026-10-30：立场行可选字段「对现有挂单=保留/改价/撤销/改现价」→ pending_action（只影响入场方案分组，不影响打分）
+PEND_RE = re.compile(r"对现有挂单\s*[=:：]\s*(保留|改价|撤销|撤单|改现价|现价)")
+PEND_MAP = {"保留": "keep", "改价": "reprice", "撤销": "cancel", "撤单": "cancel", "改现价": "now", "现价": "now"}
 
 
 def parse_stance(text: str):
@@ -52,6 +55,9 @@ def parse_stance(text: str):
     if em:
         out["entry_px"] = _num(em.group(1))
         out["entry_condition"] = COND_MAP.get(em.group(2) or "", None)
+    pm = PEND_RE.search(line)
+    if pm:
+        out["pending_action"] = PEND_MAP[pm.group(1)]
     return out
 
 
@@ -106,6 +112,8 @@ class RoleStance(BaseModel):
     horizon_days: int = Field(default=5, description="观点周期（天）")
     entry_px: float | None = Field(default=None, description="建议的开仓触发价位（USDT），原文没写就省略")
     entry_condition: Literal["gte", "lte", "now"] | None = Field(default=None, description="gte=价格涨到≥该价时开仓，lte=跌到≤该价时开仓，now=现价开仓")
+    pending_action: Literal["keep", "reprice", "cancel", "now"] | None = Field(
+        default=None, description="对现有同向条件挂单的态度：keep=保留，reprice=改价（以 entry_px 为准），cancel=撤销，now=改现价；原文没提就省略")
     reason: str = Field(description="一句话中文理由（≤40字）")
 
 
@@ -140,13 +148,16 @@ def normalize(s: dict) -> dict:
     """B1：所有加权角色同一规则，动作（方向）标签为准。中性/平仓立场不是多空票，入场与价位字段失效，冲突记录在 field_conflict。"""
     if s.get("direction") not in ("neutral", "close"):
         return s
-    keys = [k for k in ("entry_px", "entry", "entry_condition", "target", "stop") if s.get(k) not in (None, "")]
+    keys = [k for k in ("entry_px", "entry", "entry_condition", "pending_action", "target", "stop") if s.get(k) not in (None, "")]
     if not keys:
         return s
     s = dict(s)
     prev = s.get("field_conflict")
     for k in keys:
         s[k] = None
+    keys = [k for k in keys if k != "pending_action"]
+    if not keys:
+        return s
     s["field_conflict"] = ((prev + "；") if prev else "") + f"方向={s['direction']}，字段 {','.join(keys)} 已忽略（以动作标签为准）"
     return s
 
@@ -167,7 +178,7 @@ def extract(fs: dict, cfg, tracker=None) -> dict:
         model = dllm.make_llm(cfg, "quick", tracker, role="extractor").with_structured_output(StanceList)
         body = "\n\n".join(f"### 角色键名={r}（{ROLE_CN[r]}）\n{texts[r][-6000:]}" for r in missing)
         prompt = ("下面是一个加密货币交易团队中各角色关于 " + fs.get("company_of_interest", "") + " 的发言。"
-                  "请逐个角色提取其观点（方向、目标价、止损价、置信度、周期、建议入场价与条件、一句话理由）。"
+                  "请逐个角色提取其观点（方向、目标价、止损价、置信度、周期、建议入场价与条件、对现有挂单的态度、一句话理由）。"
                   "只根据原文，不要推测；原文没写价位就省略该字段。只输出这些角色：" + ", ".join(missing) + "\n\n" + body)
         try:
             res = model.invoke(prompt)
@@ -175,7 +186,8 @@ def extract(fs: dict, cfg, tracker=None) -> dict:
                 if s.role in missing:
                     out[s.role] = {"direction": s.direction, "target": s.target, "stop": s.stop,
                                    "confidence": max(0.0, min(1.0, s.confidence)), "horizon_days": s.horizon_days,
-                                   "entry_px": s.entry_px, "entry_condition": s.entry_condition, "reason": s.reason, "source": "LLM抽取"}
+                                   "entry_px": s.entry_px, "entry_condition": s.entry_condition, "pending_action": s.pending_action,
+                                   "reason": s.reason, "source": "LLM抽取"}
         except Exception as e:  # 抽取失败不阻断
             for r in missing:
                 out[r] = {"direction": "neutral", "confidence": 0.0, "source": f"抽取失败:{type(e).__name__}"}

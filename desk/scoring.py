@@ -45,7 +45,8 @@ def record_stances(cfg, rec: dict):
             "session": rec.get("session", "morning"),
             "inst_id": rec["inst_id"], "role": r, "direction": s["direction"], "confidence": s.get("confidence"),
             "target": s.get("target"), "stop": s.get("stop"), "horizon_days": s.get("horizon_days"),
-            "entry_px": s.get("entry_px"), "entry_condition": s.get("entry_condition"), "source_path": rec.get("source", "daily"),
+            "entry_px": s.get("entry_px"), "entry_condition": s.get("entry_condition"), "pending_action": s.get("pending_action"),
+            "source_path": rec.get("source", "daily"),
             "ref_px": rec["price"], "regime": regime_of(rec["market"]["ret_20d"], cfg), "source": s.get("source")})
 
 
@@ -332,11 +333,13 @@ def scorecard(role: str, trades=None, stances_by_decision=None) -> dict:
     return card
 
 
-def weight_roles() -> dict:
-    """参与权重调整的角色及初始权重：ROLE_KEYS 去掉组合经理（只执行、不投票），加上交易经理（TM_INIT_WEIGHT）。"""
-    from desk.manager import TM_INIT_WEIGHT
+def weight_roles(cfg=None) -> dict:
+    """参与权重调整的角色及初始权重：ROLE_KEYS 去掉组合经理（只执行、不投票）。
+    manager.tm_no_vote_weight=true（方案一）时交易经理不投票、不参与权重学习（立场打分统计照常保留）；false=旧行为加上交易经理。"""
+    from desk.manager import TM_INIT_WEIGHT, tm_no_vote
     out = {r: INIT_WEIGHT[r] for r in ROLE_KEYS if r != "portfolio_manager"}
-    out["trade_manager"] = TM_INIT_WEIGHT
+    if not tm_no_vote(cfg if cfg is not None else settings.load_config()):
+        out["trade_manager"] = TM_INIT_WEIGHT
     return out
 
 
@@ -352,7 +355,7 @@ def daily_skill(role: str) -> list[float]:
 def update_weights(cfg) -> list[dict]:
     """L2 收缩权重：w = w0·clip(exp(k·Σskill/(n+n0)), lo, hi)。学习冻结时只写影子权重。"""
     L = cfg["learning"]
-    init = weight_roles()
+    init = weight_roles(cfg)   # 方案一：权重文件里旧的 trade_manager 条目在下次写入时自然去掉
     target = WEIGHTS if L.get("apply_weights", False) else WEIGHTS_SHADOW   # 学习冻结：只更新影子权重
     old = settings.read_json(target, dict(init))
     new, changes = {}, []

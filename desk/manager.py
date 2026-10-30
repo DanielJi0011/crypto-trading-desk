@@ -24,23 +24,51 @@ VOTERS = [r for r in ROLE_KEYS if r != "portfolio_manager"] + ["trade_manager"]
 TM_INIT_WEIGHT = 1.0
 
 
+def _mcfg(cfg) -> dict:
+    return (cfg or {}).get("manager") or {}
+
+
+def tm_no_vote(cfg) -> bool:
+    """2026-10-30 方案一（manager.tm_no_vote_weight，默认 true）：交易经理不再作为投票角色计入加权共识 S，
+    也不参与权重学习；方向由其余投票角色的加权共识决定，交易经理只能否决或定点位，不能翻转多空。false=旧行为。"""
+    return bool(_mcfg(cfg).get("tm_no_vote_weight", True))
+
+
+def tm_decides_entry(cfg) -> bool:
+    """2026-10-30 方案一（manager.tm_decides_entry，默认 true）：入场价/条件单点位/止损/止盈只由交易经理定，
+    各角色的 entry_px 与「对现有挂单」字段只作参考，不再参与入场分组评分。false=回到 choose_plan 分组。"""
+    return bool(_mcfg(cfg).get("tm_decides_entry", True))
+
+
+def tm_required_for_open(cfg) -> bool:
+    """manager.tm_required_for_open（默认 true，2026-10-30 用户决定）：最后由交易经理拍板（职能等同原项目组合经理）。
+    交易经理没有生成有效的同向开仓结论（缺席/调用失败/空输出/解析失败，或没给同向的现价单或完整条件单）→ 本次不开仓、不加仓，
+    不再回退到现价 + ATR+2R 基准开仓。false=旧行为（tm_entry_plan 回退为现价入场 + ATR+2R 基准）。"""
+    return bool(_mcfg(cfg).get("tm_required_for_open", True))
+
+
+def voters(cfg=None) -> list:
+    return [r for r in VOTERS if r != "trade_manager"] if tm_no_vote(cfg if cfg is not None else settings.load_config()) else list(VOTERS)
+
+
 def weights(cfg=None) -> dict:
     """决策用权重。learning.apply_weights=false（学习冻结）时一律用初始权重，学到的权重只在影子文件里。"""
     cfg = cfg if cfg is not None else settings.load_config()
     w = settings.read_json(WEIGHTS, {}) if (cfg.get("learning") or {}).get("apply_weights", False) else {}
     # 只给投票角色权重：组合经理只执行、不投票，不在权重里
     out = {r: float(w.get(r, INIT_WEIGHT[r])) for r in ROLE_KEYS if r != "portfolio_manager"}
-    out["trade_manager"] = float(w.get("trade_manager", TM_INIT_WEIGHT))
+    if not tm_no_vote(cfg):   # 方案一：交易经理不投票、不计权重（权重文件里旧的 trade_manager 记录忽略）
+        out["trade_manager"] = float(w.get("trade_manager", TM_INIT_WEIGHT))
     return out
 
 
-def valid_voters(st: dict) -> list:
-    """L3：有效投票角色（排除 failed/absent/data_missing）。"""
-    return [r for r in VOTERS if r in st and stance_status(st[r]) not in INVALID_STATUS]
+def valid_voters(st: dict, w: dict | None = None) -> list:
+    """L3：有效投票角色（排除 failed/absent/data_missing）。给了 w 时只算 w 里有权重的角色（方案一：交易经理不在 w 里 → 不计票）。"""
+    return [r for r in VOTERS if r in st and stance_status(st[r]) not in INVALID_STATUS and (w is None or r in w)]
 
 
 def consensus(st: dict, w: dict) -> float:
-    rs = valid_voters(st)
+    rs = valid_voters(st, w)
     num = sum(w[r] * DIR_NUM[st[r]["direction"]] * float(st[r].get("confidence") or 0) for r in rs)
     den = sum(w[r] for r in rs)
     return num / den if den else 0.0
@@ -157,9 +185,61 @@ def _reduce_fraction(tm, notes) -> float:
 
 TM_VETO_NOTE = "交易经理否决：不下现价单、不挂条件单"
 TM_ABSENT_NOTE = "交易经理缺席，不开新仓"
+TM_NO_CONCLUSION_NOTE = "交易经理无结论，不开仓"
 
 
-def aggregate(cfg, st: dict, w: dict, mk: dict) -> dict:
+def tm_entry_plan(cfg, tm, side: str, last: float, atr) -> dict:
+    """方案一（manager.tm_decides_entry）：入场方案只由交易经理定。返回 {group, entry, condition, stop, tp, horizon, notes}。
+    1) 交易经理 action=pending 且点位完整、方向与共识一致 → 按其触发价/条件/止损/止盈挂条件单（group=tm_pending）；
+    2) 交易经理 action=buy/short 且方向与共识一致 → 现价入场，止损止盈用交易经理给的（group=tm）；
+    3) 其他（交易经理缺席、没给完整点位、方向不一致）→ 回退：现价入场 + ATR+2R 基准止损止盈（group=tm_fallback_now），
+       不再用各角色 entry_px 分组，也不用各角色止损止盈加权；交易经理缺席/否决时上层本来就不开新仓。
+    交易经理给的止损若在错误一侧或距离超过 risk.stop_max_pct，弃用并回退 ATR 基准；止盈在错误一侧弃用。RR≥min_rr 由 finalize_sl_tp 保证。"""
+    from desk import sizing
+    rc = sizing.rcfg(cfg)
+    sg = 1 if side == "long" else -1
+    notes: list[str] = []
+    out = {"group": "tm_fallback_now", "entry": last, "condition": "now", "stop": None, "tp": None,
+           "horizon": float(getattr(tm, "horizon_days", None) or 5) if tm is not None else None, "notes": notes}
+    act = getattr(tm, "action", None)
+    if tm is not None and act == "pending" and pending_complete(tm) and ("long" if tm.entry_side == "long" else "short") == side:
+        out.update(group="tm_pending", entry=float(tm.entry_trigger_px), condition=tm.entry_condition,
+                   stop=tm.entry_stop_loss, tp=tm.entry_take_profit)
+        notes.append(f"入场方案以交易经理为准：挂条件单 {'≥' if tm.entry_condition == 'gte' else '≤'} {float(tm.entry_trigger_px):g}")
+    elif tm is not None and act in ("buy", "short") and ("long" if act == "buy" else "short") == side:
+        out.update(group="tm", stop=tm.stop_loss, tp=tm.take_profit)
+        notes.append("入场方案以交易经理为准：现价入场")
+    else:
+        notes.append("交易经理未给出与共识同向的完整入场点位：回退为现价入场，止损止盈按 ATR+2R 基准（不用各角色入场价）")
+        return out
+    e = float(out["entry"])
+    try:
+        stp = float(out["stop"]) if out["stop"] not in (None, "") else None
+    except (TypeError, ValueError):
+        stp = None
+    if stp is not None and (sg * (e - stp) <= 0 or abs(e - stp) / e > float(rc["stop_max_pct"]) + 1e-12):
+        notes.append(f"交易经理止损 {stp:g} 在错误一侧或距离超过上限 {float(rc['stop_max_pct']):.1%}，弃用，改用 ATR 基准止损")
+        stp = None
+    try:
+        tpv = float(out["tp"]) if out["tp"] not in (None, "") else None
+    except (TypeError, ValueError):
+        tpv = None
+    if tpv is not None and sg * (tpv - e) <= 0:
+        notes.append(f"交易经理止盈 {tpv:g} 不在盈利一侧，弃用，改用 ATR 基准止盈")
+        tpv = None
+    out.update(stop=stp, tp=tpv)
+    return out
+
+
+def _agg(cfg, st, w, mk, ex, tm):
+    """开关关闭时保持旧调用签名（不传 tm）。"""
+    kw = {"existing": ex} if ex else {}
+    if tm_decides_entry(cfg):
+        kw["tm"] = tm
+    return aggregate(cfg, st, w, mk, **kw)
+
+
+def aggregate(cfg, st: dict, w: dict, mk: dict, existing: dict | None = None, tm=None) -> dict:
     """按角色权重×置信度聚合：方向（共识 S）、仓位、入场价位与条件、止损、止盈、周期。"""
     M, P = cfg["manager"], cfg.get("pending", {})
     st = {r: _norm_stance(s) for r, s in st.items()}   # B1：中性/平仓立场的价位字段不参与聚合
@@ -169,10 +249,10 @@ def aggregate(cfg, st: dict, w: dict, mk: dict) -> dict:
     side = "long" if S > th else ("short" if S < -th else None)
     want = "bullish" if side != "short" else "bearish"
     sg = 1 if side != "short" else -1
-    nv, need = len(valid_voters(st)), int(M.get("min_valid_voters", 0) or 0)
+    nv, need = len(valid_voters(st, w)), int(M.get("min_valid_voters", 0) or 0)
     if need and nv < need:   # L3：有效票不足 → 不交易
         side = None
-    bulls = [r for r in valid_voters(st) if st[r]["direction"] == want and (st[r].get("confidence") or 0) > 0]
+    bulls = [r for r in valid_voters(st, w) if st[r]["direction"] == want and (st[r].get("confidence") or 0) > 0]
 
     def wavg(vals):
         vals = [(w[r] * float(st[r]["confidence"]), v) for r, v in vals if v]
@@ -182,7 +262,27 @@ def aggregate(cfg, st: dict, w: dict, mk: dict) -> dict:
     from desk import sizing
     rc = sizing.rcfg(cfg)
     notes = []
-    plan = sizing.choose_plan(st, w, bulls, side or "long", last, band, float(rc["plan_conflict_pct"])) if bulls else {"group": None, "conflict": False, "scores": {}}
+    sc = sizing.scfg(cfg)
+    # 改动 2：同向现有挂单（无持仓路径由调用方传入），没写入场价的同向角色默认「保留」
+    ex = existing if (sc["pending_action_field"] and existing and side and existing.get("side") == side
+                      and existing.get("trigger_px")) else None
+    tmp = None
+    if tm_decides_entry(cfg):
+        # 方案一：入场方案只由交易经理定；各角色 entry_px / 对现有挂单字段只作参考，不参与分组评分
+        ex = None
+        tmp = tm_entry_plan(cfg, tm, side or "long", last, mk.get("atr14")) if bulls else None
+        plan = ({"group": tmp["group"], "conflict": False, "scores": None, "entry": tmp["entry"], "condition": tmp["condition"],
+                 "horizon": tmp["horizon"]} if tmp else {"group": None, "conflict": False, "scores": {}})
+        if tmp and side:
+            if tmp["group"] == "tm_fallback_now" and tm_required_for_open(cfg):
+                # 交易经理拍板：没有同向有效入场结论 → 不开仓、不加仓（不回退现价 + ATR+2R 基准）
+                notes.append("交易经理无同向有效入场结论（未给同向现价单或完整条件单），不开仓（manager.tm_required_for_open）")
+                plan = {"group": None, "conflict": False, "scores": {}, "tm_no_conclusion": True}
+            else:
+                notes.extend(tmp["notes"])
+    else:
+        plan = sizing.choose_plan(st, w, bulls, side or "long", last, band, float(rc["plan_conflict_pct"]),
+                                  no_entry_not_now=bool(sc["no_entry_not_now_vote"]), existing=ex) if bulls else {"group": None, "conflict": False, "scores": {}}
     conflict = bool(side and plan["conflict"])
     entry, cond = (plan.get("entry") or last), plan.get("condition") or "now"
     atr = mk.get("atr14")
@@ -191,11 +291,17 @@ def aggregate(cfg, st: dict, w: dict, mk: dict) -> dict:
     if atr:   # R2：先 ATR+2R 基准，再同向角色 stop/target 加权调整，最后 RR≥min_rr
         base_stop, base_tp, _d = sizing.stop_take(side or "long", entry, float(atr), rc)
         levels_meta["baseline_stop"], levels_meta["baseline_tp"] = base_stop, base_tp
-        lv = sizing.wavg_levels(st, w, bulls, side or "long", entry) if bulls else {"stop": None, "target": None}
+        if tmp is not None:   # 方案一：止损止盈只取交易经理给的（已校验侧向/距离），没给的用 ATR 基准，不再按角色加权
+            lv = {"stop": tmp["stop"], "target": tmp["tp"]}
+        else:
+            lv = sizing.wavg_levels(st, w, bulls, side or "long", entry) if bulls else {"stop": None, "target": None}
         fin = sizing.finalize_sl_tp(side or "long", entry, base_stop, base_tp, lv.get("stop"), lv.get("target"), min_rr)
         stop, tp = fin["stop"], fin["take_profit"]
         levels_meta.update(rr=fin["rr"], adjusted=fin["adjusted"])
         notes.extend(fin["notes"])
+    elif tmp is not None:   # 无 ATR + 方案一：只用交易经理的点位
+        stop, tp = tmp["stop"], tmp["tp"]
+        levels_meta["rr"] = sizing.rr_ratio(side or "long", entry, stop, tp) if stop and tp else None
     else:     # 无 ATR（仅旧测试/纸面路径）：沿用角色加权
         stop = wavg([(r, float(st[r]["stop"])) for r in bulls if st[r].get("stop") and sg * (entry - float(st[r]["stop"])) > 0])
         tp = wavg([(r, float(st[r]["target"])) for r in bulls if st[r].get("target") and sg * (float(st[r]["target"]) - entry) > 0])
@@ -215,7 +321,12 @@ def aggregate(cfg, st: dict, w: dict, mk: dict) -> dict:
     return {"S": round(S, 4), "buy": buy, "side": side, "entry_px": entry, "condition": cond, "stop_loss": stop, "take_profit": tp,
             "size_pct": round(size, 3), "horizon_days": int(min(max(round(hz or 5), 1), 30)), "notes": notes,
             "contributors": {r: st[r].get("entry_px") for r in bulls},
+            "tm_no_conclusion": plan.get("tm_no_conclusion") or None,
             "plan_group": plan.get("group"), "plan_scores": plan.get("scores"), "plan_conflict": conflict, "valid_voters": nv,
+            "plan_members": plan.get("members"), "plan_direction_only": plan.get("direction_only") or None,
+            "plan_implied_keep": plan.get("implied_keep") or None, "plan_cancel_votes": plan.get("cancel_votes") or None,
+            "plan_no_entry_fallback_now": plan.get("no_entry_fallback_now") or None,
+            "existing_trigger_px": (ex or {}).get("trigger_px"), "entry_by_tm": tmp is not None,
             "rr": levels_meta.get("rr"), "levels_adjusted": levels_meta.get("adjusted"),
             "baseline_stop": levels_meta.get("baseline_stop"), "baseline_tp": levels_meta.get("baseline_tp")}
 
@@ -258,9 +369,17 @@ def _prompt(cfg, coin, mk, pos, bk, st, w, S, texts, preview=None):
                   "最终是否加仓仍由你决定，你的否决权不变（hold/risk_scale=0）。"]
     from desk import analysis as _an
     lines += ["", _an.pending_brief(bk)]
-    lines += ["", f"## 各角色观点（权重为历史表现给出；加权共识 S={S:+.3f}，范围 -1~+1）",
-              f"口径说明：这里的 S={S:+.3f} 是【不含你本人投票】的其余角色加权共识。你的结构化决定会作为一票（权重 {w.get('trade_manager', 1):g}）计入，"
-              "代码最终共识（决策记录 consensus）因此会与此值不同，这是已知口径差异。理由中引用共识时请写明\"不含交易经理的 S\"。"]
+    if tm_no_vote(cfg):
+        lines += ["", f"## 各角色观点（权重为历史表现给出；加权共识 S={S:+.3f}，范围 -1~+1）",
+                  f"你的角色：你不投票，权重不计。S={S:+.3f} 是全部投票角色（不含你）按权重×置信度汇总的加权共识，也就是代码最终使用的共识，"
+                  "方向（做多/做空/不交易）由它决定。你是最终定点位的人：综合下面所有角色意见和行情账户数据拟定这一单，"
+                  "决定做不做（不做请 action=hold 或 risk_scale=0，即否决）、入场价或条件单触发价、止损、止盈，以及 risk_scale（0~1，只降不升）。"
+                  "你不能翻转多空：与共识方向相反的开仓或挂单会被视为否决。各角色给的入场价只作参考，入场方案以你给出的为准；"
+                  "你没给完整点位时，代码按现价入场并用 ATR+2R 基准止损止盈。这一单的盈亏记在你名下。"]
+    else:
+        lines += ["", f"## 各角色观点（权重为历史表现给出；加权共识 S={S:+.3f}，范围 -1~+1）",
+                  f"口径说明：这里的 S={S:+.3f} 是【不含你本人投票】的其余角色加权共识。你的结构化决定会作为一票（权重 {w.get('trade_manager', 1):g}）计入，"
+                  "代码最终共识（决策记录 consensus）因此会与此值不同，这是已知口径差异。理由中引用共识时请写明\"不含交易经理的 S\"。"]
     for r in ROLE_KEYS:
         s = st[r]
         wl = "只执行不投票" if r not in w else f"权重 {w[r]:.2f}"
@@ -274,9 +393,13 @@ def _prompt(cfg, coin, mk, pos, bk, st, w, S, texts, preview=None):
               "（做多突破/做空反弹到阻力），lte=跌到≤触发价时开仓（做多回踩/做空跌破支撑）；",
               "- entry_stop_loss：成交后的止损价（做多低于触发价、做空高于触发价，距离≤硬性止损上限）；entry_take_profit：止盈价（可省略）；",
               "- entry_size_pct：保证金（%权益）；leverage：杠杆；entry_expire_hours：有效期（小时，过期自动撤销）；entry_reason：为什么选这个价位。",
-              "条件单直接挂在 OKX 模拟盘，由交易所按最新价触发。注意：你只是投票角色之一，最终方向、仓位、入场价与止损由各角色"
-              "按历史权重加权聚合决定，投资组合经理只负责执行（过护栏后在 OKX 模拟盘下市价单或挂 trigger 条件单，均附止损止盈）。"
-              "仓位由代码按风险定仓（单笔止损亏损上限×共识强度×回撤缩放），size_pct 已废弃不再影响下单；你可以用 risk_scale（0~1，只降不升，0=否决）表达把握程度；"
+              "条件单直接挂在 OKX 模拟盘，由交易所按最新价触发。"
+              + ("注意：方向由全部投票角色的加权共识决定，入场价、条件单点位、止损、止盈由你定（过代码护栏：止损只收紧、RR≥1.5、止损距离上限、价格漂移检查）；"
+                 "投资组合经理只负责执行（过护栏后在 OKX 模拟盘下市价单或挂 trigger 条件单，均附止损止盈）。"
+                 if tm_no_vote(cfg) else
+                 "注意：你只是投票角色之一，最终方向、仓位、入场价与止损由各角色"
+                 "按历史权重加权聚合决定，投资组合经理只负责执行（过护栏后在 OKX 模拟盘下市价单或挂 trigger 条件单，均附止损止盈）。")
+              + "仓位由代码按风险定仓（单笔止损亏损上限×共识强度×回撤缩放），size_pct 已废弃不再影响下单；你可以用 risk_scale（0~1，只降不升，0=否决）表达把握程度；"
               "leverage 只作上限。" + ("已有持仓时：同向加仓用 buy/short（现价）或 pending（条件加仓，entry_side 须与持仓同向），"
                                     "加仓腿按加仓入场价独立挂止盈止损（原仓止盈止损不动）；不同意加仓请 action=hold 并在理由中写明（共识太弱或预算已满等）。"
                                     if add_position.enabled(cfg) else "已有持仓时不要填写条件入场。"),
@@ -292,6 +415,44 @@ def _prompt(cfg, coin, mk, pos, bk, st, w, S, texts, preview=None):
     return "\n".join(lines)
 
 
+def tm_attribution(cfg) -> bool:
+    """ledger.tm_attribution（默认 true）：决策记录写 decided_by/decision_type，平仓写交易经理账本，日报列交易经理战绩。"""
+    return bool(((cfg or {}).get("ledger") or {}).get("tm_attribution", True))
+
+
+DTYPE = {"buy": "开仓", "short": "开仓", "add_long": "加仓", "add_short": "加仓", "pending_add": "加仓", "pending": "挂条件单",
+         "sell": "平仓", "reduce": "减仓"}
+
+
+def decision_type(action, dec, pos, absent=False) -> str:
+    """这一单的类型：开仓、加仓、持有、平仓、减仓、改点位、挂条件单（pending_add 记为加仓）。"""
+    a = str(action)
+    if a in DTYPE:
+        return DTYPE[a]
+    if pos and not absent and (getattr(dec, "new_stop", None) is not None or getattr(dec, "new_tp", None) is not None):
+        return "改点位"
+    return "持有"
+
+
+def tm_direction_gate(cfg, S, dec, status, absent, mk, pos) -> dict:
+    """方案一（manager.tm_no_vote_weight）：方向由投票角色共识定，交易经理不能翻转多空。
+    交易经理 go 但开仓/挂单方向与共识方向相反 → 改为否决（不下单）。同时标记「交易经理否决共识」：
+    共识有方向（|S|>阈值）而交易经理否决（含翻转被拦）。开关关闭时只记标记，不改状态。"""
+    th = float(_mcfg(cfg).get("consensus_threshold", 0.1))
+    side = "long" if S > th else ("short" if S < -th else None)
+    out = {"status": status, "consensus_side": side, "vetoed_consensus": False, "flip_blocked": False, "note": None}
+    if absent:
+        return out
+    if tm_no_vote(cfg) and status == "go" and side:
+        d = tm_stance(dec, mk, pos)["direction"]
+        if d in ("bullish", "bearish") and d != ("bullish" if side == "long" else "bearish"):
+            out.update(status="veto", flip_blocked=True,
+                       note=f"交易经理方向（{'多' if d == 'bullish' else '空'}）与共识方向（{'多' if side == 'long' else '空'}，S={S:+.3f}）相反："
+                            "交易经理不能翻转多空，按否决处理（不下单）")
+    out["vetoed_consensus"] = bool(side and out["status"] == "veto")
+    return out
+
+
 def decide_and_execute(cfg, coin, trade_date, fs, st, tracker, source="daily") -> dict:
     inst = coin["inst_id"]
     mk = market_ctx(inst)
@@ -303,7 +464,7 @@ def decide_and_execute(cfg, coin, trade_date, fs, st, tracker, source="daily") -
     bk = demo_exec.book(cfg, prices) if demo_exec.is_demo(cfg) else ledger.book(cfg, prices)
     pos = next((p for p in bk["positions"] if p["inst_id"] == inst), None)
     w = weights(cfg)
-    S = consensus(st, w)          # 交易经理提示词里展示的是不含交易经理本人的共识
+    S = consensus(st, w)          # 交易经理提示词里展示的是不含交易经理本人的共识（方案一下即最终共识）
     texts = role_texts(fs)
     from desk import sessions
     pre = sessions.did_prefix(trade_date, settings.SESSION)   # 早场 D-<日期>-<币>，晚场 D-<日期>-E-<币>
@@ -325,11 +486,18 @@ def decide_and_execute(cfg, coin, trade_date, fs, st, tracker, source="daily") -
                                   "trade_manager")
         dec = model.invoke(_prompt(cfg, coin, mk, pos, bk, st, w, S, texts, preview))
         if isinstance(dec, dict):
-            dec = ManagerDecision(**dec)
-        absent = False
+            dec = ManagerDecision(**dec) if dec else None
+        absent, absent_why = False, None
+        if not isinstance(dec, ManagerDecision):
+            # 空输出（None/空字典/非结构化结果）：视为交易经理无结论
+            absent, absent_why = True, "交易经理输出为空"
+            dec = ManagerDecision(action="hold", confidence=0.0, rationale=f"{absent_why}：{TM_NO_CONCLUSION_NOTE}")
     except Exception as e:
         # 调用失败：不再用默认中性 0.5 票计入共识，这一票直接不计；保守处理，本次不开新仓（不算否决）
-        dec = ManagerDecision(action="hold", confidence=0.0, rationale=f"交易经理调用失败（{type(e).__name__}）：{TM_ABSENT_NOTE}")
+        n = type(e).__name__
+        absent_why = (f"交易经理输出解析失败（{n}）" if any(k in n for k in ("Pars", "Validation", "JSON", "Output"))
+                      else f"交易经理调用失败（{n}）")
+        dec = ManagerDecision(action="hold", confidence=0.0, rationale=f"{absent_why}：{TM_ABSENT_NOTE}")
         absent = True
     finally:
         dllm.STAGE.reset(tok)
@@ -338,9 +506,15 @@ def decide_and_execute(cfg, coin, trade_date, fs, st, tracker, source="daily") -
     status = "absent" if absent else tm_status(dec, pos, mk)
     if not absent:
         st["trade_manager"] = tm_stance(dec, mk, pos)
+    gate = tm_direction_gate(cfg, S, dec, status, absent, mk, pos)
+    status = gate["status"]
     res = pm_execute(cfg, coin, did, st, w, mk, bk, pos, dec.rationale, source=source, tm=None if absent else dec,
                      tm_state=status)
     action, size, notes, execd, agg = res["action"], res["size_pct"], res["notes"], res["execution"], res["aggregate"]
+    if gate.get("note"):
+        notes.insert(0, gate["note"])
+    if absent and tm_required_for_open(cfg):
+        notes.insert(0, f"{TM_NO_CONCLUSION_NOTE}（{absent_why}）")
     S_pre_tm = S   # 交易经理提示里看到的口径（不含其本人投票）
     S = agg["S"]
     apply_position_sl_tp(cfg, pos, st, w, mk, dec, action, execd, notes, tm_absent=absent)
@@ -349,14 +523,25 @@ def decide_and_execute(cfg, coin, trade_date, fs, st, tracker, source="daily") -
            "price": mk["last"], "market": mk, "consensus": round(S, 4), "consensus_pre_tm": round(S_pre_tm, 4), "weights": w,
            "ta_signal": fs.get("_signal"), "manager": dec.model_dump(), "final_action": action, "size_pct": size,
            "notes": notes, "execution": execd, "stances": st, "aggregate": agg, "source": source,
-           "pending": res.get("pending"), "tm_status": status,
+           "pending": res.get("pending"), "tm_status": status, "tm_absent_reason": absent_why if absent else None,
            "analysis_px": (ap or {}).get("px"), "analysis_px_time": (ap or {}).get("time"),
            "drift_check": agg.get("drift_check"), "drift_skipped": agg.get("drift_skipped"), "add_preview": preview,
            "tm_label_mismatch": None if absent else tm_label_mismatch(dec.model_dump()),
            "field_missing": None if absent else (tm_field_issues(dec.model_dump())["missing"] or None),
            "stance_field_conflicts": {r: s["field_conflict"] for r, s in st.items() if s.get("field_conflict")} or None,
+           "consensus_side": gate.get("consensus_side"), "tm_vetoed_consensus": gate.get("vetoed_consensus"),
+           "tm_flip_blocked": gate.get("flip_blocked") or None,
            "config_hash": settings.config_hash(cfg), "playbook_versions": roles.versions()}   # L1 追溯
+    if tm_attribution(cfg):   # 方案一 B：每一单的盈亏挂到交易经理名下
+        rec["decided_by"] = "trade_manager"
+        rec["decision_type"] = decision_type(action, dec, pos, absent)
     settings.append_jsonl(DECISIONS, rec)
+    if absent:   # 交易经理无结论：独立即时提醒（按决策号去重，同一币同一次讨论一次）
+        try:
+            from desk.demo_ws import notify_tm_no_conclusion
+            notify_tm_no_conclusion(inst, absent_why, did, source)
+        except Exception:
+            pass
     return rec
 
 
@@ -564,7 +749,7 @@ def pm_execute(cfg, coin, did, st, w, mk, bk, pos, rationale, source="daily", tm
     if demo_exec.is_demo(cfg):
         return pm_execute_demo(cfg, coin, did, st, w, mk, bk, pos, rationale, source, tm, tm_state)
     inst = coin["inst_id"]
-    agg = aggregate(cfg, st, w, mk)
+    agg = _agg(cfg, st, w, mk, None, tm)
     notes, execd, pend = list(agg["notes"]), None, None
     action, size = "hold", 0.0
     if pos:
@@ -623,7 +808,7 @@ def pm_execute(cfg, coin, did, st, w, mk, bk, pos, rationale, source="daily", tm
                 "reason": ((tm.entry_reason if tm is not None else "") or rationale or "")[:200],
                 "role_levels": {r: {"entry_px": st[r].get("entry_px"), "condition": st[r].get("entry_condition"),
                                     "stop": st[r].get("stop"), "weight": w[r], "confidence": st[r].get("confidence")}
-                                for r in VOTERS if r in st}})
+                                for r in VOTERS if r in st and r in w}})
             action = "pending"
             notes.append(f"挂{'多' if side == 'long' else '空'}单 {lev:g}x：{'≥' if agg['condition'] == 'gte' else '≤'} {agg['entry_px']:.6g}，止损 {sl:.6g}，"
                          f"仓位 {size:.1f}%，{float(exp):.0f} 小时有效")
@@ -680,7 +865,27 @@ def pm_execute_demo(cfg, coin, did, st, w, mk, bk, pos, rationale, source="daily
         from desk import okx_demo
         okx_demo.log_event("exec_error", inst_id=inst, decision_id=did, error=f"{type(e).__name__}: {e}"[:300])
         return {"action": "hold(执行失败)", "size_pct": 0.0, "notes": [f"模拟盘执行失败：{type(e).__name__}: {e}"], "execution": None,
-                "aggregate": aggregate(cfg, st, w, mk), "pending": None}
+                "aggregate": _agg(cfg, st, w, mk, None, tm), "pending": None}
+
+
+def sizing_same_px(cfg, a, b) -> bool:
+    from desk import sizing
+    return sizing.same_px(a, b, float(sizing.scfg(cfg)["same_px_tol_pct"]))
+
+
+def _drift_exempt(cfg, inst, did, agg, notes, tm_pend) -> bool:
+    """manager.tm_pending_drift_exempt（默认 true）：交易经理条件单（触发价是绝对价位）不因 1% 漂移被跳过，
+    除非现价已越过触发价（会立即触发，等同现价开仓）。现价单、加仓与聚合出的非交易经理条件单仍按漂移检查跳过。"""
+    if not tm_pend or not (cfg.get("manager") or {}).get("tm_pending_drift_exempt", True):
+        return False
+    d = agg.get("drift_skipped") or {}
+    if _trigger_crossed(agg.get("condition"), float(agg["entry_px"]), float(d.get("now_px") or 0)):
+        return False
+    agg["drift_exempted"] = agg.pop("drift_skipped", None)
+    from desk import okx_demo
+    okx_demo.log_event("drift_exempt_tm_trigger", inst_id=inst, decision_id=did, **(agg["drift_exempted"] or {}))
+    notes.append("交易经理条件单触发价为绝对价位、现价未越过触发价：不因价格漂移跳过，按条件单原流程挂单")
+    return True
 
 
 def _cooldown(cfg, inst, agg, did, notes) -> bool:
@@ -725,6 +930,63 @@ def post_tp_override(source, tm, tm_state, agg, notes) -> bool:
         return False
     notes.append("止盈后再讨论：交易经理未投现价开仓且未给完整条件单点位 → 观望不下单")
     return True
+
+
+def tm_pending_override(cfg, source, tm, tm_state, agg, notes) -> bool:
+    """改动 3（manager.tm_pending_override，默认 true）：把止盈后再讨论的规则推广到早晚场与止损后再讨论。
+    止盈后再讨论仍走 post_tp_override 原规则。其余来源：交易经理 go 且 action=pending、点位完整、方向与聚合方向一致、
+    聚合结果允许入场（buy）时，不管聚合选的是现价还是别的价位，一律改按交易经理的触发价、条件、止损、止盈挂条件单，返回 False。
+    方向相反或聚合不入场时不改（沿用原流程）。返回值语义同 post_tp_override（True=观望不下单，这里恒为 False）。"""
+    if str(source).startswith("post_tp"):
+        return post_tp_override(source, tm, tm_state, agg, notes)
+    if not (cfg.get("manager") or {}).get("tm_pending_override", True):
+        return False
+    if tm is None or tm_state != "go" or tm.action != "pending" or not pending_complete(tm) or not agg.get("buy"):
+        return False
+    side = "long" if tm.entry_side == "long" else "short"
+    if side != agg.get("side"):
+        notes.append("交易经理条件单方向与共识相反：不改挂交易经理条件单，按聚合结果执行")
+        return False
+    before = (agg.get("condition"), agg.get("entry_px"))
+    agg.update({"entry_px": float(tm.entry_trigger_px), "condition": tm.entry_condition, "stop_loss": float(tm.entry_stop_loss),
+                "take_profit": float(tm.entry_take_profit) if tm.entry_take_profit else None, "plan_group": "tm_pending",
+                "plan_before_tm": {"condition": before[0], "entry_px": before[1]}})
+    lab = "止损后再讨论" if str(source).startswith("post_stop") else "早晚场"
+    notes.append(f"{lab}：交易经理投挂条件单且点位完整 → 不追现价，改按交易经理点位挂条件单"
+                 f"（{'≥' if tm.entry_condition == 'gte' else '≤'} {float(tm.entry_trigger_px):g}，止损 {float(tm.entry_stop_loss):g}，"
+                 f"止盈 {tm.entry_take_profit if tm.entry_take_profit else '无'}；聚合原方案 "
+                 f"{'现价' if before[0] == 'now' else before[0]} {before[1] if before[1] is None else f'{float(before[1]):g}'}）")
+    return False
+
+
+def keep_same_trigger(cfg, inst, mk, agg, ex, tm, notes) -> dict:
+    """交易经理条件单与现有同向挂单同价位：保留原单不重挂，只按 new 止损/止盈规则改点（sizing.pending_keep_sltp）。"""
+    from desk import demo_exec as DX, sizing
+    rc, M = sizing.rcfg(cfg), cfg.get("manager") or {}
+    r = sizing.pending_keep_sltp(ex["side"], ex["trigger_px"], ex.get("stop_loss"), ex.get("take_profit"),
+                                 float(tm.entry_stop_loss) if tm.entry_stop_loss else None,
+                                 float(tm.entry_take_profit) if tm.entry_take_profit else None,
+                                 float(mk["last"]), float(rc.get("min_rr_after_adjust", 1.5)), float(M.get("tp_min_gap_pct", 0.3)))
+    for x in r["reasons"]:
+        notes.append("保留现有条件单改点：" + x)
+    info = {"kept": ex["algoId"], "trigger_px": ex["trigger_px"], "side": ex["side"], "old_sl": ex.get("stop_loss"),
+            "old_tp": ex.get("take_profit"), "stop_loss": r["stop_loss"], "take_profit": r["take_profit"], "rr": r["rr"],
+            "reasons": r["reasons"]}
+    if r["changed"]:
+        res = DX.amend_trigger_sltp(cfg, inst, ex, r["stop_loss"] if r["stop_loss"] != ex.get("stop_loss") else None,
+                                    r["take_profit"] if r["take_profit"] != ex.get("take_profit") else None)
+        info.update(amend=res, algoId=res.get("algoId"))
+        notes.append(f"保留现有条件单 {ex['algoId']}（{ex['trigger_px']:g}），止损 {ex.get('stop_loss')}→{r['stop_loss']}，"
+                     f"止盈 {ex.get('take_profit')}→{r['take_profit']}（{ {'amend': '原单修改', 'replace': '重挂替换', 'failed': '修改失败，保持原值'}.get(res['how'], res['how']) }）")
+    else:
+        info["algoId"] = ex["algoId"]
+        notes.append(f"保留现有条件单 {ex['algoId']}（{ex['trigger_px']:g}），止损止盈不变")
+    agg.update(stop_loss=info["stop_loss"], take_profit=info["take_profit"], plan_group="tm_pending_keep")
+    return info
+
+
+def _trigger_crossed(cond, trig, px) -> bool:
+    return (px >= trig) if cond == "gte" else (px <= trig) if cond == "lte" else True
 
 
 def pre_trade_gate(cfg, inst, mk) -> str | None:
@@ -957,11 +1219,18 @@ def _pm_execute_demo_locked(cfg, coin, did, st, w, mk, bk, pos, rationale, sourc
     或 OKX trigger 条件单（均附带止损止盈）。不写本地纸面账本 / 本地 pending。任何模拟盘错误只记入 notes 与 demo_events。"""
     from desk import demo_exec as DX
     inst = coin["inst_id"]
-    agg = aggregate(cfg, st, w, mk)
+    try:
+        ex = None if pos else DX.existing_trigger(bk, inst)
+    except Exception:
+        ex = None
+    agg = _agg(cfg, st, w, mk, ex, tm)
     notes, execd, pend = list(agg["notes"]), None, None
     action, size = "hold", 0.0
     cancel_ok = DX.ecfg(cfg)["cancel_pending_on_new_decision"]
-    tp_hold = post_tp_override(source, tm, tm_state, agg, notes)
+    tp_hold = tm_pending_override(cfg, source, tm, tm_state, agg, notes)
+    tm_pend = agg.get("plan_group") in ("tm_pending", "post_tp_tm_pending")
+    same_ex = bool(tm_pend and ex and ex.get("side") == agg.get("side") and ex.get("trigger_px")
+                   and sizing_same_px(cfg, ex["trigger_px"], agg.get("entry_px")))
     try:
         if pos and pos.get("legacy"):
             notes.append("该币是旧纸面仓（由旧仓盯盘管理止损/止盈/强平），本流程不操作、不加仓")
@@ -1004,7 +1273,10 @@ def _pm_execute_demo_locked(cfg, coin, did, st, w, mk, bk, pos, rationale, sourc
             action = "hold(止损冷却)"
             if cancel_ok:
                 DX.cancel_triggers(cfg, inst, "止损冷却")
-        elif drift.skip(cfg, inst, did, mk, agg, notes, "open"):
+        elif same_ex:
+            # 改动 3：交易经理条件单与现有同向挂单同价位 → 保持原单（不重挂、不过漂移跳过），按 new 止损/止盈规则改点
+            pend = keep_same_trigger(cfg, inst, mk, agg, ex, tm, notes); action = "pending"
+        elif drift.skip(cfg, inst, did, mk, agg, notes, "open") and not _drift_exempt(cfg, inst, did, agg, notes, tm_pend):
             action = "hold(价格漂移)"   # 只跳过本次新开仓/挂条件单；旧条件单、持仓不动
         else:
             size, sl, side = 0.0, agg["stop_loss"], agg["side"]

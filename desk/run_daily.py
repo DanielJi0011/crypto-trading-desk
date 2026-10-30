@@ -111,6 +111,11 @@ def main(argv=None):
     except Exception as e:
         errors.append(f"读取模拟盘平仓失败：{type(e).__name__}: {e}（本次只复盘纸面账本）")
         today_closed = [t for t in ledger.store.read_trades() if t["status"] == "closed" and t["trade_id"] not in reviewed]
+    try:   # 方案一 B：平仓盈亏记到交易经理账本（幂等；只写本地文件）
+        from desk import tm_ledger
+        tm_ledger.record_closed(cfg, today_closed)
+    except Exception as e:
+        errors.append(f"写交易经理账本失败：{type(e).__name__}: {e}")
     if stop and today_closed:
         errors.append(f"{'HALT' if halt else 'KILL'} 生效：{len(today_closed)} 笔已平仓待复盘，本次只收集数据，复盘会（LLM）待解除后运行")
     for t in ([] if stop else today_closed):

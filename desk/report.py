@@ -108,6 +108,12 @@ def write(cfg, date, decisions, closed, reviews, weight_changes, pb_events, usag
          "| 权益 USDT | 可用现金 | 总名义 | 总名义占比 | 累计已实现 | 今日已实现 | 累计收益率 |", "|---|---|---|---|---|---|---|",
          f"| {_f(bk.get('live_equity', bk['equity']))} | {_f(bk['cash'])} | {_f(bk['exposure'])} | 占{BASIS_CN.get(bk.get('equity_basis'), '权益基准')} {_f(bk['equity'])} 的 {bk['exposure'] / bk['equity'] * 100:.1f}% | "
          f"{realized:+.2f} | {today_real:+.2f} | {(bk.get('live_equity', bk['equity']) / bk['initial'] - 1) * 100:+.2f}% |", ""]
+    _nc = [d for d in decisions if d.get("tm_status") == "absent"]
+    if _nc:   # 今日未开仓说明：交易经理无结论的币放在最前
+        _i = next((i for i, x in enumerate(L) if str(x).startswith("## 一、")), len(L))
+        L[_i:_i] = ["## 今日未开仓说明（交易经理无结论）", ""] + [
+            f"- {(d.get('inst_id') or '').split('-')[0]}（{d.get('decision_id')}）：交易经理无结论，不开仓；原因：{d.get('tm_absent_reason') or '调用失败'}"
+            for d in _nc] + [""]
     if macro:
         try:
             from desk import macro as _macro
@@ -167,7 +173,14 @@ def write(cfg, date, decisions, closed, reviews, weight_changes, pb_events, usag
             L.append(f"| {t['trade_id']} | {t['inst_id']} | {_px(t['entry_px'])} | {_px(t['exit_px'])} | {t['exit_reason']} | "
                      f"{float(t['pnl_usd']):+.2f} | {float(t['pnl_pct']):+.2f}% |")
         for rv in reviews:
-            L += ["", f"### 复盘：{rv['trade_id']}", "", rv.get("summary", ""), "",
+            L += ["", f"### 复盘：{rv['trade_id']}", ""]
+            tl = rv.get("tm_line")
+            if tl:   # 方案一：复盘主线是交易经理这一单
+                L += [f"- 主线（交易经理）：动作 {tl.get('action') or '—'}（{tl.get('decision_type') or '—'}），入场 {_px(tl.get('entry_px'))}，"
+                      f"止损 {_px(tl.get('sl_px'))}，止盈 {_px(tl.get('tp_px'))}，出场 {_px(tl.get('exit_px'))}（{tl.get('exit_reason') or '—'}），"
+                      f"盈亏 {float(tl.get('pnl_usd') or 0):+.2f} USDT，实际盈亏比 {_f(tl.get('realized_rr'))}"
+                      + ("，当时否决过共识" if tl.get("vetoed_consensus") else ""), "- 下表各角色方向对错只作参考。", ""]
+            L += [rv.get("summary", ""), "",
                   "| 角色 | 当时观点 | 置信 | 对错（代码判定） | 复盘会判定 | 教训 |", "|---|---|---|---|---|---|"]
             vd = {v["role"]: v for v in rv.get("verdicts", [])}
             for t in rv["table"]:
@@ -178,6 +191,9 @@ def write(cfg, date, decisions, closed, reviews, weight_changes, pb_events, usag
                 L.append(f"\n交易经理教训：{rv['manager_lesson']}")
     else:
         L.append("今日无平仓。")
+    from desk import tm_ledger as _tml
+    if _tml.enabled(cfg):
+        L += [""] + _tml.report_lines(cfg)
     from desk.manager import tm_label_mismatch as _mm
     notes_by = {k: list(v) for k, v in (coin_notes or {}).items()}
     if demo:   # 交易经理否决导致的撤单：自动补记（已在 coin_notes 里提到的单号不重复）
@@ -201,7 +217,7 @@ def write(cfg, date, decisions, closed, reviews, weight_changes, pb_events, usag
               f"止损 {_px((d.get('aggregate') or {}).get('stop_loss'))}，止盈 {_px((d.get('aggregate') or {}).get('take_profit'))}，"
               f"保证金 {(d.get('aggregate') or {}).get('size_pct', 0):.1f}%，杠杆 {(d.get('aggregate') or {}).get('leverage', '—')}"
               + _sizing_line((d.get('aggregate') or {}).get('sizing')),
-              f"- 交易经理（投票角色之一）建议：{('条件入场计划（' + ('多' if m.get('entry_side') == 'long' else '空') + ' ' + str(m.get('entry_trigger_px')) + '）') if m['action'] == 'pending' else ACT_CN.get(m['action'], m['action'])}，仓位 {m.get('size_pct')}%，入场 {_px(m.get('entry'))}，"
+              f"- 交易经理（{'不投票，定点位' if 'trade_manager' not in d.get('weights', {}) and d.get('decided_by') else '投票角色之一'}）建议：{('条件入场计划（' + ('多' if m.get('entry_side') == 'long' else '空') + ' ' + str(m.get('entry_trigger_px')) + '）') if m['action'] == 'pending' else ACT_CN.get(m['action'], m['action'])}，仓位 {m.get('size_pct')}%，入场 {_px(m.get('entry'))}，"
               f"止损 {_px(m.get('stop_loss'))}，止盈 {_px(m.get('take_profit'))}，周期 {m.get('horizon_days')} 天，置信 {m.get('confidence')}",
               f"- 失效条件：{m.get('invalidation') or '—'}",
               f"- 理由：{m.get('rationale')}"]
@@ -215,7 +231,10 @@ def write(cfg, date, decisions, closed, reviews, weight_changes, pb_events, usag
         if d.get("tm_status") == "veto":
             L.append("- **交易经理否决**：本币不下现价单、不挂条件单、不加仓；按 cancel_pending_on_new_decision 撤旧条件单（受保护的不撤），已有持仓不动")
         elif d.get("tm_status") == "absent":
-            L.append("- **交易经理缺席，不开新仓**：调用失败，这一票不计入共识（不按中性 0.5 计），也不算否决")
+            _why = d.get("tm_absent_reason") or "调用失败"
+            L.append(f"- **交易经理无结论，不开仓**（原因：{_why}）：不新开、不加仓、不挂条件单；这一票不计入共识（不按中性 0.5 计），也不算否决；已有持仓的止损、到期回退平仓照常")
+        if (d.get("aggregate") or {}).get("tm_no_conclusion"):
+            L.append("- **交易经理无同向有效入场结论，不开仓**：未给与共识同向的现价单或完整条件单，不回退现价 + ATR+2R 基准开仓")
         if d.get("tm_label_mismatch") or (d.get("tm_status") is None and _mm(m)):
             L.append("- ⚠️ 交易经理字段冲突（以动作标签为准）：" + (d.get("tm_label_mismatch") or _mm(m)))
         if d.get("field_missing"):
@@ -261,7 +280,7 @@ def write(cfg, date, decisions, closed, reviews, weight_changes, pb_events, usag
     for r in [k for k in ROLE_KEYS if k != "portfolio_manager"] + ["trade_manager"]:   # 组合经理只执行不投票，不列
         c = scoring.scorecard(r, trades, st_by)
         br = c["by_regime"]
-        L.append(f"| {CN[r]} | {w[r]:.2f} | {_f(w_sh.get(r))} | v{read_meta(r)['current']:03d} | {c['n']} | {_f(c['hit'], pct=True)} | "
+        L.append(f"| {CN[r]} | {format(w[r], '.2f') if r in w else '不计（不投票）'} | {_f(w_sh.get(r))} | v{read_meta(r)['current']:03d} | {c['n']} | {_f(c['hit'], pct=True)} | "
                  f"{_f(c['recent']['hit'], pct=True)} | {_f(br['上涨']['hit'], pct=True)}({br['上涨']['n']}) | "
                  f"{_f(br['下跌']['hit'], pct=True)}({br['下跌']['n']}) | {_f(br['震荡']['hit'], pct=True)}({br['震荡']['n']}) | "
                  f"{c['stops']['止损有效']}/{c['stops']['被洗出']} | {_f(c.get('skill'), 3)} | {_f(c.get('brier'), 3)} | "

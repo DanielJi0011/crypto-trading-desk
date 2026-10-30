@@ -837,3 +837,79 @@ def cancel_trigger(inst, algo_id, why) -> str:
     r = reg(); r["triggers"].pop(str(algo_id), None); save_reg(r)
     X.log_event("trigger_cancelled", inst_id=inst, algoId=str(algo_id), why=why, state=state)
     return state
+
+
+# ------------------------------------------------------------------ 2026-10-30 现有条件单：识别与改止盈止损
+def existing_trigger(bk: dict, inst: str) -> dict | None:
+    """本币现有的一张条件入场单（模拟盘 book["triggers"] + 登记表元数据）。没有或多于一张返回 None / 第一张。
+    返回 {algoId, side, trigger_px, condition, stop_loss, take_profit, sz, expires}；condition 缺登记时按 None。"""
+    ts = [t for t in (bk.get("triggers") or []) if (t.get("instId") or t.get("inst_id")) == inst]
+    if not ts:
+        return None
+    t = ts[0]
+    try:
+        meta = reg().get("triggers", {}).get(str(t.get("algoId")), {})
+    except Exception:
+        meta = {}
+    side = meta.get("side")
+    if side not in ("long", "short"):
+        ps = t.get("posSide")
+        side = ps if ps in ("long", "short") else ("long" if t.get("side") == "buy" else "short")
+    sl = tp = None
+    for a in t.get("attachAlgoOrds") or []:
+        sl = sl or a.get("slTriggerPx"); tp = tp or a.get("tpTriggerPx")
+    sl = sl or t.get("slTriggerPx") or meta.get("stop_loss")
+    tp = tp or t.get("tpTriggerPx") or meta.get("take_profit")
+    px = t.get("triggerPx") or meta.get("trigger_px")
+    f = lambda v: float(v) if v not in (None, "") else None
+    return {"algoId": str(t.get("algoId")), "side": side, "trigger_px": f(px), "condition": meta.get("condition"),
+            "stop_loss": f(sl), "take_profit": f(tp), "sz": t.get("sz") or meta.get("sz"), "expires": meta.get("expires"),
+            "attachAlgoClOrdId": next((a.get("attachAlgoClOrdId") for a in t.get("attachAlgoOrds") or [] if a.get("attachAlgoClOrdId")), None)}
+
+
+def amend_trigger_sltp(cfg, inst: str, ex: dict, sl, tp) -> dict:
+    """改一张未触发条件入场单的附带止损/止盈（不改触发价、张数）。
+    先用 amend-algos（trigger 单：attachAlgoOrds[newTpTriggerPx/newSlTriggerPx]）；交易所不支持或失败时，
+    按原触发价、原张数、原到期重挂一张带新止损止盈的条件单再撤旧单（新单挂成功才撤旧）。返回 {ok, how, algoId, error?}。"""
+    _require()
+    att = {}
+    if ex.get("attachAlgoClOrdId"):
+        att["attachAlgoClOrdId"] = ex["attachAlgoClOrdId"]
+    if sl is not None and not (ex.get("stop_loss") and abs(float(sl) - float(ex["stop_loss"])) < 1e-12):
+        att.update(newSlTriggerPx=X._px(inst, sl), newSlOrdPx="-1")
+    if tp is not None and not (ex.get("take_profit") and abs(float(tp) - float(ex["take_profit"])) < 1e-12):
+        att.update(newTpTriggerPx=X._px(inst, tp), newTpOrdPx="-1")
+    if not any(k.startswith("new") for k in att):
+        return {"ok": True, "how": "unchanged", "algoId": ex["algoId"]}
+    try:
+        X.post("/api/v5/trade/amend-algos", {"instId": inst, "algoId": ex["algoId"], "attachAlgoOrds": [att]})
+        r = reg(); m = r["triggers"].get(ex["algoId"])
+        if m is not None:
+            if sl is not None:
+                m["stop_loss"] = float(sl)
+            if tp is not None:
+                m["take_profit"] = float(tp)
+            save_reg(r)
+        X.log_event("trigger_sltp_amended", inst_id=inst, algoId=ex["algoId"], how="amend", old_sl=ex.get("stop_loss"),
+                    new_sl=sl, old_tp=ex.get("take_profit"), new_tp=tp)
+        return {"ok": True, "how": "amend", "algoId": ex["algoId"]}
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"[:300]
+        X.log_event("trigger_amend_failed", inst_id=inst, algoId=ex["algoId"], error=err)
+    # 回退：重挂再撤旧
+    try:
+        meta = dict(reg().get("triggers", {}).get(ex["algoId"]) or {})
+        o = {**{k: meta.get(k) for k in TRIGGER_META_KEYS}, "side": ex["side"], "trigger_px": ex["trigger_px"],
+             "stop_loss": float(sl if sl is not None else ex.get("stop_loss")),
+             "take_profit": (float(tp) if tp is not None else ex.get("take_profit")),
+             "condition": ex.get("condition") or meta.get("condition"), "leverage": meta.get("leverage") or 1}
+        new = submit_trigger(cfg, inst, o, str(ex["sz"]), ex.get("expires") or meta.get("expires") or "",
+                             extra={"replaced": ex["algoId"]})
+        cancel_trigger(inst, ex["algoId"], "改止盈止损重挂")
+        X.log_event("trigger_sltp_amended", inst_id=inst, algoId=new["algoId"], how="replace", replaced=ex["algoId"],
+                    new_sl=sl, new_tp=tp)
+        return {"ok": True, "how": "replace", "algoId": new["algoId"]}
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"[:300]
+        X.log_event("trigger_sltp_replace_failed", inst_id=inst, algoId=ex["algoId"], error=err)
+        return {"ok": False, "how": "failed", "algoId": ex["algoId"], "error": err}

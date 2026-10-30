@@ -42,7 +42,12 @@ class FakeOKX:
                 raise X.DemoError(f"POST {path} code=1 msg= [{{'sCode': '{self.amend_code}'}}]")
             for a in self.algos:
                 if a["algoId"] == body["algoId"]:
-                    a["slTriggerPx"] = body["newSlTriggerPx"]
+                    if "newSlTriggerPx" in body:
+                        a["slTriggerPx"] = body["newSlTriggerPx"]
+                    for at in body.get("attachAlgoOrds") or []:   # 条件入场单的附带止盈止损改价
+                        a.setdefault("attachAlgoOrds", [{}])
+                        if "newSlTriggerPx" in at: a["attachAlgoOrds"][0]["slTriggerPx"] = at["newSlTriggerPx"]
+                        if "newTpTriggerPx" in at: a["attachAlgoOrds"][0]["tpTriggerPx"] = at["newTpTriggerPx"]
             return {"data": [{}]}
         if path.endswith("order-algo"):
             aid = str(next(self._id))

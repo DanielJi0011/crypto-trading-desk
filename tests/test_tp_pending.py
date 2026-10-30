@@ -55,10 +55,22 @@ def test_tp_tm_pending_opposite_side_holds(monkeypatch):
     assert c["open"] == [] and c["trig"] == []
 
 
-def test_sl_and_sessions_unchanged(monkeypatch):
+def test_sl_and_sessions_unchanged_when_switch_off(monkeypatch):
+    # 2026-10-30 改动 3 关闭开关时保持旧行为：止损再讨论与早晚场照共识现价开仓
+    orig = settings.load_config
+    def off():
+        c = orig(); c.setdefault("manager", {})["tm_pending_override"] = False; return c
+    monkeypatch.setattr(settings, "load_config", off)
     for src in ("post_stop:x", "daily", "evening"):
         r, c = _run(monkeypatch, src, _tm())
         assert len(c["open"]) == 1 and c["trig"] == [] and r["action"] == "short", src
+
+
+def test_sl_and_sessions_follow_tm_pending_when_on(monkeypatch):
+    for src in ("post_stop:x", "daily", "evening"):
+        r, c = _run(monkeypatch, src, _tm())
+        assert c["open"] == [] and len(c["trig"]) == 1 and r["action"] == "pending", src
+        assert c["trig"][0]["trigger_px"] == 106.1
 
 
 def test_tp_tm_market_vote_still_market(monkeypatch):

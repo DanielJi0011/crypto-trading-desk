@@ -45,9 +45,23 @@ def role_call_table(trade, dec) -> list[dict]:
     return rows
 
 
+def tm_line(trade, dec) -> dict:
+    """方案一：复盘主线 = 交易经理这一单（当时动作、单子类型、定的点位、结果）。"""
+    m = (dec or {}).get("manager") or {}
+    from desk import tm_ledger
+    return {"decision_id": (dec or {}).get("decision_id"), "action": m.get("action"),
+            "decision_type": (dec or {}).get("decision_type"), "final_action": (dec or {}).get("final_action"),
+            "consensus": (dec or {}).get("consensus"), "vetoed_consensus": bool((dec or {}).get("tm_vetoed_consensus")),
+            "entry_px": trade.get("entry_px"), "sl_px": trade.get("sl_px"), "tp_px": trade.get("tp_px"), "exit_px": trade.get("exit_px"),
+            "exit_reason": trade.get("exit_reason"), "pnl_usd": trade.get("pnl_usd"), "pnl_pct": trade.get("pnl_pct"),
+            "realized_rr": tm_ledger.realized_rr(trade), "rationale": m.get("rationale")}
+
+
 def review_trade(cfg, trade, tracker) -> dict:
     dec = decision_by_id(trade.get("signal_id"))
     table = role_call_table(trade, dec)
+    from desk import tm_ledger
+    tml = tm_line(trade, dec) if tm_ledger.enabled(cfg) else None
     prompt = [f"交易复盘会。标的 {trade['inst_id']}（OKX 永续 {'空' if trade.get('side') == 'sell' else '多'}单），入场 {trade['entry_time']} @ {trade['entry_px']}，"
               f"止损 {trade['sl_px']}，止盈 {trade['tp_px'] or '无'}；出场 {trade['exit_time']} @ {trade['exit_px']}"
               f"（{trade['exit_reason']}），盈亏 {float(trade['pnl_usd']):+.2f} USDT（{float(trade['pnl_pct']):+.2f}%，已含手续费）。",
@@ -56,6 +70,12 @@ def review_trade(cfg, trade, tracker) -> dict:
         prompt.append(f"- {t['role']}（{ROLE_CN[t['role']]}）：{t['direction']} 置信 {t['confidence']} 目标 {t['target']} 止损 {t['stop']}")
     if dec:
         prompt.append(f"交易经理当时理由：{dec['manager'].get('rationale', '')}；失效条件：{dec['manager'].get('invalidation', '')}")
+    if tml:
+        prompt += ["", "【复盘主线：交易经理】这一单由交易经理定入场价、止损、止盈和仓位（方向由投票角色共识决定），盈亏记在交易经理名下。",
+                   f"交易经理当时动作 {tml['action']}（单子类型 {tml['decision_type'] or '—'}，最终执行 {tml['final_action']}，共识 S={tml['consensus']}），"
+                   f"入场 {tml['entry_px']} 止损 {tml['sl_px']} 止盈 {tml['tp_px'] or '无'}，出场 {tml['exit_px']}（{tml['exit_reason']}），"
+                   f"实际盈亏比 {tml['realized_rr']}。请先评价交易经理的点位、仓位和执行，把结论写进 summary 与 manager_lesson；"
+                   "其他角色的方向对错只作参考。"]
     prompt.append("\n请逐个角色判定其观点对这笔交易是否正确，并给一句可操作的教训；不要事后诸葛亮，只评价当时可得信息下的判断质量。")
     tok = dllm.STAGE.set(f"{trade['inst_id']}/复盘会")
     try:
@@ -66,6 +86,8 @@ def review_trade(cfg, trade, tracker) -> dict:
     finally:
         dllm.STAGE.reset(tok)
     out = {"trade_id": trade["trade_id"], "time": settings.now_str(), "trade": trade, "table": table, **res}
+    if tml:
+        out["tm_line"] = tml
     REVIEWS.mkdir(parents=True, exist_ok=True)
     settings.write_json(REVIEWS / f"{trade['trade_id']}.json", out)
     return out

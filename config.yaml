@@ -196,8 +196,19 @@ manager:
   max_size_pct: 20                      # 交易经理建议仓位的上限（再受护栏约束）
   allow_stop_widen: false               # 已有持仓只允许上移止损，不允许放宽
   tp_min_gap_pct: 0.3                   # 交易经理 new_tp：新止盈须在现价盈利一侧且距现价至少 0.3%，避免改完立即触发（可调近可调远）
+  tm_no_vote_weight: true               # 2026-10-30 方案一：交易经理不投票、不计权重、不参与权重学习；方向由其余投票角色加权共识 S 决定，交易经理只能否决不能翻转多空；false=旧行为（交易经理作为一票计入）
+  tm_decides_entry: true                # 2026-10-30 方案一：入场价/条件单点位/止损/止盈只由交易经理定，各角色 entry_px 只作参考；没给完整点位 → 现价 + ATR+2R 基准；false=旧行为（choose_plan 分组）
   tm_hold_keep_sltp: true               # 2026-10-28 用户决定：交易经理 hold 且 new_stop/new_tp 都留空 → 保持原止损止盈，不套全员加权调点；false=旧行为
   tm_hold_keep_single_sltp: true        # 2026-10-29 用户决定：交易经理 hold 只给 new_stop 或只给 new_tp 时，没给的那一项保持原值（不套加权）；给的那项过原护栏，不过则保持原值；false=旧行为（另一项走加权）
+  tm_pending_override: true             # 2026-10-30 改动 3：早晚场与止损后再讨论中，交易经理投 pending 且点位完整、方向与共识一致 → 改挂交易经理条件单，不追现价（止盈后再讨论沿用原规则）；若已有同向同价位挂单则保留原单，只按 new 止损/止盈规则改点；false=旧行为
+  tm_pending_drift_exempt: true         # 2026-10-30：交易经理条件单不因 1% 价格漂移被跳过（现价已越过触发价时仍跳过）；现价单、加仓仍受漂移检查；false=旧行为（条件单也会被漂移跳过）
+  tm_required_for_open: true            # 2026-10-30 用户决定：最后由交易经理拍板（职能等同原项目组合经理）；交易经理无结论（调用重试后仍失败/空输出/解析失败）或未给同向现价单、完整条件单 → 本次不开仓不加仓，日报写明原因；不再回退现价+ATR+2R 基准开仓；持仓管理（止损、到期回退平仓）不变；false=旧行为
+
+# 入场方案分组（desk/sizing.py choose_plan，2026-10-30 新增）
+sizing:
+  no_entry_not_now_vote: true           # 改动 1：没写入场价、也没明确写入场条件=现价的同向角色只算方向票，不算现价组的票；所有同向角色都没写价时回退为现价入场；false=旧行为
+  pending_action_field: true            # 改动 2：立场行「对现有挂单=保留/改价/撤销/改现价」；已有同向挂单时，没写入场价也没写该字段的同向角色按「保留」（以挂单触发价参与分组）；false=忽略该字段与现有挂单
+  same_px_tol_pct: 0.05                 # 交易经理条件单与现有挂单触发价相差 ≤0.05% 视为同价位（保留原单不重挂）
 
 # L4 数据质量：输入数据缺失的角色记 data_missing，不进共识也不打分
 notify:                                 # webhook 降噪（每条 webhook 会唤起一次 Grok Bot 任务）
@@ -296,3 +307,6 @@ expiry_extend:                          # 2026-10-30 用户决定：持有期到
   pre_window_minutes: 5                 # 到期前一个检查周期（demo_watch 5 分钟一轮）内即可开始讨论/判断；判平仓的等真正到期再平
   retry_delays: [2, 5, 10]              # 仅 simple 模式：交易经理调用失败重试 3 次的退避秒数（full_discussion 沿用 llm_retry.install 全局重试）
   max_round_attempts: 3                 # 仅 simple 模式： 跨轮尝试上限（轮次超时打断也计数）；超过回退到期平仓
+
+ledger:
+  tm_attribution: true                  # 2026-10-30 方案一：决策记 decided_by=trade_manager 与单子类型；平仓写 state/ledger/tm_ledger.jsonl（幂等）；日报加「交易经理战绩」；复盘以交易经理为主线；false=旧行为

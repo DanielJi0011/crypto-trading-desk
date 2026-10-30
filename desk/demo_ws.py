@@ -64,7 +64,9 @@ NOTIFY_KINDS = {"trigger_placed",   # 挂出入场条件单（早场/晚场/止�
                 "offsite_backup_failed", "offsite_heartbeat_failed",
                 "evening_missing",
                 # demo_ws 进程运行的代码落后于 HEAD（每小时至多一次）
-                "stale_code"}
+                "stale_code",
+                # 交易经理无结论（调用失败/解析失败/空输出），不开仓；按决策号只提醒一次
+                "tm_no_conclusion"}
 _lock = threading.Lock()
 NOTIFY_TIMEOUT = 30
 NOTIFY_RETRIES = 2
@@ -453,6 +455,42 @@ def notify_placed(meta: dict, session=None, notifier=None, path=None) -> bool:
         return ok is not False
     except Exception as e:
         log(f"挂单提醒异常 {type(e).__name__}")
+        return False
+
+
+TM_NC_SEEN = settings.STATE / "ledger" / "tm_no_conclusion_notified.json"   # 交易经理无结论提醒去重（按决策号，同一币同一次讨论一次）
+
+
+def tm_no_conclusion_event(inst: str, reason, decision_id=None, source=None) -> dict:
+    coin = (inst or "").split("-")[0]
+    label = session_label(source)
+    msg = f"【交易经理无结论，不开仓】{coin}：{reason or '原因未知'}；决策 {decision_id}；来源 {label}"
+    return {"kind": "tm_no_conclusion", "inst_id": inst, "decision_id": decision_id, "session": label, "message": msg}
+
+
+def notify_tm_no_conclusion(inst: str, reason, decision_id=None, source=None, notifier=None, path=None) -> bool:
+    """交易经理无结论即时提醒；同一决策号（同一币同一次讨论）跨进程加锁只提醒一次，发送失败释放以便重试。不抛异常。"""
+    key = str(decision_id or f"{inst}:{settings.now_str()[:16]}")
+    path = path or TM_NC_SEEN
+    notifier = notifier or notify
+
+    def claim(j):
+        d = j.setdefault("keys", {})
+        if key in d:
+            return False
+        d[key] = settings.now_str()
+        if len(d) > 2000:
+            j["keys"] = dict(list(d.items())[-2000:])
+        return True
+    try:
+        if not _rmw(path, claim):
+            return False
+        ok = notifier(tm_no_conclusion_event(inst, reason, decision_id, source))
+        if ok is False:
+            _rmw(path, lambda j: j.setdefault("keys", {}).pop(key, None))
+        return ok is not False
+    except Exception as e:
+        log(f"交易经理无结论提醒异常 {type(e).__name__}")
         return False
 
 
