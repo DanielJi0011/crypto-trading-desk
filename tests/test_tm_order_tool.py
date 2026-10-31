@@ -128,7 +128,10 @@ def test_three_failures_no_conclusion(env):
 # ---------- 张数、点位以交易经理为准 ----------
 def test_open_margin_pct_not_recomputed_and_levels_not_overridden(env, monkeypatch):
     m, calls, box = env
-    monkeypatch.setattr(m, "demo_size", lambda *a, **k: pytest.fail("给了 margin_pct 不得按风险重算"))
+    real = m.demo_size
+    # 提示词里的基准示例（tm 无 _order_tool）允许按风险算；本单定张数不得按风险重算
+    monkeypatch.setattr(m, "demo_size", lambda *a, **k: real(*a, **k) if not hasattr(a[4], "_order_tool")
+                        else pytest.fail("给了 margin_pct 不得按风险重算"))
     rec = _go(m, box, [OTC(action="open", side="short", entry=100.0, stop_loss=103.0, take_profit=94.0, margin_pct=12, **INV)])
     a = calls["open_now"][0][0]
     assert a[3] == pytest.approx(12) and a[4] == 103.0 and a[5] == 94.0 and a[6] == "short"

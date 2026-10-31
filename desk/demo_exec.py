@@ -873,7 +873,7 @@ def existing_trigger(bk: dict, inst: str) -> dict | None:
     px = t.get("triggerPx") or meta.get("trigger_px")
     f = lambda v: float(v) if v not in (None, "") else None
     return {"algoId": str(t.get("algoId")), "side": side, "trigger_px": f(px), "condition": meta.get("condition"),
-            "stop_loss": f(sl), "take_profit": f(tp), "sz": t.get("sz") or meta.get("sz"), "expires": meta.get("expires"),
+            "stop_loss": f(sl), "take_profit": f(tp), "sz": t.get("sz") or meta.get("sz"), "expires": meta.get("expires"), "created": meta.get("created"),
             "attachAlgoClOrdId": next((a.get("attachAlgoClOrdId") for a in t.get("attachAlgoOrds") or [] if a.get("attachAlgoClOrdId")), None)}
 
 

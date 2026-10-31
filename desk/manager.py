@@ -332,7 +332,7 @@ def decide_and_execute(cfg, coin, trade_date, fs, st, tracker, source="daily") -
                                   .with_structured_output(tm_order_tool.OrderToolCall), "trade_manager")
         tctx = tool_context(cfg, inst, mk, bk, pos, S)
         tool_res = tm_order_tool.run(cfg, model, _prompt(cfg, coin, mk, pos, bk, st, w, S, texts, preview)
-                                     + tm_order_tool.instructions(tctx), tctx)
+                                     + tm_order_tool.instructions(tctx, cfg), tctx)
         dec = tool_res["dec"]
         if dec is None:
             raise TMToolFailed(tool_res["absent_why"])
@@ -375,7 +375,8 @@ def decide_and_execute(cfg, coin, trade_date, fs, st, tracker, source="daily") -
            "consensus_side": gate.get("consensus_side"), "tm_vetoed_consensus": gate.get("vetoed_consensus"),
            "tm_flip_blocked": gate.get("flip_blocked") or None,
            "config_hash": settings.config_hash(cfg), "playbook_versions": roles.versions(),   # L1 追溯
-           **({"tm_order_tool": {"attempts": tool_res["attempts"], "call": tool_res["call"], "rejected": tool_res["history"]}}
+           **({"tm_order_tool": {"attempts": tool_res["attempts"], "call": tool_res["call"], "rejected": tool_res["history"],
+                                 "receipt": tool_res.get("receipt")}}
               if tool_res else {})}
     if tm_attribution(cfg):   # 方案一 B：每一单的盈亏挂到交易经理名下
         rec["decided_by"] = "trade_manager"
@@ -912,10 +913,18 @@ def _tool_contracts(cfg, inst, bk, tm, agg, mk, px, sl):
         if not r.get("ok"):
             return None, lev, 0.0, {"ok": False, "reason": r.get("reason")}
         notional, lev = float(r["notional"]), float(r["leverage"])
-        info = {"ok": True, "how": "risk_sizing", "risk_scale": tm.risk_scale, "notional": round(notional, 2), "leverage": lev}
+        info = {"ok": True, "how": "risk_sizing", "risk_scale": tm.risk_scale, "notional": round(notional, 2), "leverage": lev,
+                "risk_usd": round(float(r["risk_usd"]), 2) if r.get("risk_usd") is not None else None}
     sz = X.contracts(inst, notional / px)
     size_pct = notional / lev / float(bk["equity"]) * 100
-    info.update(sz=sz, size_pct=round(size_pct, 4))
+    info.update(sz=sz, size_pct=round(size_pct, 4), margin=round(notional / lev, 2))
+    try:   # 回执：按实际张数算止损亏损金额与占权益%
+        qty = float(sz) * float(X.instrument(inst)["ctVal"]) if sz else notional / px
+        loss = qty * abs(float(px) - float(sl))
+        eq_ = float(bk.get("live_equity") or bk["equity"])
+        info.update(stop_loss_usd=round(loss, 2), risk_pct_equity=round(loss / eq_ * 100, 3))
+    except Exception:
+        pass
     return sz, lev, size_pct, info
 
 
@@ -942,6 +951,14 @@ def _pm_execute_tool(cfg, coin, did, st, w, mk, bk, pos, rationale, source, tm, 
     if tp_hold:
         notes.append("止盈后再讨论：交易经理条件单方向与共识相反 → 观望不下单")
     agg["tm_order_tool"] = {"action": a, "margin_pct": t.get("margin_pct")}
+    if t.get("keep_expiry_at") and a == "replace_pending":   # keep_expiry：新单沿用原到期时刻，按执行时剩余小时重算
+        from desk import tm_order_tool as _T
+        h = _T.remaining_hours(t["keep_expiry_at"])
+        if h:
+            tm.entry_expire_hours = h
+            notes.append(f"keep_expiry：重挂单沿用原到期时刻 {t['keep_expiry_at']}（剩余 {h:.2f} 小时）")
+    elif t.get("keep_expiry_at") and a == "keep_pending":
+        notes.append(f"keep_expiry：保留挂单沿用原到期时刻 {t['keep_expiry_at']}，不按 expire_hours 重算")
     try:
         if pos and pos.get("legacy"):
             notes.append("该币是旧纸面仓（由旧仓盯盘管理止损/止盈/强平），本流程不操作、不加仓")

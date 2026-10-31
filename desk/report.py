@@ -10,15 +10,49 @@ BASIS_CN = {"initial": "初始权益", "live": "实时权益"}
 DIR_CN = {"bullish": "看多", "bearish": "看空", "neutral": "中性", "close": "平仓"}
 
 
-def _sizing_line(z) -> str:
-    """R1：日报显示风险预算、名义、杠杆、止损亏损与被哪条上限削减。"""
-    if not z:
+def _num(x):
+    try:
+        return None if x in (None, "") else float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def _sizing_line(z, agg=None) -> str:
+    """R1：日报显示风险预算、名义、杠杆、止损亏损与被哪条上限削减。
+    兼容两种 sizing 结构：旧路径 sizing.size（risk_usd/stop_loss_usd 齐全）与交易经理下单工具路径
+    （manager._tool_contracts：只有 how/notional/leverage/sz/size_pct/risk_scale 或 margin_pct）。
+    缺字段时用开仓价、止损与名义（=张数×面值×价格）现算止损亏损；算不出写“按交易经理指定”。任何缺字段都不抛异常。"""
+    if not z or not isinstance(z, dict):
         return ""
     if not z.get("ok"):
-        return f"；定仓拒绝 {z.get('reason')}"
-    clip = "、".join(c["limit"] for c in z.get("clipped") or [])
-    return (f"；风险预算 {z['risk_usd']:.2f} USDT，名义 {z['notional']:.2f}，杠杆 {z['leverage']:g}x，止损亏损 {z['stop_loss_usd']:.2f}"
-            + (f"，被上限削减：{clip}" if clip else ""))
+        return f"；定仓拒绝 {z.get('reason') or '—'}"
+    agg = agg or {}
+    clip = "、".join(str((c or {}).get("limit", c)) if isinstance(c, dict) else str(c) for c in z.get("clipped") or [])
+    notional, lev = _num(z.get("notional")), _num(z.get("leverage"))
+    entry, stop = _num(agg.get("entry_px")), _num(agg.get("stop_loss"))
+    loss = _num(z.get("stop_loss_usd"))
+    if loss is None and notional and entry and stop:
+        loss = notional * abs(entry - stop) / entry
+    risk = _num(z.get("risk_usd"))
+    if z.get("how") == "tm_margin_pct":
+        basis = f"交易经理 margin_pct {_f(z.get('margin_pct'), 2)}%"
+    elif z.get("how") == "risk_sizing":
+        basis = f"按风险定仓×risk_scale {_f(z.get('risk_scale'), 2)}"
+    else:
+        basis = None
+    parts = []
+    if basis:
+        parts.append(f"定仓 {basis}")
+    parts.append(f"风险预算 {risk:.2f} USDT" if risk is not None else "风险预算 按交易经理指定")
+    if z.get("sz") not in (None, ""):
+        parts.append(f"张数 {z['sz']}")
+    parts.append(f"名义 {notional:.2f}" if notional is not None else "名义 —")
+    parts.append(f"杠杆 {lev:g}x" if lev is not None else "杠杆 —")
+    if loss is not None:
+        parts.append(f"止损亏损 {loss:.2f}" + ("（按入场价与止损现算）" if _num(z.get("stop_loss_usd")) is None else ""))
+    else:
+        parts.append("止损亏损 按交易经理指定")
+    return "；" + "，".join(parts) + (f"，被上限削减：{clip}" if clip else "")
 
 
 def model_note(r: dict) -> str:
@@ -214,8 +248,8 @@ def write(cfg, date, decisions, closed, reviews, weight_changes, pb_events, usag
               f"- 加权聚合（组合经理只执行）：方向 {({'long': '做多', 'short': '做空'}).get((d.get('aggregate') or {}).get('side'), '不交易')}，"
               f"入场 {_px((d.get('aggregate') or {}).get('entry_px'))}（{(d.get('aggregate') or {}).get('condition', '—')}），"
               f"止损 {_px((d.get('aggregate') or {}).get('stop_loss'))}，止盈 {_px((d.get('aggregate') or {}).get('take_profit'))}，"
-              f"保证金 {(d.get('aggregate') or {}).get('size_pct', 0):.1f}%，杠杆 {(d.get('aggregate') or {}).get('leverage', '—')}"
-              + _sizing_line((d.get('aggregate') or {}).get('sizing')),
+              f"保证金 {_f((d.get('aggregate') or {}).get('size_pct') or 0, 1)}%，杠杆 {(d.get('aggregate') or {}).get('leverage', '—')}"
+              + _sizing_line((d.get('aggregate') or {}).get('sizing'), d.get('aggregate') or {}),
               f"- 交易经理（{'不投票，定点位' if 'trade_manager' not in d.get('weights', {}) and d.get('decided_by') else '投票角色之一'}）建议：{('条件入场计划（' + ('多' if m.get('entry_side') == 'long' else '空') + ' ' + str(m.get('entry_trigger_px')) + '）') if m['action'] == 'pending' else ACT_CN.get(m['action'], m['action'])}，仓位 {m.get('size_pct')}%，入场 {_px(m.get('entry'))}，"
               f"止损 {_px(m.get('stop_loss'))}，止盈 {_px(m.get('take_profit'))}，周期 {m.get('horizon_days')} 天，置信 {m.get('confidence')}",
               f"- 失效条件：{m.get('invalidation') or '—'}",
