@@ -27,7 +27,7 @@ def test_set_source(monkeypatch):
 
 
 def test_all_ops_scripts_tag_source():
-    for f in ("btc_demo_execute", "eth_demo_backfill", "reprice_triggers_limit", "btc_rediscuss_demo", "demo_smoke", "rerun_coin"):
+    for f in ("reprice_triggers_limit", "demo_smoke", "rerun_coin"):
         t = (ROOT / "scripts" / f"{f}.py").read_text(encoding="utf-8")
         assert 'set_event_source("ops")' in t or 'set_event_source("test")' in t, f
     assert 'set_event_source("rediscuss")' in (ROOT / "desk" / "rediscuss.py").read_text(encoding="utf-8")

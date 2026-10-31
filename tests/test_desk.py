@@ -253,11 +253,13 @@ def test_mock_full_dry_run(cfg, monkeypatch):
             p.unlink()
 
     def hook(schema):
-        return schema(action="buy", size_pct=10, entry=82000.0, stop_loss=round(ledger.PRICE("BTC-USDT-SWAP") * 0.95, 1), take_profit=90200.0,
-                      invalidation="跌破止损", horizon_days=5, confidence=0.6, rationale="模拟：采纳多数角色看多")
-    dllm.FAKE_STRUCTURED["ManagerDecision"] = hook
+        return schema(action="open", side="long", entry=82000.0, stop_loss=77900.0, take_profit=90200.0,
+                      invalidation="跌破止损", horizon_days=5, rationale="模拟：采纳多数角色看多")
+    monkeypatch.setitem(dllm.FAKE_STRUCTURED, "OrderToolCall", hook)
     monkeypatch.setattr(ledger, "PRICE", lambda inst: 82000.0)
     monkeypatch.setattr(manager.okx_data, "last_price", lambda inst: 82000.0)
+    from desk import stop_cooldown
+    monkeypatch.setattr(stop_cooldown, "blocked", lambda *a, **k: None)   # 隔离其它用例遗留的止损冷却记录
     rc = run_daily.main(["--mock", "--coins", "BTC", "--date", "2026-10-19"])
     assert rc == 0
     rep = (settings.REPORTS / "2026-10-19.md").read_text(encoding="utf-8")

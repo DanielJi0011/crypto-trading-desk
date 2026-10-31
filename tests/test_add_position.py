@@ -1,9 +1,8 @@
 """同向加仓：加仓腿独立止盈止损，原仓保护不动。预算、削减、不反手、RR、开关、条件单成交不撤旧保护。离线。"""
-import types
 
 import pytest
 
-from desk import add_position as AP, demo_exec as DX, manager as MG, okx_demo as X, settings, sizing, equity_guard as EG
+from desk import add_position as AP, demo_exec as DX, okx_demo as X, settings, sizing, equity_guard as EG
 from tests.fake_okx import FakeOKX
 
 INSTR = {"ctVal": "0.01", "lotSz": "0.01", "minSz": "0.01", "tickSz": "0.1"}
@@ -91,59 +90,6 @@ def test_check_open_add_mode(base):
 
 
 # ---------------------------------------------------------------- 组合经理
-def _mgr(monkeypatch, base, agg_side="short", tm_state="go", enabled=True, sz_info=None, condition="now"):
-    calls = {"add_now": [], "trig": [], "cancel": []}
-    base = {**base, "risk": {**(base.get("risk") or {}), "allow_add_position": enabled}}
-    agg = {"S": -0.5 if agg_side == "short" else 0.5, "buy": True, "side": agg_side, "entry_px": 80000.0,
-           "condition": condition, "stop_loss": 82000.0, "take_profit": 76000.0, "size_pct": 10, "horizon_days": 5,
-           "notes": [], "plan_conflict": False}
-    monkeypatch.setattr(MG, "aggregate", lambda cfg, st, w, mk: dict(agg))
-    monkeypatch.setattr(MG, "pre_trade_gate", lambda cfg, inst, mk: None)
-    monkeypatch.setattr(MG, "_cooldown", lambda *a: False)
-    monkeypatch.setattr(MG, "demo_size", lambda *a: sz_info or {"ok": True, "risk_usd": 750.0, "notional": 10000.0, "clipped": []})
-    monkeypatch.setattr(DX, "cancel_triggers", lambda cfg, inst, why: calls["cancel"].append(why) or [])
-    monkeypatch.setattr(DX, "add_now", lambda *a, **k: calls["add_now"].append({"sz": a[4], "sl": a[5], "tp": a[6], "px": a[8]}) or (True, {"sz": a[4], "sl": a[5], "tp": a[6]}))
-    monkeypatch.setattr(DX, "place_add_trigger", lambda *a, **k: calls["trig"].append(a) or (True, {"algoId": "T1", "sz": a[5]}))
-    monkeypatch.setattr(DX, "reg", lambda: {"positions": {}, "triggers": {}})
-    monkeypatch.setattr(DX, "save_reg", lambda r: None)
-    tm = types.SimpleNamespace(action="short", rationale="趋势延续", entry_expire_hours=None, entry_reason="")
-    mk = {"last": 80000.0, "atr14": 2500.0, "bar_date": None}
-    p = _short()
-    res = MG._pm_execute_demo_locked(base, {"inst_id": INST}, "D-T", {}, {}, mk, _bk([p]), p, "r", tm=tm, tm_state=tm_state)
-    return res, calls
-
-
-def test_manager_add_success_independent_sl(base, monkeypatch):
-    res, c = _mgr(monkeypatch, base)
-    assert res["action"] == "add_short" and len(c["add_now"]) == 1
-    a = res["aggregate"]["add"]
-    assert a["ok"] and a["final_sl"] is not None and a["rr"] >= 1.5 - 1e-9
-    assert a["base_sl"] == 82600  # 原仓止损保留在描述里
-    assert c["add_now"][0]["sl"] == a["final_sl"]
-    assert any("原仓止损" in n and "不动" in n for n in res["notes"])
-
-
-def test_manager_no_reversal(base, monkeypatch):
-    res, c = _mgr(monkeypatch, base, agg_side="long")
-    assert not c["add_now"] and any("不反手" in n for n in res["notes"])
-
-
-def test_manager_switch_off(base, monkeypatch):
-    res, c = _mgr(monkeypatch, base, enabled=False)
-    assert not c["add_now"] and res["action"] == "hold" and any("不加仓" in n for n in res["notes"])
-
-
-def test_manager_tm_veto_states_reason(base, monkeypatch):
-    res, c = _mgr(monkeypatch, base, tm_state="veto")
-    assert not c["add_now"] and any("否决" in n and "趋势延续" in n for n in res["notes"])
-
-
-def test_manager_budget_full_skip(base, monkeypatch):
-    base.setdefault("add_position", {})["tm_decides_add"] = False   # 2026-10-30 起默认交易经理决定；本测试显式设旧值（预算硬拒）
-    res, c = _mgr(monkeypatch, base, sz_info={"ok": True, "risk_usd": 100.0, "notional": 10000.0, "clipped": []})
-    assert not c["add_now"] and res["aggregate"]["add"]["reason"] == "add_budget_full"
-
-
 # ---------------------------------------------------------------- 独立保护单 / 不撤旧
 def test_place_leg_protection_keeps_old(base, monkeypatch):
     f = FakeOKX().install(monkeypatch)

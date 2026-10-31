@@ -86,6 +86,6 @@ def test_decision_has_new_tp():
 def test_prompt_labels_consensus_basis():
     import inspect
     src = inspect.getsource(M)
-    assert "不含你本人投票" in src and "consensus_pre_tm" in src
+    assert "不含其本人投票" in src and "consensus_pre_tm" in src
     from pathlib import Path
     assert "consensus_pre_tm" in (Path(__file__).resolve().parents[1] / "routine_prompt.md").read_text()

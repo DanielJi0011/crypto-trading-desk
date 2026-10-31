@@ -7,10 +7,11 @@ from desk import settings
 
 
 def _dec(**kw):
-    from desk.manager import ManagerDecision
-    base = dict(action="hold", rationale="t", confidence=0.6, invalidation="x")
+    """交易经理下单工具的一次调用（固定走工具）。"""
+    from desk.tm_order_tool import OrderToolCall
+    base = dict(action="hold", rationale="t", invalidation="x")
     base.update(kw)
-    return ManagerDecision(**base)
+    return OrderToolCall(**base)
 
 
 def _st(direction="bearish", entry_px=100.0, cond="now"):
@@ -22,14 +23,14 @@ def _st(direction="bearish", entry_px=100.0, cond="now"):
 
 
 def _off(cfg):
-    cfg["manager"].update(tm_no_vote_weight=False, tm_decides_entry=False)
+    cfg["manager"].update(tm_no_vote_weight=False)
     cfg.setdefault("ledger", {})["tm_attribution"] = False
     return cfg
 
 
 def test_config_defaults_true():
     cfg = settings.load_config()
-    assert cfg["manager"]["tm_no_vote_weight"] is True and cfg["manager"]["tm_decides_entry"] is True
+    assert cfg["manager"]["tm_no_vote_weight"] is True
     assert cfg["ledger"]["tm_attribution"] is True
 
 
@@ -74,51 +75,6 @@ def test_weight_learning_excludes_tm():
                 p.unlink()
 
 
-def test_aggregate_entry_from_tm_pending():
-    from desk import manager
-    cfg = settings.load_config()
-    st = _st("bearish", entry_px=95.0, cond="lte")   # 角色入场价只作参考
-    tm = _dec(action="pending", entry_side="short", entry_trigger_px=103.0, entry_condition="gte",
-              entry_stop_loss=106.0, entry_take_profit=92.0, entry_size_pct=5)
-    agg = manager.aggregate(cfg, st, manager.weights(cfg), {"last": 100.0, "atr14": 2.0}, tm=tm)
-    assert agg["side"] == "short" and agg["plan_group"] == "tm_pending"
-    assert agg["entry_px"] == pytest.approx(103.0) and agg["condition"] == "gte"
-    assert agg["stop_loss"] == pytest.approx(106.0) and agg["take_profit"] <= 92.0
-    assert not agg.get("plan_conflict")
-
-
-def test_aggregate_fallback_when_tm_incomplete():
-    from desk import manager, sizing
-    cfg = settings.load_config()
-    cfg["manager"]["tm_require_explicit_levels"] = False  # 旧行为：交易经理缺入场价/止盈时用基准补（2026-10-31 后默认必须给具体点位，见 test_tm_explicit_levels.py）
-    cfg["manager"]["tm_required_for_open"] = False   # 旧回退行为（2026-10-30 后默认 true 不开仓，见 test_tm_required_for_open.py）
-    st = _st("bearish", entry_px=95.0, cond="lte")
-    for tm in (None, _dec(), _dec(action="pending", entry_side="short", entry_trigger_px=103.0)):
-        agg = manager.aggregate(cfg, st, manager.weights(cfg), {"last": 100.0, "atr14": 2.0}, tm=tm)
-        assert agg["plan_group"] == "tm_fallback_now" and agg["entry_px"] == pytest.approx(100.0) and agg["condition"] == "now"
-        bs, bt, _ = sizing.stop_take("short", 100.0, 2.0, sizing.rcfg(cfg))
-        assert agg["stop_loss"] == pytest.approx(bs) and any("回退" in n for n in agg["notes"])
-
-
-def test_aggregate_bad_tm_stop_uses_baseline():
-    from desk import manager
-    cfg = settings.load_config()
-    cfg["manager"]["tm_require_explicit_levels"] = False  # 旧行为：交易经理缺入场价/止盈时用基准补（2026-10-31 后默认必须给具体点位，见 test_tm_explicit_levels.py）
-    tm = _dec(action="short", stop_loss=95.0, take_profit=90.0, size_pct=5)   # 空单止损在下方：错误一侧
-    agg = manager.aggregate(cfg, _st("bearish"), manager.weights(cfg), {"last": 100.0, "atr14": 2.0}, tm=tm)
-    assert agg["plan_group"] == "tm" and agg["stop_loss"] > 100.0 and any("弃用" in n for n in agg["notes"])
-    assert agg.get("levels", {}).get("rr") is None or agg.get("levels", {}).get("rr") >= 1.5 - 1e-9
-
-
-def test_aggregate_switch_off_uses_choose_plan():
-    from desk import manager
-    cfg = _off(settings.load_config())
-    tm = _dec(action="pending", entry_side="short", entry_trigger_px=103.0, entry_condition="gte",
-              entry_stop_loss=106.0, entry_size_pct=5)
-    agg = manager.aggregate(cfg, _st("bearish"), manager.weights(cfg), {"last": 100.0, "atr14": 2.0}, tm=tm)
-    assert agg["plan_group"] not in ("tm_pending", "tm_fallback_now", "tm")
-
-
 @pytest.fixture()
 def desk_env(monkeypatch):
     from desk import demo_exec as DX, manager, roles
@@ -151,53 +107,26 @@ SOURCES = ["daily", "evening", "post_stop:T1", "post_tp:T1", "expiry:T1"]
 
 
 @pytest.mark.parametrize("source", SOURCES)
-def test_flip_blocked_all_paths(desk_env, source):
+def test_flip_rejected_all_paths(desk_env, source):
+    """共识看空、交易经理想做多：工具校验退回 [DIRECTION]，3 次仍反向 → 无结论，不下单。"""
     manager, calls, box = desk_env
     cfg = settings.load_config()
-    box["dec"] = _dec(action="buy", size_pct=5, stop_loss=96.0, take_profit=110.0)   # 共识看空，交易经理想做多
+    box["dec"] = _dec(action="open", side="long", entry=100.0, stop_loss=96.0, take_profit=110.0)
     rec = manager.decide_and_execute(cfg, cfg["coins"][0], "2026-10-30", {}, _st("bearish"), None, source=source)
-    assert rec["tm_status"] == "veto", rec["manager"]["rationale"]
-    assert rec["tm_flip_blocked"] and rec["tm_vetoed_consensus"]
+    assert rec["tm_status"] in ("absent", "veto")
+    assert "DIRECTION" in (rec.get("tm_absent_reason") or "")
     assert not calls["open_now"] and not calls["place_trigger"]
-    assert rec["decided_by"] == "trade_manager" and rec["consensus_side"] == "short"
-    assert "trade_manager" not in rec["weights"]
-    assert any("不能翻转多空" in n for n in rec["notes"])
+    assert rec["consensus_side"] == "short" and "trade_manager" not in rec["weights"]
 
 
-@pytest.mark.parametrize("source", SOURCES)
-def test_tm_pending_points_used_all_paths(desk_env, source):
+def test_veto_and_open(desk_env):
     manager, calls, box = desk_env
     cfg = settings.load_config()
-    box["dec"] = _dec(action="pending", entry_side="short", entry_trigger_px=102.0, entry_condition="gte",
-                      entry_stop_loss=105.0, entry_take_profit=93.0, entry_size_pct=5)
-    rec = manager.decide_and_execute(cfg, cfg["coins"][0], "2026-10-30", {}, _st("bearish", entry_px=97.0, cond="lte"), None, source=source)
-    assert rec["tm_status"] == "go" and not rec["tm_vetoed_consensus"]
-    assert rec["decision_type"] == "挂条件单"
-    assert calls["place_trigger"] and not calls["open_now"]
-    agg = rec["aggregate"]
-    assert agg["entry_px"] == pytest.approx(102.0) or rec["final_action"].startswith("hold")
-
-
-def test_veto_and_absent(desk_env):
-    manager, calls, box = desk_env
-    cfg = settings.load_config()
-    box["dec"] = _dec()
+    box["dec"] = _dec()     # hold
     rec = manager.decide_and_execute(cfg, cfg["coins"][0], "2026-10-30", {}, _st("bearish"), None)
     assert rec["tm_status"] == "veto", rec["manager"]["rationale"]
     assert rec["tm_vetoed_consensus"] and rec["decision_type"] == "持有"
     assert not calls["open_now"] and not calls["place_trigger"]
-    box["dec"] = _dec(action="short", size_pct=5, entry=100.0, stop_loss=104.0, take_profit=92.0)
-    rec = manager.decide_and_execute(cfg, cfg["coins"][0], "2026-10-30", {}, _st("bearish"), None)
-    assert rec["tm_status"] == "go" and rec["decision_type"] == "开仓" and calls["open_now"]
-
-
-def test_switch_off_no_flip_gate(desk_env):
-    manager, calls, box = desk_env
-    cfg = _off(settings.load_config())
-    box["dec"] = _dec(action="buy", size_pct=5, stop_loss=96.0, take_profit=110.0)
-    rec = manager.decide_and_execute(cfg, cfg["coins"][0], "2026-10-30", {}, _st("bearish"), None)
-    assert rec["tm_status"] == "go" and not rec.get("tm_flip_blocked") and "decided_by" not in rec
-    assert "trade_manager" in rec["weights"]
 
 
 def test_prompt_text(desk_env):

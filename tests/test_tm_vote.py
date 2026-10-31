@@ -59,18 +59,16 @@ def test_tm_status_rules():
     assert manager.tm_status(_dec(action="sell")) == "veto"                      # 无持仓时卖出 = 不入场
     # B1：hold 即使带条件单字段也是中性（今日 BTC 事故形态），冲突被记录
     hold_plan = _dec(entry_side="short", entry_trigger_px=83500.0, entry_condition="gte", entry_stop_loss=85000.0,
-                     entry_size_pct=5, size_pct=0)
+                     entry_size_pct=5)
     assert manager.tm_status(hold_plan, mk={"last": 81000}) == "veto"
     assert manager.tm_stance(hold_plan, {"last": 81000})["direction"] == "neutral"
-    assert "以动作标签为准" in manager.tm_label_mismatch(hold_plan.model_dump())
     plan = _dec(action="pending", entry_side="short", entry_trigger_px=2515.0, entry_condition="gte",
                 entry_stop_loss=2600.0, entry_size_pct=5, invalidation="站上2600")
     assert manager.tm_status(plan, mk={"last": 2450}) == "go"
     assert manager.tm_stance(plan, {"last": 2450})["direction"] == "bearish"
-    assert manager.tm_label_mismatch(plan.model_dump()) is None
     bad = _dec(action="pending", entry_side="short", entry_trigger_px=2515.0, entry_condition="gte", entry_size_pct=0)
     assert manager.tm_status(bad) == "veto" and manager.tm_stance(bad, {"last": 2450})["direction"] == "neutral"
-    assert manager.tm_status(_dec(action="short", size_pct=5, stop_loss=2600), mk={"last": 2450}) == "go"
+    assert manager.tm_status(_dec(action="short", stop_loss=2600), mk={"last": 2450}) == "go"
 
 
 @pytest.fixture()
@@ -97,10 +95,6 @@ def test_tm_veto_no_orders(demo):
     assert calls["open_now"] == 0 and calls["place_trigger"] == 0
     assert calls["cancel"] == ["交易经理否决"] and "否决" in res["action"]
     assert any("交易经理否决" in n for n in res["notes"])
-    # 对照：交易经理同意 → 走现价开仓（打桩）
-    res2 = manager.pm_execute_demo(cfg, cfg["coins"][0], "D-G", st, manager.weights(), {"last": 100.0}, bk, None, "t",
-                                   tm=None, tm_state="go")
-    assert calls["open_now"] == 1
 
 
 def test_tm_absent_not_counted_no_new_position(demo, monkeypatch):
@@ -147,21 +141,6 @@ def test_report_limit_column_and_denominator(monkeypatch):
     assert "占初始权益 101,898.76 的 4.6%" in txt
     assert "交易经理 |" in txt and "投资组合经理 |" not in txt.split("## 五")[1].split("## 六")[0]
     assert "09:00 撤单 X，原因：交易经理否决，用户授权" in txt
-
-
-def test_b4_hold_no_default_fraction_and_missing_invalidation():
-    from desk import manager
-    d = _dec()
-    assert d.reduce_fraction is None and d.invalidation is None
-    iss = manager.tm_field_issues(d.model_dump())
-    assert iss["missing"] == ["invalidation"] and not iss["conflicts"]
-    r = manager.tm_field_issues(_dec(action="reduce", invalidation="x").model_dump())
-    assert r["missing"] == ["reduce_fraction"]
-    notes = []
-    assert manager._reduce_fraction(_dec(action="reduce"), notes) == 0.5 and "字段缺失" in notes[0]
-    assert manager._reduce_fraction(_dec(action="reduce", reduce_fraction=0.3), []) == 0.3
-    h = manager.tm_field_issues(_dec(reduce_fraction=0.5, invalidation="x").model_dump())
-    assert any("reduce_fraction" in c for c in h["conflicts"])
 
 
 def test_b1_all_roles_neutral_fields_ignored():

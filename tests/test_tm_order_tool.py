@@ -64,9 +64,7 @@ def env(desk_env, monkeypatch):
 
 
 def _cfg(on=True):
-    c = settings.load_config()
-    c["manager"]["tm_order_tool"] = {"enabled": on}
-    return c
+    return settings.load_config()   # 下单工具固定开启（无开关），on 参数保留仅为兼容调用方
 
 
 def _go(m, box, script, source="daily", on=True, st=None):
@@ -80,23 +78,6 @@ PEND = dict(action="pending", side="short", trigger_px=102.0, condition="gte", s
 
 
 # ---------- 开关与默认 ----------
-def test_switch_default_false():
-    assert settings.load_config()["manager"]["tm_order_tool"]["enabled"] is False
-    assert T.enabled(settings.load_config()) is False
-    assert "tm_order_tool" in open("config.yaml", encoding="utf-8").read()
-
-
-def test_switch_off_regression_uses_manager_decision(env):
-    m, calls, box = env
-    from tests.test_tm_no_vote import _dec
-    box["script"] = [_dec(action="pending", entry_side="short", entry_trigger_px=102.0, entry_condition="gte",
-                          entry_stop_loss=105.0, entry_take_profit=93.0, entry_size_pct=5)]
-    cfg = _cfg(False)
-    rec = m.decide_and_execute(cfg, cfg["coins"][0], "2026-10-31", {}, _st("bearish"), None)
-    assert box["schema"] is m.ManagerDecision and "tm_order_tool" not in rec
-    assert calls["place_trigger"] and "下单工具" not in calls["prompts"][0]
-
-
 # ---------- 参数校验与重试 ----------
 def test_missing_fields_returned_then_retry_ok(env):
     m, calls, box = env
@@ -244,7 +225,6 @@ def test_hold_empty_keeps_levels_no_weighting(env, monkeypatch):
     m, calls, box = env
     box["pos"] = POS
     from desk import sizing
-    monkeypatch.setattr(sizing, "drop_self_levels", lambda *a, **k: pytest.fail("工具模式不得加权调点"))
     monkeypatch.setattr(sizing, "wavg_levels", lambda *a, **k: pytest.fail("工具模式不得加权调点"))
     monkeypatch.setattr(m, "add_preview", lambda *a, **k: None)
     rec = _go(m, box, [OTC(action="hold", **INV)])
@@ -272,12 +252,12 @@ OLD_FIELDS = ("entry_side", "entry_trigger_px", "entry_condition", "entry_stop_l
               "ATR+2R", "【立场】行")
 
 
-def _prompt(tool_mode, ex=None, pos=None):
+def _prompt(_tool_mode=True, ex=None, pos=None):
     cfg = settings.load_config()
     bk = {"equity": 1e5, "initial": 1e5, "cash": 1e5, "exposure": 0.0, "positions": [], "pending_entries": [],
           "triggers": ([{"instId": cfg["coins"][0]["inst_id"], "algoId": "A1", "triggerPx": "102", "side": "sell", "sz": "7"}] if ex else [])}
     return manager._prompt(cfg, cfg["coins"][0], dict(MK), pos, bk, _st("bearish"), manager.weights(cfg), -0.5,
-                           {"portfolio_manager": "pm", "trader": "t"}, None, tool_mode=tool_mode)
+                           {"portfolio_manager": "pm", "trader": "t"}, None)
 
 
 def test_tool_mode_prompt_drops_old_fields(desk_env):
@@ -289,11 +269,6 @@ def test_tool_mode_prompt_drops_old_fields(desk_env):
     cfg = settings.load_config()
     cap = min(float(cfg["guardrails"]["max_stop_loss_pct"]), float(cfg["risk"]["stop_max_pct"]) * 100)
     assert f"止损距入场≤{cap:g}%" in p and f"止损距离≤{cap:g}%" in p
-
-
-def test_legacy_prompt_unchanged_when_off(desk_env):
-    p = _prompt(False, ex=True)
-    assert "entry_trigger_px" in p and "existing_pending" in p and "## 条件入场（挂单）字段说明" in p and "## 硬护栏" not in p
 
 
 def test_decide_passes_tool_mode(env):

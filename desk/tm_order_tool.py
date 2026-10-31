@@ -1,4 +1,4 @@
-"""交易经理受限下单工具（manager.tm_order_tool.enabled，默认 false；2026-10-31 用户决定，在 feat/tm-order-tool 分支）。
+"""交易经理受限下单工具（2026-10-31 用户决定；交易经理所有入口固定走本工具，无开关）。
 
 做法：交易经理在讨论汇总之后，按固定参数「调用」一次下单工具（严格 JSON schema 结构化输出）；代码只做两件事：
 1) 参数校验 + 硬护栏预检（沿用 demo_exec.check_open、sizing、stop_cooldown、drift 等现有函数，不另写一套）；
@@ -17,10 +17,6 @@ from pydantic import BaseModel, Field
 TOOL_MAX_ATTEMPTS = 3          # 沿用项目「模型调用失败重试 3 次」约定
 OPEN_ACTS = ("open", "add", "pending", "replace_pending")
 TRIGGER_ACTS = ("pending", "replace_pending", "keep_pending")
-
-
-def enabled(cfg) -> bool:
-    return bool((((cfg or {}).get("manager") or {}).get("tm_order_tool") or {}).get("enabled", False))
 
 
 class OrderToolCall(BaseModel):
@@ -201,6 +197,8 @@ def allowed_range(cfg, ctx, px, sl) -> str:
 
 def guard_errors(cfg, call, ctx) -> list[str]:
     from desk import demo_exec as DX
+    if not DX.is_demo(cfg):   # 纸面模式（paper）不对接 OKX 合约规格，护栏由 pm_execute 纸面路径自行执行
+        return []
     bk, inst, pos = ctx["bk"], ctx["inst"], ctx.get("pos")
     px = float(ctx["mk"]["last"]) if call.action in ("open", "add") else float(call.trigger_px)
     sl = float(call.stop_loss)
@@ -220,12 +218,11 @@ def keep_errors(cfg, call, ctx) -> list[str]:
     """保留现有挂单：按原张数，用现有 sizing.pending_keep_sltp（与执行层同一函数）预检交易经理的止损止盈，任何「保持原值」都返回给交易经理。"""
     from desk import manager, sizing
     ex, mk, rc, M = ctx["existing"], ctx["mk"], sizing.rcfg(cfg), cfg.get("manager") or {}
-    by_tm = manager.tm_pending_stop_by_tm(cfg)
     r = sizing.pending_keep_sltp(ex["side"], ex["trigger_px"], ex.get("stop_loss"), ex.get("take_profit"),
                                  float(call.stop_loss), float(call.take_profit), float(mk["last"]),
                                  float(rc.get("min_rr_after_adjust", 1.5)), float(M.get("tp_min_gap_pct", 0.3)),
-                                 **({"allow_widen": True, "stop_max_pct": float(rc["stop_max_pct"]),
-                                     "widen_check": manager.pending_widen_guard(cfg, ctx["inst"], ex, ctx["bk"])} if by_tm else {}))
+                                 allow_widen=True, stop_max_pct=float(rc["stop_max_pct"]),
+                                 widen_check=manager.pending_widen_guard(cfg, ctx["inst"], ex, ctx["bk"]))
     bad = [x for x in r["reasons"] if "保持原" in x or "弃用" in x]
     return [f"[KEEP_GUARD] {x}（原挂单 {ex.get('sz')} 张不变）" for x in bad]
 
@@ -266,8 +263,7 @@ def to_decision(call: OrderToolCall, ctx: dict):
         d = dict(action="pending", entry_side=call.side, entry_trigger_px=call.trigger_px,
                  entry_condition=call.condition or ex.get("condition"), entry_stop_loss=call.stop_loss,
                  entry_take_profit=call.take_profit, entry_size_pct=float(call.margin_pct) if _num(call.margin_pct) else 1.0,
-                 entry_expire_hours=call.expire_hours,
-                 existing_pending={"keep_pending": "keep", "replace_pending": "replace"}.get(a))
+                 entry_expire_hours=call.expire_hours)
     elif a == "close":
         d = dict(action="sell")
     elif a == "reduce":

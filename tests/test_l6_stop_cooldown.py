@@ -28,9 +28,9 @@ def test_pm_blocks_same_direction(demo):  # noqa: F811
     cfg, manager, calls, st, bk = demo
     inst = cfg["coins"][0]["inst_id"]
     stop_cooldown.record(inst, "buy", "short")      # 空单刚被止损；夹具里各角色看空
-    cfg["manager"]["tm_required_for_open"] = False   # 本测试验证止损冷却，沿用无交易经理点位的旧回退
+    from tests._tool_tm import from_side
     res = manager.pm_execute_demo(cfg, cfg["coins"][0], "D-C", st, manager.weights(), {"last": 100.0}, bk, None, "t",
-                                  tm=None, tm_state="go")
+                                  tm=from_side("short", entry=100.0), tm_state="go")
     assert calls["open_now"] == 0 and calls["place_trigger"] == 0 and res["action"] == "hold(止损冷却)"
     assert any("止损冷却" in n for n in res["notes"])
     ev = [e for e in settings.read_jsonl(settings.STATE / "ledger" / "demo_events.jsonl") if e["event"] == "cooldown_blocked"]

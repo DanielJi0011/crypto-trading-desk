@@ -44,7 +44,6 @@ ENFORCED = {
     "risk.max_open_risk_pct": ["desk/sizing.py"],
     "risk.max_net_directional_pct": ["desk/sizing.py"],
     "risk.cost_buffer_pct": ["desk/sizing.py"],
-    "risk.plan_conflict_pct": ["desk/sizing.py"],
     "risk.min_rr_after_adjust": ["desk/sizing.py", "desk/manager.py"],
     "risk.max_price_drift_atr": ["desk/sizing.py", "desk/manager.py"],
     "risk.max_daily_bar_age_days": ["desk/sizing.py", "desk/manager.py"],

@@ -194,7 +194,6 @@ def write(cfg, date, decisions, closed, reviews, weight_changes, pb_events, usag
     from desk import tm_ledger as _tml
     if _tml.enabled(cfg):
         L += [""] + _tml.report_lines(cfg)
-    from desk.manager import tm_label_mismatch as _mm
     notes_by = {k: list(v) for k, v in (coin_notes or {}).items()}
     if demo:   # 交易经理否决导致的撤单：自动补记（已在 coin_notes 里提到的单号不重复）
         from desk import okx_demo as _od2
@@ -235,8 +234,8 @@ def write(cfg, date, decisions, closed, reviews, weight_changes, pb_events, usag
             L.append(f"- **交易经理无结论，不开仓**（原因：{_why}）：不新开、不加仓、不挂条件单；这一票不计入共识（不按中性 0.5 计），也不算否决；已有持仓的止损、到期回退平仓照常")
         if (d.get("aggregate") or {}).get("tm_no_conclusion"):
             L.append("- **交易经理无同向有效入场结论，不开仓**：未给与共识同向的现价单或完整条件单，不回退现价 + ATR+2R 基准开仓")
-        if d.get("tm_label_mismatch") or (d.get("tm_status") is None and _mm(m)):
-            L.append("- ⚠️ 交易经理字段冲突（以动作标签为准）：" + (d.get("tm_label_mismatch") or _mm(m)))
+        if d.get("tm_label_mismatch"):
+            L.append("- ⚠️ 交易经理字段冲突（以动作标签为准）：" + d.get("tm_label_mismatch"))
         if d.get("field_missing"):
             L.append("- ⚠️ 交易经理字段缺失：" + "、".join(d["field_missing"]))
         for r, c in (d.get("stance_field_conflicts") or {}).items():

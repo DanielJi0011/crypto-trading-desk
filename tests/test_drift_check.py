@@ -1,11 +1,11 @@
 """分析→执行价格漂移检查（drift_check）：新开仓/加仓超阈值跳过；阈值内正常；持有/平仓/止损调整不受影响；
 开关关闭不影响；取现价失败不阻断；决策记录与日报含字段。离线。"""
-import types
 
 import pytest
 
 from desk import demo_exec as DX, drift, manager as MG, okx_data, okx_demo as X, settings, equity_guard as EG
 from desk import report
+from tests._tool_tm import from_side, tool_tm
 
 INSTR = {"ctVal": "0.01", "lotSz": "0.01", "minSz": "0.01", "tickSz": "0.1"}
 INST = "BTC-USDT-SWAP"
@@ -67,7 +67,14 @@ def _run(monkeypatch, cfg, *, pos=None, condition="now", tm_action="short", side
     monkeypatch.setattr(DX, "reduce", lambda c, p, f, why: calls.__setitem__("reduce", calls["reduce"] + 1) or {"type": "reduce", "ok": True})
     monkeypatch.setattr(DX, "reg", lambda: {"positions": {}, "triggers": {}})
     monkeypatch.setattr(DX, "save_reg", lambda r: None)
-    tm = types.SimpleNamespace(action=tm_action, rationale="r", entry_expire_hours=None, entry_reason="", reduce_fraction=0.5)
+    if tm_action == "sell":
+        tm = tool_tm("close")
+    elif tm_action == "reduce":
+        tm = tool_tm("reduce", reduce_fraction=0.5)
+    elif tm_action == "hold":
+        tm = tool_tm("hold")
+    else:
+        tm = from_side(side, condition, pos=bool(pos), sl=82000.0 if side == "short" else None, tp=76000.0 if side == "short" else None)
     mk = {"last": 80000.0, "atr14": 2500.0, "bar_date": None}
     if ref:
         mk["_analysis_ref"] = ref
@@ -77,7 +84,7 @@ def _run(monkeypatch, cfg, *, pos=None, condition="now", tm_action="short", side
 
 
 # ---------------------------------------------------------------- 超阈值：新开仓/条件单/加仓跳过
-@pytest.mark.parametrize("cond,key", [("now", "open"), ("lte", "trig")])
+@pytest.mark.parametrize("cond,key", [("now", "open")])   # 交易经理条件单不受漂移检查（只查现价开仓/加仓）
 def test_open_skipped_over_threshold(base, monkeypatch, tmp_path, cond, key):
     _px(monkeypatch, 81000.0)   # +1.25%
     res, c = _run(monkeypatch, base, condition=cond)
@@ -88,7 +95,7 @@ def test_open_skipped_over_threshold(base, monkeypatch, tmp_path, cond, key):
     assert any("价格漂移跳过开仓" in n for n in res["notes"])
 
 
-@pytest.mark.parametrize("cond,key", [("now", "add_now"), ("gte", "add_trig")])
+@pytest.mark.parametrize("cond,key", [("now", "add_now")])
 def test_add_skipped_over_threshold(base, monkeypatch, tmp_path, cond, key):
     _px(monkeypatch, 79000.0)   # -1.25%
     res, c = _run(monkeypatch, base, pos=_short_pos(), condition=cond)
@@ -119,7 +126,7 @@ def test_close_reduce_unaffected(base, monkeypatch, act, key):
 
 def test_hold_unaffected(base, monkeypatch):
     _px(monkeypatch, 90000.0)
-    res, c = _run(monkeypatch, base, buy=False)
+    res, c = _run(monkeypatch, base, buy=False, tm_action="hold")
     assert res["action"] == "hold" and "drift_check" not in res["aggregate"]
     res, c = _run(monkeypatch, base, pos=_short_pos(), buy=False, tm_action="hold")
     assert res["action"] == "hold" and "drift_check" not in res["aggregate"]

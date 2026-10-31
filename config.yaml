@@ -172,12 +172,11 @@ risk:
   max_price_drift_atr: 0.5              # D1 第 3 点：执行前最新价偏离分析价 > 0.5×ATR14 → 不执行（price_drift_skip）
   max_daily_bar_age_days: 2             # D1 第 2 点：最近一根已收盘日线（UTC）距今超过 2 天视为过期，不开仓（data_stale_no_trade）
   stop_cooldown_hours: 24               # L6：同币某方向被止损后 24 小时内同向不开仓、不挂新条件单（cooldown_blocked）；反向不限；0=关闭
-  plan_conflict_pct: 0.20               # R2 入场方案组得分差距小于 20% 视为冲突，不开仓（plan_conflict）
   min_rr_after_adjust: 1.5               # 开仓/早晚场调点后盈亏比 RR=止盈距/止损距（相对入场或持仓均价）不得低于 1.5；TM new_stop/new_tp 同一护栏
 
 # 2026-10-30 用户决定：是否加仓由交易经理权衡后决定
 add_position:
-  tm_decides_add: true                  # true：交易经理决定加仓且方向一致时，加仓风险预算（cap=min(risk_usd, 权益×risk_per_trade_pct)−现有风险）只作给交易经理的参考数据（提示词加仓预览写明数字），不削减不否决；只受硬护栏约束：合并后单笔保证金 33%、总名义 100%、R4 总在途风险 max_open_risk_pct 与同向净名义、必须有止损、当日亏损停开仓、KILL/HALT；交易经理仍可否决，无结论仍不加仓（manager.tm_required_for_open）；加仓视为新订单，该腿独立止盈止损、原仓不动；false=旧行为（预算不足削减，预算满 add_budget_full 拒绝）
+  tm_decides_add: true                  # true：交易经理决定加仓且方向一致时，加仓风险预算（cap=min(risk_usd, 权益×risk_per_trade_pct)−现有风险）只作给交易经理的参考数据（提示词加仓预览写明数字），不削减不否决；只受硬护栏约束：合并后单笔保证金 33%、总名义 100%、R4 总在途风险 max_open_risk_pct 与同向净名义、必须有止损、当日亏损停开仓、KILL/HALT；交易经理仍可否决，无结论仍不加仓；加仓视为新订单，该腿独立止盈止损、原仓不动；false=旧行为（预算不足削减，预算满 add_budget_full 拒绝）
 
 # 条件入场单参数（venue=okx_demo 时条件单挂在模拟盘；demo_watch 用 rediscuss_* 与有效期；desk.monitor 只管旧纸面仓）
 pending:
@@ -192,7 +191,6 @@ pending:
 
 manager:
   # 加权共识分 S ∈ [-1,1]：S = Σ w_i·方向_i·置信度_i / Σ w_i
-  min_consensus_to_buy: 0.0             # 未使用：代码不读取（旧键，已由 consensus_threshold 取代）
   consensus_threshold: 0.1              # S > 0.1 做多，S < −0.1 做空，之间不交易
   min_valid_voters: 6                   # L3：有效票（排除抽取失败/无发言/数据缺失）少于 6 个时不交易（有效票不足）
   half_size_below: 0.3                  # |S| < 0.3 时仓位减半
@@ -201,24 +199,9 @@ manager:
   allow_stop_widen: false               # 已有持仓只允许上移止损，不允许放宽
   tp_min_gap_pct: 0.3                   # 交易经理 new_tp：新止盈须在现价盈利一侧且距现价至少 0.3%，避免改完立即触发（可调近可调远）
   tm_no_vote_weight: true               # 2026-10-30 方案一：交易经理不投票、不计权重、不参与权重学习；方向由其余投票角色加权共识 S 决定，交易经理只能否决不能翻转多空；false=旧行为（交易经理作为一票计入）
-  tm_decides_entry: true                # 2026-10-30 方案一：入场价/条件单点位/止损/止盈只由交易经理定，各角色 entry_px 只作参考；没给完整点位 → 现价 + ATR+2R 基准；false=旧行为（choose_plan 分组）
-  tm_hold_keep_sltp: true               # 2026-10-28 用户决定：交易经理 hold 且 new_stop/new_tp 都留空 → 保持原止损止盈，不套全员加权调点；false=旧行为
-  tm_hold_keep_single_sltp: true        # 2026-10-29 用户决定：交易经理 hold 只给 new_stop 或只给 new_tp 时，没给的那一项保持原值（不套加权）；给的那项过原护栏，不过则保持原值；false=旧行为（另一项走加权）
-  tm_pending_override: true             # 2026-10-30 改动 3：早晚场与止损后再讨论中，交易经理投 pending 且点位完整、方向与共识一致 → 改挂交易经理条件单，不追现价（止盈后再讨论沿用原规则）；若已有同向同价位挂单则保留原单，只按 new 止损/止盈规则改点；false=旧行为
-  tm_pending_drift_exempt: true         # 2026-10-30：交易经理条件单不因 1% 价格漂移被跳过（现价已越过触发价时仍跳过）；现价单、加仓仍受漂移检查；false=旧行为（条件单也会被漂移跳过）
-  tm_required_for_open: true            # 2026-10-30 用户决定：最后由交易经理拍板（职能等同原项目组合经理）；交易经理无结论（调用重试后仍失败/空输出/解析失败）或未给同向现价单、完整条件单 → 本次不开仓不加仓，日报写明原因；不再回退现价+ATR+2R 基准开仓；持仓管理（止损、到期回退平仓）不变；false=旧行为
-  tm_pending_keep_sltp: true            # 2026-10-30 规则 3：交易经理投 pending/条件加仓且 new_stop/new_tp 都留空 → 原仓保持原点位（不重新加权、不外推止盈），日报写"保持原点位"；false=旧行为（仅 hold 保持）
-  tm_decides_add_levels: true           # 2026-10-30 用户决定：加仓腿止损止盈以交易经理为准（条件加仓用 entry_stop_loss/entry_take_profit，现价加仓用 stop_loss/take_profit），只过硬护栏（侧向、stop_max_pct、RR≥1.5 不足外推止盈并写明）；未给的项用 ATR 基准；false=旧行为（按角色加权）
-  tm_decides_existing_pending: true     # 2026-10-30 用户决定：现有同向同价位挂单按交易经理 existing_pending（keep/replace）执行；字段留空按理由文字（重挂类词=replace），字段与文字矛盾按字段并标记；keep 时有效期按 entry_expire_hours 自原挂单时刻重算；replace 撤旧挂新、张数按风险重算；false=旧行为（同价位一律保留原单原张数原到期）
-  tm_require_explicit_levels: true      # 2026-10-31 用户决定：交易经理开仓/加仓类决定必须给具体点位（buy/short：entry、stop_loss、take_profit；pending：entry_trigger_px、entry_stop_loss、entry_take_profit），缺任一项视为无有效结论，按 tm_required_for_open 不开仓不加仓并发无结论提醒；持有/平仓/减仓不受影响；false=旧行为（缺项用 ATR 基准补）
-  tm_pending_stop_by_tm: true           # 2026-10-31 用户决定：同价位保留现有挂单（未成交条件单）时止损以交易经理为准，取消「只许收紧」；仍过硬护栏（触发价亏损一侧、距离≤stop_max_pct 8%、RR≥1.5、按原张数单笔风险≤1.5%、保证金≤33%），违反则弃用并写明原因；已开仓位止损只许收紧不变；false=旧行为
-  tm_order_tool:                        # 2026-10-31 用户决定（分支 feat/tm-order-tool）：交易经理通过受限下单工具直接下单
-    enabled: false                      # 默认关闭=原路径不变。true：交易经理按固定参数（action=open/add/pending/keep_pending/replace_pending/cancel_pending/hold/close/reduce 与点位、margin_pct、risk_scale、有效期）调用下单工具；代码只校验必填项与硬护栏（check_open 等现有函数），不通过把原因与允许范围返回交易经理改参数重试，最多 3 次，仍失败按交易经理无结论不开仓并发提醒；张数、点位、保留/重挂以交易经理为准，不做关键词识别、不静默重算张数、不用加权点位覆盖；理由文字只进复盘日报；只对 OKX 模拟盘下单
 
-# 入场方案分组（desk/sizing.py choose_plan，2026-10-30 新增）
+# 止损止盈参考点位与同价位判定（desk/sizing.py）
 sizing:
-  no_entry_not_now_vote: true           # 改动 1：没写入场价、也没明确写入场条件=现价的同向角色只算方向票，不算现价组的票；所有同向角色都没写价时回退为现价入场；false=旧行为
-  pending_action_field: true            # 改动 2：立场行「对现有挂单=保留/改价/撤销/改现价」；已有同向挂单时，没写入场价也没写该字段的同向角色按「保留」（以挂单触发价参与分组）；false=忽略该字段与现有挂单
   same_px_tol_pct: 0.05                 # 交易经理条件单与现有挂单触发价相差 ≤0.05% 视为同价位（保留原单不重挂）
   # 2026-10-30 止损止盈锚定修正（feat/sltp-anchor-fix）；基准止损距离 = risk.stop_atr_mult×ATR14（夹在 stop_min/max_pct 内）
   sltp_anchor_entry: true               # 规则 1：现价入场/已有持仓调点时，止损相对实际入场价（或均价）距离超过基准的 sltp_anchor_max_mult 倍 → 收紧到该上限；条件单只用触发价校验记录、不改点；false=旧行为
@@ -226,7 +209,6 @@ sizing:
   sltp_rr_tighten_stop_first: true      # 规则 2：RR<min_rr_after_adjust 时先把止损收紧到基准距离（只收紧），仍不足再外推止盈；false=旧行为（只外推止盈）
   sltp_tp_cap: true                     # 规则 2：止盈距离封顶；封顶后 RR 仍不足如实记录（notes / aggregate.rr_short），不放弃开仓；false=旧行为（止盈无上限）
   sltp_tp_cap_mult: 1.2                 # 规则 2：止盈距离上限 = 1.2×tp_r_multiple×基准止损距离
-  sltp_exclude_self_levels: true        # 规则 4：已有持仓调点加权时，角色 target/stop 与现有止盈/止损同价（same_px_tol_pct）→ 排除该项（防自我强化）；false=旧行为
 
 # L4 数据质量：输入数据缺失的角色记 data_missing，不进共识也不打分
 notify:                                 # webhook 降噪（每条 webhook 会唤起一次 Grok Bot 任务）

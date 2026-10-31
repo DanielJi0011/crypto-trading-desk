@@ -64,7 +64,7 @@ def test_report_top_section(desk_env, monkeypatch, capture):
     monkeypatch.setattr(DX, "is_demo", lambda cfg: False)
     txt = open(report.write(cfg, "2099-01-01", [rec], [], [], [], [], _usage(), {}, [], name="t-tmnc"), encoding="utf-8").read()
     head = txt.split("## 一、")[0]
-    assert "今日未开仓说明" in head and "交易经理无结论，不开仓" in head and "调用失败" in head
+    assert "今日未开仓说明" in head and "交易经理无结论，不开仓" in head and "未通过校验" in head
 
 
 @pytest.mark.parametrize("kind", ["call_fail", "empty"])

@@ -95,7 +95,7 @@ def test_prompt_contains_preview_and_rule(base):
     pv = MG.add_preview(base, INST, MK, bk, p, st, {"trader": 1.0}, -0.5)
     txt = MG._prompt(base, {"name": "ETH", "inst_id": INST}, MK, p, bk, st, {"trader": 1.0}, -0.5,
                      {"portfolio_manager": "pm", "trader": "tr"}, pv)
-    assert "## 加仓预览" in txt and "不要拿原仓止损止盈" in txt and "否决权不变" in txt and "本腿止损" in txt
+    assert "## 加仓预览" in txt and "不要拿原仓止损止盈" in txt and "最终是否加仓仍由你决定" in txt and "本腿止损" in txt
 
 
 def test_report_shows_preview():

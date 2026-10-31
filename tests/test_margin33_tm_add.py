@@ -5,7 +5,7 @@ import copy
 import pytest
 
 from desk import add_position as AP, config_safety, demo_exec as DX, manager as MG, okx_demo as X, settings, sizing
-from tests.test_add_position import base, _mgr, _short, _bk  # noqa: F401  复用夹具
+from tests.test_add_position import base, _short, _bk, INST  # noqa: F401  复用夹具
 
 E = 100000.0
 INSTR = {"ctVal": "0.01", "lotSz": "0.01", "minSz": "0.01", "tickSz": "0.1"}
@@ -28,7 +28,6 @@ def test_config_values(cfg):
     assert r["max_net_directional_pct"] == 1.0 and r["max_notional_per_trade_pct"] == 1.0
     assert cfg["manager"]["max_size_pct"] == 33
     assert cfg["add_position"]["tm_decides_add"] is True and AP.tm_decides(cfg)
-    assert cfg["manager"]["tm_required_for_open"] is True
     assert sw["leverage_max"] == 1 and g["leverage"] == 1 and g["allow_leverage"] is False
     assert config_safety.max_open_leverage(cfg) == 1
     config_safety.validate(cfg)
@@ -124,42 +123,18 @@ def test_budget_tm_decides_hard_guards(cfg):
     assert not a["ok"] and a["reason"] == "no_stop"
 
 
-@pytest.fixture
-def mbase(base):
-    # _mgr 的 aggregate 桩是旧签名（不收 tm）：与 test_add_position 相同，关闭入场方案一开关以隔离；加仓开关用默认值
-    base.setdefault("manager", {}).update(tm_no_vote_weight=False, tm_decides_entry=False)
-    return base
-
-
-def test_manager_tm_decides_add_not_budget_rejected(mbase, monkeypatch):
-    base = mbase
-    res, c = _mgr(monkeypatch, base, sz_info={"ok": True, "risk_usd": 100.0, "notional": 10000.0, "clipped": [],
-                                               "exposure": {"long": 0, "short": 4832.0}})
-    assert res["action"] == "add_short" and len(c["add_now"]) == 1
-    a = res["aggregate"]["add"]
-    assert a["ok"] and a["tm_decides"] and a["over_budget"] and "add_risk_budget" not in a["clip_by"]
-    assert any("仅参考" in n for n in res["notes"])
-
-
-def test_manager_switch_off_restores_budget(mbase, monkeypatch):
-    base = mbase
-    base.setdefault("add_position", {})["tm_decides_add"] = False
-    res, c = _mgr(monkeypatch, base, sz_info={"ok": True, "risk_usd": 100.0, "notional": 10000.0, "clipped": []})
-    assert not c["add_now"] and res["aggregate"]["add"]["reason"] == "add_budget_full"
-
-
-def test_manager_total_notional_blocks_add(mbase, monkeypatch):
-    base = mbase
-    res, c = _mgr(monkeypatch, base, sz_info={"ok": True, "risk_usd": 750.0, "notional": 10000.0, "clipped": [],
-                                               "exposure": {"long": 60000.0, "short": 40000.0}})
-    assert not c["add_now"] and res["aggregate"]["add"]["reason"] == "add_total_notional_full"
-
-
 @pytest.mark.parametrize("tm_state", ["absent", "veto"])
-def test_manager_tm_absent_or_veto_no_add(mbase, monkeypatch, tm_state):
-    base = mbase
-    res, c = _mgr(monkeypatch, base, tm_state=tm_state)
-    assert not c["add_now"] and not c["trig"] and res["action"].startswith("hold")
+def test_manager_tm_absent_or_veto_no_add(base, monkeypatch, tm_state):
+    calls = []
+    monkeypatch.setattr(MG, "pre_trade_gate", lambda cfg, inst, mk: None)
+    monkeypatch.setattr(DX, "cancel_triggers", lambda *a, **k: [])
+    monkeypatch.setattr(DX, "add_now", lambda *a, **k: calls.append(a) or (True, {}))
+    monkeypatch.setattr(DX, "place_add_trigger", lambda *a, **k: calls.append(a) or (True, {}))
+    st = {r: {"direction": "bearish", "confidence": 0.8} for r in MG.VOTERS}
+    mk = {"last": 80000.0, "atr14": 2500.0, "bar_date": None}
+    p = _short()
+    res = MG._pm_execute_demo_locked(base, {"inst_id": INST}, "D-T", st, MG.weights(), mk, _bk([p]), p, "r", tm=None, tm_state=tm_state)
+    assert not calls and res["action"].startswith("hold")
 
 
 def test_preview_shows_reference_and_hard_max(monkeypatch, tmp_path):

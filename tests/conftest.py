@@ -74,8 +74,8 @@ def _no_expiry_discuss_spawn(monkeypatch):
     monkeypatch.setattr(expiry_discuss, "SPAWN", lambda args, logfile: None)
 
 
-# ---- 2026-10-30 方案一：下列旧用例验证的是「交易经理作为一票 + choose_plan 分组 + 无交易经理账本」的旧行为，
-# 在这些文件里显式关闭三个新开关（开关关闭 = 改动前行为，正好作为回退回归测试）。新行为见 tests/test_tm_no_vote.py。
+# ---- 2026-10-30 方案一：下列旧用例验证的是「交易经理作为一票 + 无交易经理账本」的旧行为，
+# 在这些文件里显式关闭这两个开关（开关关闭 = 改动前行为，正好作为回退回归测试）。新行为见 tests/test_tm_no_vote.py。
 _LEGACY_TM_VOTE = {"test_add_position.py", "test_batch2_exec.py", "test_drift_check.py", "test_monitor.py",
                    "test_r1_r4_sizing.py", "test_sltp_weighted_rr15.py", "test_tm_vote.py", "test_learning_freeze_and_expiry.py"}
 
@@ -90,7 +90,7 @@ def _legacy_tm_flags_off(request, monkeypatch):
 
     def _off():
         c = real()
-        c.setdefault("manager", {}).update(tm_no_vote_weight=False, tm_decides_entry=False)
+        c.setdefault("manager", {}).update(tm_no_vote_weight=False)
         c.setdefault("ledger", {})["tm_attribution"] = False
         return c
     monkeypatch.setattr(settings, "load_config", _off)

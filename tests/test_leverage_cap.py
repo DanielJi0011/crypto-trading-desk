@@ -2,17 +2,25 @@
 5 倍场景只作为测试参数单独设定，验证夹取与降杠杆逻辑仍正确。离线，不发请求。"""
 from types import SimpleNamespace
 
-import pytest
 
 from desk import config_safety, demo_exec as DX, ledger, manager, settings
+
+
+def _lev(cfg, lev):
+    """下单工具定张数时的杠杆夹取（manager._tool_contracts，margin_pct 路径）。"""
+    tm = SimpleNamespace(leverage=lev, risk_scale=1.0, _order_tool={"margin_pct": 10})
+    bk = {"equity": 100000.0, "live_equity": 100000.0}
+    agg = {"stop_loss": 105.0, "side": "short", "entry_px": 100.0}
+    from desk import okx_demo as X
+    X._inst_cache.setdefault("BTC-USDT-SWAP", {"ctVal": "0.01", "lotSz": "0.01", "minSz": "0.01", "tickSz": "0.1"})
+    return manager._tool_contracts(cfg, "BTC-USDT-SWAP", bk, tm, agg, {"last": 100.0}, 100.0, 105.0)[1]
 
 
 def test_default_new_open_leverage_is_1():
     cfg = settings.load_config()
     assert config_safety.max_open_leverage(cfg) == 1.0
-    agg = {"stop_loss": 105.0, "side": "short", "entry_px": 100.0}
-    assert manager._levfix(cfg, agg, SimpleNamespace(leverage=5)) == 1.0      # 交易经理给 5 倍 → 夹到 1
-    assert manager._levfix(cfg, agg, SimpleNamespace(leverage=1)) == 1.0
+    assert _lev(cfg, 5) == 1.0      # 交易经理给 5 倍 → 夹到 1
+    assert _lev(cfg, 1) == 1.0
 
 
 def test_check_open_rejects_2x(monkeypatch, tmp_path):
@@ -32,14 +40,12 @@ def _cfg5():
     return cfg
 
 
-def test_param_5x_used_6_clamped_and_liq_reduction():
+def test_param_5x_used_6_clamped():
     cfg = _cfg5()
     assert config_safety.max_open_leverage(cfg) == 5
-    agg = {"stop_loss": 105.0, "side": "short", "entry_px": 100.0}
-    assert manager._levfix(cfg, agg, SimpleNamespace(leverage=5)) == 5.0
-    assert manager._levfix(cfg, agg, SimpleNamespace(leverage=6)) == 5.0
-    lev = manager._levfix(cfg, {"stop_loss": 75.0, "side": "long", "entry_px": 100.0}, SimpleNamespace(leverage=6))
-    assert 1 <= lev < 5 and 75.0 > ledger.liq_price("long", 100.0, lev, ledger.swap_cfg(cfg)["maint_margin_rate"])
+    assert _lev(cfg, 5) == 5.0
+    assert _lev(cfg, 6) == 5.0
+    assert ledger.liq_price("long", 100.0, 5, ledger.swap_cfg(cfg)["maint_margin_rate"]) < 100.0
 
 
 def test_allow_leverage_false_caps_even_if_swap_higher():

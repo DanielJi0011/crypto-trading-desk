@@ -65,35 +65,6 @@ def _st(a_conf, b_conf):
             "B": {"direction": "bullish", "confidence": b_conf, "entry_px": 95, "entry_condition": "lte", "horizon_days": 5}}
 
 
-def test_r2_conflict():
-    p = sizing.choose_plan(_st(0.8, 0.7), {"A": 1, "B": 1}, ["A", "B"], "long", 100.0, 0.003)
-    assert p["conflict"]
-
-
-def test_r2_breakout_wins_no_average():
-    p = sizing.choose_plan(_st(0.8, 0.3), {"A": 1, "B": 1}, ["A", "B"], "long", 100.0, 0.003)
-    assert not p["conflict"] and p["group"] == "breakout"
-    assert p["entry"] == pytest.approx(110) and p["condition"] == "gte"
-
-
-def test_r2_aggregate_conflict_no_trade(cfg_like=None):
-    from desk import manager
-    from desk.settings import load_config
-    cfg = load_config()
-    st = {r: {"direction": "neutral", "confidence": 0} for r in manager.VOTERS}
-    r1, r2 = manager.VOTERS[0], manager.VOTERS[1]
-    st[r1] = {"direction": "bullish", "confidence": 0.8, "entry_px": 110, "entry_condition": "gte", "horizon_days": 5}
-    st[r2] = {"direction": "bullish", "confidence": 0.7, "entry_px": 95, "entry_condition": "lte", "horizon_days": 5}
-    w = {r: (1.0 if r in (r1, r2) else 0.05) for r in manager.VOTERS}
-    agg = manager.aggregate(cfg, st, w, {"last": 100.0, "atr14": 2.0})
-    assert agg["plan_conflict"] and not agg["buy"]
-    st[r2]["confidence"] = 0.3
-    agg = manager.aggregate(cfg, st, w, {"last": 100.0, "atr14": 2.0})
-    assert agg["buy"] and agg["entry_px"] == pytest.approx(110)
-    assert agg["stop_loss"] == pytest.approx(110 * (1 - 0.03 / 1.1 * 1.0), rel=1e-6)   # 1.5×2/110
-    assert agg["take_profit"] == pytest.approx(110 + 2 * (110 - agg["stop_loss"]))
-
-
 def test_r3_liq_buffer_lowers_leverage():
     # 1% 止损需 4x；ATR=30 时 4x 强平距离不足 → 逐级降到满足为止
     r = _size(0.6, 0.01, atr=30.0)

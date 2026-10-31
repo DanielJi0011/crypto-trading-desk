@@ -1,7 +1,6 @@
 """R1–R4 统一定仓（纯函数，无网络）。所有开仓路径（open_now / place_trigger / 限价补单的上限）与日报都只用这里的结果。
 
-R2 入场方案：同向角色按入场条件分为 now / breakout / pullback 三组，按组内 Σ w×conf 选组，入场价只在组内加权；
-   两组得分差 < plan_conflict_pct（20%）→ 方案冲突不开仓（plan_conflict）。止损 = clip(stop_atr_mult×ATR14/entry, stop_min, stop_max)，
+R2 参考点位（manager.aggregate，只作参考，实际下单点位以交易经理下单工具为准）：止损 = clip(stop_atr_mult×ATR14/entry, stop_min, stop_max)，
    止盈 = 入场 ± tp_r_multiple × 止损距离。再按同向角色 stop/target 做 w×置信度加权调整；调整后盈亏比 RR=止盈距/止损距（相对入场）不得低于 min_rr_after_adjust。
 R1 定仓：risk_usd = 权益×risk_per_trade_pct×scale×dd_scale×tm_risk_scale；notional = min(risk_usd/stop_dist, 权益×max_notional, R4 剩余)；
    杠杆取满足保证金上限的最小值（步长 0.5，1 ≤ lev ≤ 新开仓上限与交易经理上限）；不够则按保证金上限反推削减 notional。
@@ -14,15 +13,14 @@ import math
 
 RISK_DEFAULTS = {"risk_per_trade_pct": 0.0075, "max_notional_per_trade_pct": 1.0, "max_margin_pct": 0.20, "stop_atr_mult": 1.5,
                  "stop_min_pct": 0.01, "stop_max_pct": 0.08, "tp_r_multiple": 2.0, "liq_buffer_atr_mult": 1.0,
-                 "max_open_risk_pct": 0.02, "max_net_directional_pct": 1.2, "cost_buffer_pct": 0.002, "plan_conflict_pct": 0.20,
+                 "max_open_risk_pct": 0.02, "max_net_directional_pct": 1.2, "cost_buffer_pct": 0.002,
                  "max_price_drift_atr": 0.5, "max_daily_bar_age_days": 2, "min_rr_after_adjust": 1.5}
 
-SIZING_DEFAULTS = {"no_entry_not_now_vote": True, "pending_action_field": True, "same_px_tol_pct": 0.05,
+SIZING_DEFAULTS = {"same_px_tol_pct": 0.05,
                    # 2026-10-30 止损止盈锚定修正（feat/sltp-anchor-fix），false=旧行为
                    "sltp_anchor_entry": True, "sltp_anchor_max_mult": 1.25,
                    "sltp_rr_tighten_stop_first": True,
-                   "sltp_tp_cap": True, "sltp_tp_cap_mult": 1.2,
-                   "sltp_exclude_self_levels": True}
+                   "sltp_tp_cap": True, "sltp_tp_cap_mult": 1.2}
 
 
 def anchor_opts(cfg, rc: dict | None = None, atr=None, entry=None) -> dict:
@@ -40,23 +38,8 @@ def anchor_opts(cfg, rc: dict | None = None, atr=None, entry=None) -> dict:
             "tp_r": float(rc["tp_r_multiple"])}
 
 
-def drop_self_levels(st: dict, pos: dict | None, tol_pct: float = 0.05) -> tuple[dict, list]:
-    """规则 4：对已有持仓调点加权时，角色 target/stop 与现有持仓止盈/止损同价（容差 same_px_tol_pct）→ 排除该项，
-    避免把现有点位原样回收进加权（自我强化）。返回 (新立场字典, 被排除的 [(角色, 字段, 值)])。"""
-    out, dropped = {}, []
-    tp, sl = (pos or {}).get("tp_px"), (pos or {}).get("sl_px")
-    for r, s in (st or {}).items():
-        s2 = dict(s or {})
-        for f, ref in (("target", tp), ("stop", sl)):
-            v = s2.get(f)
-            if v not in (None, "") and ref not in (None, "") and same_px(v, ref, tol_pct):
-                dropped.append((r, f, v)); s2[f] = None
-        out[r] = s2
-    return out, dropped
-
-
 def scfg(cfg) -> dict:
-    """sizing 段开关（2026-10-30 新增）：no_entry_not_now_vote（改动 1）、pending_action_field（改动 2）默认 true。"""
+    """sizing 段参数：同价位容差与止损止盈锚定规则。"""
     return {**SIZING_DEFAULTS, **((cfg or {}).get("sizing") or {})}
 
 
@@ -70,7 +53,6 @@ def stop_take(side: str, entry: float, atr: float, rc: dict) -> tuple[float, flo
     d = min(max(float(rc["stop_atr_mult"]) * float(atr) / float(entry), float(rc["stop_min_pct"])), float(rc["stop_max_pct"]))
     sg = 1 if side == "long" else -1
     return entry * (1 - sg * d), entry * (1 + sg * float(rc["tp_r_multiple"]) * d), d
-
 
 
 def rr_ratio(side: str, entry: float, stop, tp) -> float | None:
@@ -186,14 +168,6 @@ def guard_rr(side: str, entry: float, stop, tp, min_rr: float = 1.5) -> tuple[bo
     return True, "", rr
 
 
-def classify(side: str, cond: str | None, entry: float | None, last: float, band: float) -> str:
-
-    if cond == "now" or not entry or abs(float(entry) / last - 1) <= band:
-        return "now"
-    up = float(entry) > last
-    return "breakout" if (up if side == "long" else not up) else "pullback"
-
-
 PENDING_ACTIONS = ("keep", "reprice", "cancel", "now")   # 立场行「对现有挂单」：保留/改价/撤销/改现价
 
 
@@ -205,63 +179,6 @@ def same_px(a, b, tol_pct: float = 0.05) -> bool:
         return False
 
 
-def choose_plan(st: dict, w: dict, roles: list, side: str, last: float, band: float, conflict_pct: float = 0.20,
-                no_entry_not_now: bool = False, existing: dict | None = None) -> dict:
-    """roles=同向角色。返回 {group, entry, condition, horizon, scores, conflict, ...}。
-
-    no_entry_not_now（sizing.no_entry_not_now_vote）：没写入场价、也没明确写现价的角色只算方向票，不进 now 组；
-      若所有同向角色都落到这一类（一个入场方案票都没有），回退旧行为：这些角色计入 now 组（现价入场）。
-    existing（stances.pending_keep_default 开启时由调用方传入的同向现有挂单 {trigger_px, condition}）：
-      没写入场价、也没写「对现有挂单」的角色按「保留」处理，以现有挂单触发价作隐含入场价参与分组；
-      pending_action=keep 以现有挂单为准；reprice 以其入场价为准；cancel 不投入场票；now 计入 now 组。
-      隐含入场价只用于分组，不写回立场（打分仍按原立场的方向/目标/止损）。"""
-    groups: dict[str, list] = {"now": [], "breakout": [], "pullback": []}
-    eff: dict[str, float] = {}
-    dir_only, implied, cancelled = [], [], []
-    ex_px = float(existing["trigger_px"]) if existing and existing.get("trigger_px") else None
-    for r in roles:
-        s = st[r]
-        pa = s.get("pending_action")
-        e, cond = s.get("entry_px"), s.get("entry_condition")
-        if pa == "now":
-            cond = "now"
-        elif pa == "cancel" and ex_px:
-            cancelled.append(r); continue
-        elif ex_px and cond != "now" and (pa == "keep" or (not e and pa is None)):
-            e, cond = ex_px, existing.get("condition"); implied.append(r)
-        if e and not (0.5 * last < float(e) < 1.5 * last):   # 离谱价位剔除（沿用原规则）
-            continue
-        if not e and cond != "now" and no_entry_not_now:
-            dir_only.append(r); continue
-        g = classify(side, cond, e, last, band)
-        groups[g].append(r)
-        if e:
-            eff[r] = float(e)
-    fallback = False
-    if no_entry_not_now and dir_only and not any(groups.values()):
-        groups["now"] = list(dir_only); dir_only = []; fallback = True   # 全部没写价：保持旧行为（现价入场）
-    score = {g: sum(float(w[r]) * float(st[r].get("confidence") or 0) for r in rs) for g, rs in groups.items()}
-    ranked = sorted(score.items(), key=lambda x: -x[1])
-    top, sec = ranked[0], ranked[1]
-    out = {"scores": {k: round(v, 4) for k, v in score.items()}, "group": top[0], "conflict": False,
-           "direction_only": dir_only, "implied_keep": implied, "cancel_votes": cancelled, "no_entry_fallback_now": fallback,
-           "members": {g: list(rs) for g, rs in groups.items()}}
-    if top[1] <= 0:
-        return {**out, "group": None}
-    if sec[1] > 0 and (top[1] - sec[1]) / top[1] < conflict_pct:
-        return {**out, "conflict": True}
-    rs = groups[top[0]]
-    wsum = sum(float(w[r]) * float(st[r].get("confidence") or 0) for r in rs)
-    if top[0] == "now":
-        entry = last
-    else:
-        entry = sum(float(w[r]) * float(st[r]["confidence"]) * eff[r] for r in rs) / wsum
-    hz = sum(float(w[r]) * float(st[r]["confidence"]) * float(st[r].get("horizon_days") or 0) for r in rs) / wsum
-    cond = "now" if (top[0] == "now" or abs(entry / last - 1) <= band) else ("gte" if entry > last else "lte")
-    return {**out, "entry": last if cond == "now" else entry, "condition": cond, "horizon": hz}
-
-
-# ------------------------------------------------------------------ R3
 def liq_price(side: str, px: float, lev: float, mmr: float) -> float:
     return px * (1 - 1 / lev + mmr) if side == "long" else px * (1 + 1 / lev - mmr)
 
@@ -362,7 +279,7 @@ def pending_keep_sltp(side: str, trigger: float, old_sl, old_tp, new_sl, new_tp,
     """保留同价位现有条件单时，按交易经理给的 new 止损/止盈改点（2026-10-30 用户规则，纯函数）：
     只给一项另一项保持原值；止损只收紧（做空只下移、做多只上移）且须在触发价亏损一侧；
     止盈须在触发价盈利一侧且距现价至少 gap_pct%；按触发价算 RR≥min_rr；违规的项保持原值并记原因。
-    allow_widen=True（2026-10-31，manager.tm_pending_stop_by_tm）：挂单止损以交易经理为准，可放宽，但须距触发价 ≤ stop_max_pct，
+    allow_widen=True（2026-10-31 用户决定，保留挂单时止损以交易经理为准）：挂单止损以交易经理为准，可放宽，但须距触发价 ≤ stop_max_pct，
     且 widen_check(sl) 返回 None（单笔风险/保证金等硬护栏）；违反则弃用并写明原因。"""
     sg = 1 if side == "long" else -1
     sl, tp, why = old_sl, old_tp, []

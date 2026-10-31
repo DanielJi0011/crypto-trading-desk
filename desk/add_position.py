@@ -29,7 +29,7 @@ def tm_decides(cfg) -> bool:
     """add_position.tm_decides_add（默认 true，2026-10-30 用户决定）：是否加仓由交易经理权衡后决定。
     true：加仓风险预算（min(risk_usd, 权益×risk_per_trade_pct) − 现有风险）只作给交易经理的参考数据，不削减、不否决；
     加仓只受硬护栏约束（合并后单笔保证金 max_position_pct、总名义 max_total_notional_pct、R4 在途风险/同向净名义、
-    必须有止损、当日亏损停开仓、KILL/HALT）。交易经理仍可否决；交易经理无结论仍不加仓（manager.tm_required_for_open）。
+    必须有止损、当日亏损停开仓、KILL/HALT）。交易经理仍可否决；交易经理无结论仍不加仓。
     false：恢复旧行为（预算不足削减，预算满 add_budget_full 拒绝）。"""
     return bool((cfg.get("add_position") or {}).get("tm_decides_add", True))
 

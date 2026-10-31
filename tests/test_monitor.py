@@ -200,8 +200,8 @@ def test_aggregation_signed_and_pm_not_voting(env):
     st["portfolio_manager"] = {"direction": "bullish", "confidence": 1.0}
     mk = {"last": 100.0}
     a = manager.aggregate(cfg, st, w, mk)
-    assert a["side"] == "short" and a["condition"] == "lte" and a["entry_px"] == pytest.approx(98.0)
-    assert a["stop_loss"] == pytest.approx(104.0) and a["take_profit"] == pytest.approx(90.0)
+    # 加权汇总只作参考：方向由 S 定，参考入场=现价；条件单点位以交易经理下单工具为准
+    assert a["side"] == "short" and a["condition"] == "now" and a["entry_px"] == pytest.approx(100.0)
     S_with = a["S"]
     st["portfolio_manager"] = {"direction": "bearish", "confidence": 1.0}
     assert manager.aggregate(cfg, st, w, mk)["S"] == S_with          # 组合经理不影响 S
@@ -211,6 +211,8 @@ def test_aggregation_signed_and_pm_not_voting(env):
     assert manager.aggregate(cfg, weak, w, mk)["side"] is None
     # pm_execute：无持仓 → 挂空单
     coin = cfg["coins"][0]
-    res = manager.pm_execute(cfg, coin, "D-X", st, w, mk, ledger.book(cfg), None, "测试")
+    from tests._tool_tm import tool_tm
+    tm = tool_tm("pending", side="short", trigger_px=98.0, condition="lte", stop_loss=104.0, take_profit=90.0)
+    res = manager.pm_execute(cfg, coin, "D-X", st, w, mk, ledger.book(cfg), None, "测试", tm=tm, tm_state="go")
     assert res["action"] == "pending" and pending.load()[coin["inst_id"]]["side"] == "short"
     assert "portfolio_manager" not in pending.load()[coin["inst_id"]]["role_levels"]

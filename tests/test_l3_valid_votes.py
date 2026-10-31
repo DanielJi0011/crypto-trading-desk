@@ -44,7 +44,6 @@ def test_enough_valid_votes_can_trade():
     st = _st({"direction": "bullish", "confidence": 0.6, "source": "立场行", "entry_px": 100, "entry_condition": "now"})
     for r in manager.VOTERS[6:]:
         st[r] = {"direction": "neutral", "confidence": 0, "source": "无发言"}
-    cfg["manager"]["tm_required_for_open"] = False   # 本测试验证其他护栏，沿用无交易经理点位的旧回退
     a = manager.aggregate(cfg, st, _w(), MK)
     assert a["valid_voters"] == 6 and a["buy"]
 

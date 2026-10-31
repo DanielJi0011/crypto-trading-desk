@@ -59,6 +59,7 @@ def test_r8_exec_lock_mutual_exclusion():
 def test_r8_second_open_sees_position(monkeypatch):
     """锁内重读账户：第二次执行看到已有持仓 → 不开仓。"""
     from desk import demo_exec as DX, manager
+    from tests._tool_tm import from_side
     cfg = settings.load_config()
     held = {"pos": []}
     bk = lambda cfg, prices=None: {"equity": 1e5, "live_equity": 1e5, "positions": list(held["pos"]), "triggers": [], "pending_entries": []}
@@ -70,12 +71,14 @@ def test_r8_second_open_sees_position(monkeypatch):
         held["pos"].append({"inst_id": "BTC-USDT-SWAP", "side": "long", "venue": "okx_demo", "notional": 1, "price": 1})
         return True, {}
     monkeypatch.setattr(DX, "open_now", fake_open)
+    from desk import okx_demo as X
+    monkeypatch.setattr(X, "contracts", lambda inst, q: "1")
     monkeypatch.setattr(DX, "cancel_triggers", lambda *a, **k: [])
     st = {r: {"direction": "bullish", "confidence": 0.8, "entry_px": 100.0, "entry_condition": "now", "horizon_days": 3,
               "stop": 95.0, "target": 110.0} for r in manager.VOTERS}
     for _ in range(2):
         manager.pm_execute_demo(cfg, cfg["coins"][0], "D-R8", st, manager.weights(), {"last": 100.0}, None, None, "t",
-                                tm=None, tm_state="go")
+                                tm=from_side("long", entry=100.0, sl=95.0, tp=110.0), tm_state="go")
     assert opened == [1]
 
 
