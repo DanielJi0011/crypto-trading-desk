@@ -75,6 +75,7 @@ def test_notify_applies_cooldown(tmp_path, monkeypatch):
     monkeypatch.delenv("TA_NOTIFY_DISABLED", raising=False)
     monkeypatch.setattr(W, "_notify_cfg", lambda: ("http://example.invalid/hook", ""))
     monkeypatch.setattr(W, "COOLDOWN_PATH", tmp_path / "cd.json")
+    monkeypatch.setattr(W, "quiet_ops_alerts", lambda: False)   # 关闭静默开关时沿用原通知行为
     assert W.notify({"kind": "stale_code", "message": "a"})
     assert not W.notify({"kind": "stale_code", "message": "b"})
     assert W.notify({"kind": "stop_loss", "message": "s"}) and W.notify({"kind": "stop_loss", "message": "s"})
@@ -85,6 +86,7 @@ def test_notify_applies_cooldown(tmp_path, monkeypatch):
 def test_stale_code_branch_condition(monkeypatch):
     monkeypatch.setattr(W, "_code_rev", {"start": "a" * 40, "alerted": 0.0})
     monkeypatch.setattr(W, "run_branch", lambda: "chore/publish-prep")
+    monkeypatch.setattr(W, "quiet_ops_alerts", lambda: False)
     sent = []
     nt = lambda e: sent.append(e) or True
     assert not W.check_code_version(now=1e9, head="b" * 40, notifier=nt, branch="feat/webhook-filter")

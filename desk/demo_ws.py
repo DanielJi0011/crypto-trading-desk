@@ -18,6 +18,7 @@ import fcntl
 import hashlib
 import hmac
 import json
+from pathlib import Path
 import os
 import random
 import re
@@ -366,8 +367,40 @@ def fill_claim(ev: dict, path=None) -> bool:
     return _rmw(path or NOTIFIED_FILLS, fn)
 
 
+# ------------------------------------------------------------------ 静默运维告警（2026-11-01 用户决定）
+# “运行旧代码 stale_code”与“心跳超时类”（healthcheck_stale、demo_ws 心跳未更新但进程仍在、healthcheck 发现心跳/日志过期重启）
+# 不再 POST webhook（每条 webhook 会唤醒一次 AI 任务），只写日志 + state/alerts/quiet_alerts.jsonl 留查。
+# 开关 notify.quiet_ops_alerts，缺省 true（= 这两类不通知）；设为 false 恢复原通知行为。
+# 进程已死（proc_*、*_down）、KILL/HALT、成交/止损/开仓/挂单、护栏等一律不受影响。
+QUIET_KINDS = {"stale_code", "healthcheck_stale"}   # 整类静默；chain_unhealthy:demo_ws / health_fix *_stale 由调用方按条件判定
+QUIET_LOG = settings.STATE / "alerts" / "quiet_alerts.jsonl"
+
+
+def quiet_ops_alerts() -> bool:
+    v = _notify_section().get("quiet_ops_alerts", True)
+    return not (v is False or str(v).strip().lower() in ("false", "0", "no", "off"))
+
+
+def quiet_record(kind: str, message: str, path=None, **ctx) -> dict:
+    """静默告警：只写 demo_ws 日志与 quiet_alerts.jsonl（保留可查），不发 webhook。"""
+    rec = {"time": settings.now_str(), "kind": kind, "message": message, "notified": False,
+           "reason": "notify.quiet_ops_alerts", **ctx}
+    try:
+        q = Path(path) if path else QUIET_LOG
+        q.parent.mkdir(parents=True, exist_ok=True)
+        with open(q, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as e:
+        log(f"静默告警写文件失败 {type(e).__name__}")
+    log(f"静默告警（只记日志不通知）{kind}：{message}")
+    return rec
+
+
 def notify(ev: dict) -> bool:
     if ev.get("kind") not in NOTIFY_KINDS:
+        return False
+    if ev.get("kind") in QUIET_KINDS and quiet_ops_alerts():   # 兜底：任何路径都不为这两类发 webhook
+        quiet_record(ev.get("kind"), str(ev.get("message") or ""))
         return False
     if os.environ.get("TA_NOTIFY_DISABLED") == "1":   # 测试与演练用总开关：不发任何 webhook
         log(f"通知已禁用（TA_NOTIFY_DISABLED=1）：{ev.get('kind')}")
@@ -807,6 +840,9 @@ def check_code_version(now=None, head=None, notifier=None, branch=None) -> bool:
     if now - _code_rev["alerted"] >= STALE_ALERT_EVERY:
         _code_rev["alerted"] = now
         msg = f"demo_ws 运行的是旧代码（启动版本 {str(_code_rev['start'])[:7]}，当前 HEAD {head[:7]}），需重启生效"
+        if quiet_ops_alerts():
+            quiet_record("stale_code", msg)
+            return True
         log("告警：" + msg)
         try:
             (notifier or notify)({"kind": "stale_code", "message": msg})

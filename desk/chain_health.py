@@ -55,6 +55,14 @@ def _send(kind, message, notifier):
         pass
 
 
+def _quiet() -> bool:
+    try:
+        from desk.demo_ws import quiet_ops_alerts
+        return quiet_ops_alerts()
+    except Exception:
+        return True
+
+
 def _dedup(st, key, now_ts) -> bool:
     n = st.setdefault("notified", {})
     if key in n and now_ts - n[key] < DEDUP_S:
@@ -167,7 +175,15 @@ def run(cfg, now: _dt.datetime | None = None, notifier=None) -> list:
             sent.append("evening_missing")
     except Exception:
         pass
-    for key, msg in problems(cfg, ts).items():
+    probs = problems(cfg, ts)
+    quiet = _quiet()
+    for key, msg in probs.items():
+        if quiet and key == "demo_ws" and "proc_demo_ws" not in probs and "proc" not in probs:
+            # 心跳超时但进程仍在 → 只记日志/状态（healthcheck.py 会按需重启）；进程已死时照常通知
+            st.setdefault("quiet", {})[key] = {"ts": ts, "message": msg}
+            from desk.demo_ws import quiet_record
+            quiet_record("chain_unhealthy", msg, problem=key); sent.append(f"quiet:{key}")
+            continue
         if _dedup(st, f"chain_unhealthy:{key}", ts):
             _send("chain_unhealthy", msg, notifier); sent.append(f"chain_unhealthy:{key}")
     hb = float(A["heartbeat_hours"] or 0)
@@ -201,5 +217,10 @@ def healthcheck_stale(now_ts: float | None = None, notifier=None, cfg=None) -> b
     if not _dedup(st, "healthcheck_stale", now_ts):
         return False
     _save(st)
+    msg = f"健康检查超过 {lim / 60:g} 分钟未运行（state/healthcheck_state.json）"
+    if _quiet():
+        from desk.demo_ws import quiet_record
+        quiet_record("healthcheck_stale", msg)
+        return True
     _send("healthcheck_stale", f"健康检查超过 {lim / 60:g} 分钟未运行（state/healthcheck_state.json）", notifier)
     return True

@@ -67,6 +67,7 @@ def test_catchup_uses_subprocess(monkeypatch):
 
 
 def test_stale_code_alert_hourly(monkeypatch):
+    monkeypatch.setattr(W, "quiet_ops_alerts", lambda: False)   # 原通知行为（静默开关关闭）；静默模式见 test_alert_quiet
     monkeypatch.setattr(W, "_code_rev", {"start": None, "alerted": 0.0})
     monkeypatch.setattr(W, "git_branch", lambda: W.run_branch())   # HEAD 在运行分支上
     sent = []

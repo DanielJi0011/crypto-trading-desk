@@ -96,7 +96,9 @@ def test_flags_daily_missing_dedup_heartbeat(iso):
     assert sent == ["heartbeat"]
 
 
-def test_chain_unhealthy_dedup(iso):
+def test_chain_unhealthy_dedup(iso, monkeypatch):
+    from desk import demo_ws
+    monkeypatch.setattr(demo_ws, "quiet_ops_alerts", lambda: False)   # 原通知行为（开关关闭）
     cfg = settings.load_config()
     (iso / "stop_coverage.json").write_text(json.dumps({"missing": {"BTC-USDT-SWAP:net": 2}}))
     os.utime(iso / "demo_ws_heartbeat", (0, 0))
@@ -111,7 +113,9 @@ def test_chain_unhealthy_dedup(iso):
     assert len(sent) == 4
 
 
-def test_healthcheck_stale(iso):
+def test_healthcheck_stale(iso, monkeypatch):
+    from desk import demo_ws as _W
+    monkeypatch.setattr(_W, "quiet_ops_alerts", lambda: False)   # 原通知行为（开关关闭）
     sent = []
     (iso / "healthcheck_state.json").write_text(json.dumps({"last_run": 1000.0}))
     assert chain_health.healthcheck_stale(1000 + 600, lambda e: sent.append(e["kind"])) is False

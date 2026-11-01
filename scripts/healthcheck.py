@@ -80,6 +80,23 @@ def watch_log_age():
     return min(ages) if ages else None
 
 
+def quiet() -> bool:
+    try:
+        from desk import demo_ws
+        return demo_ws.quiet_ops_alerts()
+    except Exception:
+        return True
+
+
+def quiet_log(issue, msg):
+    log(f"静默（只记日志不通知 health_fix）：{issue} {msg}")
+    try:
+        from desk import demo_ws
+        demo_ws.quiet_record("health_fix", msg, issue=issue)
+    except Exception as e:
+        log(f"静默记录失败 {type(e).__name__}")
+
+
 def notify(st, issue, fixes):
     last = st.setdefault("notified", {}).get(issue, 0)
     if time.time() - last < NOTIFY_COOLDOWN:
@@ -137,6 +154,9 @@ def main():
             n = k.rsplit("_", 1)[0]
             ok = bool(pids(PROCS[n]["pat"]))
             log(f"修复：{v}；重启后存活={ok}")
+            if k.endswith("_stale") and ok and quiet():   # 心跳/日志过期但已重启存活：只记日志（notify.quiet_ops_alerts）
+                quiet_log(k, v)
+                continue
             notify(st, k, [v + ("" if ok else "（重启后仍未存活！）")])
     else:
         log(f"正常：demo_watch/demo_ws 在运行，心跳 {int((age(HEARTBEAT) or 0))}s 前，watch 日志 {int(watch_log_age() or 0)}s 前")
