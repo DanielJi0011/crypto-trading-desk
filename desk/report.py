@@ -17,6 +17,57 @@ def _num(x):
         return None
 
 
+def _kv(label, v, fmt=None):
+    """缺字段（None/空）返回 None，不出现 “None”。"""
+    if v is None or v == "":
+        return None
+    return f"{label} {fmt(v) if fmt else v}"
+
+
+def tm_advice_text(d: dict) -> str:
+    """“交易经理建议”行：按下单工具 action 显示；保留挂单显示现有挂单点位；缺字段省略。"""
+    m = d.get("manager") or {}
+    t = d.get("tm_order_tool") or {}
+    call = t.get("call") or {}
+    a = call.get("action")
+    tail = [_kv("周期", m.get("horizon_days"), lambda v: f"{v} 天"), _kv("置信", m.get("confidence"))]
+    if a == "keep_pending":
+        pd = d.get("pending") if isinstance(d.get("pending"), dict) else {}
+        sz = pd.get("kept_sz") or pd.get("sz") or (t.get("receipt") or {}).get("sz")
+        exp = pd.get("expires") or ("沿用原到期时刻" if call.get("keep_expiry") else
+                                    (f"原挂单时刻起 {call.get('expire_hours'):g} 小时" if call.get("expire_hours") else None))
+        parts = [_kv("触发价", pd.get("trigger_px") or call.get("trigger_px") or m.get("entry_trigger_px"), _px),
+                 _kv("张数", sz), _kv("止损", pd.get("stop_loss") or call.get("stop_loss") or m.get("entry_stop_loss"), _px),
+                 _kv("止盈", pd.get("take_profit") or call.get("take_profit") or m.get("entry_take_profit"), _px), _kv("到期", exp)]
+        body = "保留现有挂单（" + "，".join(x for x in parts if x) + "）"
+        if t.get("ignored_note"):
+            body += f"；{t['ignored_note']}"
+        return "，".join([body] + [x for x in tail if x])
+    if a in ("pending", "replace_pending") or (not a and m.get("action") == "pending"):
+        side = call.get("side") or m.get("entry_side")
+        head = ("撤旧重挂" if a == "replace_pending" else "条件入场计划") + f"（{'多' if side == 'long' else '空'} {_px(call.get('trigger_px') or m.get('entry_trigger_px'))}）"
+        parts = [_kv("保证金", call.get("margin_pct"), lambda v: f"{v:g}%"),
+                 _kv("止损", m.get("entry_stop_loss"), _px), _kv("止盈", m.get("entry_take_profit"), _px)]
+    else:
+        head = {"cancel_pending": "撤销现有挂单", "reduce": "部分减仓"}.get(a) or ACT_CN.get(m.get("action"), m.get("action") or "—")
+        parts = [_kv("仓位", m.get("size_pct"), lambda v: f"{v}%"), _kv("入场", m.get("entry"), _px),
+                 _kv("止损", m.get("stop_loss"), _px), _kv("止盈", m.get("take_profit"), _px),
+                 _kv("减仓比例", m.get("reduce_fraction") if a == "reduce" else None),
+                 _kv("新止损", m.get("new_stop"), _px), _kv("新止盈", m.get("new_tp"), _px)]
+    return "，".join([head] + [x for x in parts + tail if x])
+
+
+def untriggered_intent_line(d: dict) -> str | None:
+    """理由里出现未落地的操作意图文字时提示（只提示，不执行）。"""
+    from desk.tm_order_tool import untriggered_intents
+    m = d.get("manager") or {}
+    hits = untriggered_intents((m.get("rationale") or "") + " " + (m.get("invalidation") or ""))
+    if not hits:
+        return None
+    return (f"- ⚠ 理由含未落地的操作意图（关键词：{'、'.join(hits)}）：理由文字不会被执行，"
+            "如需动作须通过 action 字段（例如 reduce 或改 new_tp），本系统不会自动处理")
+
+
 def _sizing_line(z, agg=None) -> str:
     """R1：日报显示风险预算、名义、杠杆、止损亏损与被哪条上限削减。
     兼容两种 sizing 结构：旧路径 sizing.size（risk_usd/stop_loss_usd 齐全）与交易经理下单工具路径
@@ -250,10 +301,12 @@ def write(cfg, date, decisions, closed, reviews, weight_changes, pb_events, usag
               f"止损 {_px((d.get('aggregate') or {}).get('stop_loss'))}，止盈 {_px((d.get('aggregate') or {}).get('take_profit'))}，"
               f"保证金 {_f((d.get('aggregate') or {}).get('size_pct') or 0, 1)}%，杠杆 {(d.get('aggregate') or {}).get('leverage', '—')}"
               + _sizing_line((d.get('aggregate') or {}).get('sizing'), d.get('aggregate') or {}),
-              f"- 交易经理（{'不投票，定点位' if 'trade_manager' not in d.get('weights', {}) and d.get('decided_by') else '投票角色之一'}）建议：{('条件入场计划（' + ('多' if m.get('entry_side') == 'long' else '空') + ' ' + str(m.get('entry_trigger_px')) + '）') if m['action'] == 'pending' else ACT_CN.get(m['action'], m['action'])}，仓位 {m.get('size_pct')}%，入场 {_px(m.get('entry'))}，"
-              f"止损 {_px(m.get('stop_loss'))}，止盈 {_px(m.get('take_profit'))}，周期 {m.get('horizon_days')} 天，置信 {m.get('confidence')}",
+              f"- 交易经理（{'不投票，定点位' if 'trade_manager' not in d.get('weights', {}) and d.get('decided_by') else '投票角色之一'}）建议：" + tm_advice_text(d),
               f"- 失效条件：{m.get('invalidation') or '—'}",
               f"- 理由：{m.get('rationale')}"]
+        _iw = untriggered_intent_line(d)
+        if _iw:
+            L.append(_iw)
         if d.get("add_preview"):
             from desk.manager import describe_add_preview as _dap
             L.append("- " + _dap(d["add_preview"]))

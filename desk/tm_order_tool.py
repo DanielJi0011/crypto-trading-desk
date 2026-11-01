@@ -31,8 +31,9 @@ class OrderToolCall(BaseModel):
     condition: Literal["gte", "lte"] | None = Field(default=None, description="pending/replace_pending 必填：gte=涨到≥触发价开仓，lte=跌到≤触发价开仓")
     stop_loss: float | None = Field(default=None, description="开仓/加仓/挂单类必填：止损价（做多在下方、做空在上方，距入场≤8%）")
     take_profit: float | None = Field(default=None, description="开仓/加仓/挂单类必填：止盈价，盈亏比≥1.5")
-    margin_pct: float | None = Field(default=None, description="可选：本单保证金占权益%（定张数，以你为准，只受硬护栏封顶）；留空=按单笔风险定仓×risk_scale")
-    risk_scale: float = Field(default=1.0, description="0~1：未给 margin_pct 时按风险定仓的缩放")
+    margin_pct: float | None = Field(default=None, description="可选：本单保证金占权益%（定张数，以你为准，只受硬护栏封顶）；留空=按单笔风险定仓×risk_scale。"
+                                      "keep_pending（保留挂单）不改张数，此字段不起作用，不要填")
+    risk_scale: float = Field(default=1.0, description="0~1：未给 margin_pct 时按风险定仓的缩放。keep_pending（保留挂单）不改张数，此字段不起作用，不要填")
     leverage: float = Field(default=1, description="杠杆（只作上限，新开仓上限由代码强制）")
     expire_hours: float | None = Field(default=None, description="pending/replace_pending/keep_pending 必填（keep_expiry=true 时可不填）：有效期小时，"
                                        "从挂单时刻起算：pending/replace_pending 从本次新挂单时刻起算；keep_pending 从现有挂单的原挂单时刻起算（不是从现在起算）")
@@ -42,7 +43,8 @@ class OrderToolCall(BaseModel):
     reduce_fraction: float | None = Field(default=None, description="reduce 必填：减仓比例 0.1~0.9")
     horizon_days: int = Field(default=5, description="持有周期天数 1~30")
     invalidation: str = Field(default="", description="必填：什么情况说明判断错了")
-    rationale: str = Field(default="", description="必填：中文理由（只进复盘日报，不参与执行）")
+    rationale: str = Field(default="", description="必填：中文理由（只进复盘日报，不参与执行）。"
+                           "reason/rationale 里的任何操作意图都不会被执行，要动作必须通过 action 字段（例如 reduce 或改 new_tp）")
 
 
 REQUIRED = {"open": ("side", "entry", "stop_loss", "take_profit"),
@@ -363,6 +365,9 @@ def instructions(ctx: dict, cfg=None) -> str:
              "margin_pct 可选：给了就按它定张数（只受硬护栏封顶，超出会拒绝并告诉你上限）；不给按单笔风险×risk_scale 定仓。",
              "有效期 expire_hours 从挂单时刻起算：pending/replace_pending 从本次新挂单时刻起算；keep_pending 从现有挂单的原挂单时刻起算（不是从现在起算）。"
              "想沿用现有挂单原到期时刻，就在 keep_pending/replace_pending 设 keep_expiry=true，此时忽略 expire_hours。",
+             "keep_pending（保留挂单）沿用原挂单张数：risk_scale、margin_pct 等张数字段不起作用，不要填（填了会被忽略并在回执中注明）。",
+             "reason/rationale 里的任何操作意图都不会被执行，要动作必须通过 action 字段（例如 reduce 或改 new_tp）；"
+             "不要在理由里写“部分止盈（另行处理）”“回头再调”之类的待办，系统没有后续执行机制。",
              "预检通过就直接执行，不会再回给你确认；被拒绝时会把本次张数、名义、保证金、止损亏损金额与占权益%一并返回。"]
     lines += baseline_lines(cfg, ctx)
     if ex:
@@ -407,6 +412,36 @@ def baseline_lines(cfg, ctx) -> list[str]:
     return out
 
 
+INTENT_KEYWORDS = ("部分止盈", "另行处理", "回头再", "稍后再", "之后再", "择机", "考虑减仓", "考虑加仓", "考虑止盈")
+
+
+def untriggered_intents(text: str | None) -> list[str]:
+    """理由文字里疑似未落地的操作意图（简单关键词，只做提示，不做任何动作）。"""
+    t = text or ""
+    return [k for k in INTENT_KEYWORDS if k in t]
+
+
+KEEP_IGNORED_NOTE = "保留挂单不改张数，已忽略"
+SIZE_FIELDS = {"margin_pct": None, "risk_scale": 1.0}
+
+
+def keep_ignored_fields(call: OrderToolCall) -> dict:
+    """keep_pending 时带了张数字段（非默认值）→ 返回 {字段: 原值}；不拒绝，只在记录里忽略。"""
+    if call.action != "keep_pending":
+        return {}
+    out = {}
+    for k, dflt in SIZE_FIELDS.items():
+        v = getattr(call, k)
+        if v is not None and (dflt is None or float(v) != float(dflt)):
+            out[k] = v
+    return out
+
+
+def strip_keep_size_fields(call: OrderToolCall) -> tuple[OrderToolCall, dict]:
+    ign = keep_ignored_fields(call)
+    return (call.model_copy(update={k: SIZE_FIELDS[k] for k in ign}) if ign else call), ign
+
+
 def retry_prompt(prompt: str, history: list) -> str:
     if not history:
         return prompt
@@ -431,8 +466,14 @@ def run(cfg, model, prompt: str, ctx: dict) -> dict:
             continue
         errs = validate(cfg, call, ctx)
         if not errs:
+            call, ign = strip_keep_size_fields(call)
+            rc = (ctx.get("_sized") or {}).get(call.action)
+            note = None
+            if ign:
+                note = f"{KEEP_IGNORED_NOTE}（{'、'.join(f'{k}={v:g}' for k, v in ign.items())}）"
+                rc = {**(rc or {}), "note": note}
             return {"dec": to_decision(call, ctx), "call": call.model_dump(), "attempts": n, "history": history, "absent_why": None,
-                    "receipt": (ctx.get("_sized") or {}).get(call.action)}
+                    "receipt": rc, "ignored": ign or None, "ignored_note": note}
         history.append({"call": call.model_dump(), "errors": errs})
     last = "；".join(history[-1]["errors"]) if history else "无输出"
     return {"dec": None, "call": history[-1]["call"] if history else None, "attempts": TOOL_MAX_ATTEMPTS, "history": history,

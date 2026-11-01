@@ -376,7 +376,8 @@ def decide_and_execute(cfg, coin, trade_date, fs, st, tracker, source="daily") -
            "tm_flip_blocked": gate.get("flip_blocked") or None,
            "config_hash": settings.config_hash(cfg), "playbook_versions": roles.versions(),   # L1 追溯
            **({"tm_order_tool": {"attempts": tool_res["attempts"], "call": tool_res["call"], "rejected": tool_res["history"],
-                                 "receipt": tool_res.get("receipt")}}
+                                 "receipt": tool_res.get("receipt"), "ignored": tool_res.get("ignored"),
+                                 "ignored_note": tool_res.get("ignored_note")}}
               if tool_res else {})}
     if tm_attribution(cfg):   # 方案一 B：每一单的盈亏挂到交易经理名下
         rec["decided_by"] = "trade_manager"
