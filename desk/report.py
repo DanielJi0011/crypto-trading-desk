@@ -159,6 +159,47 @@ def _exec_title(d: dict) -> str:
     return f" · 仓位 {sz:.1f}%"
 
 
+def _parse_ts(v):
+    import datetime as _dt
+    if not v:
+        return None
+    if isinstance(v, _dt.datetime):
+        return v
+    t = str(v).strip()
+    for f in ("%Y-%m-%d %H:%M:%S%z", "%Y-%m-%d %H:%M%z", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d"):
+        try:
+            d = _dt.datetime.strptime(t, f)
+            return d if d.tzinfo else d.replace(tzinfo=settings.TZ)
+        except ValueError:
+            continue
+    return None
+
+
+def start_time(demo: bool):
+    """初始权益记录时刻：模拟盘取 state/demo_account.json 的 recorded_at；纸面账本无起始时间返回 None。"""
+    if not demo:
+        return None
+    from desk import demo_exec
+    return _parse_ts(settings.read_json(demo_exec.DEMO_ACCOUNT, {}).get("recorded_at"))
+
+
+def annualized_line(equity, initial, start, now=None) -> str:
+    """综合年化收益（复利）= (当前权益/初始权益)^(365/运行天数) - 1，运行天数为小数天。早晚报共用。"""
+    try:
+        eq, ini = float(equity), float(initial)
+        st = _parse_ts(start)
+        now = _parse_ts(now) or settings.now()
+        days = (now - st).total_seconds() / 86400 if st else 0
+        if ini <= 0 or eq <= 0 or days <= 0:
+            raise ValueError
+        cum = eq / ini - 1
+        ann = (eq / ini) ** (365 / days) - 1
+    except (TypeError, ValueError, OverflowError, ZeroDivisionError):
+        return "综合年化收益 暂无（缺少起始时间或运行天数为0）"
+    tail = "（样本过短，仅供参考）" if days < 7 else ""
+    return f"综合年化收益 {ann * 100:+.2f}%（累计 {cum * 100:+.2f}%，已运行 {days:.1f} 天）{tail}"
+
+
 def write(cfg, date, decisions, closed, reviews, weight_changes, pb_events, usage, prices, errors, mock=False,
           research=None, name=None, coin_notes=None, prices_time=None, macro=None, banner=None) -> str:
     """coin_notes：{inst_id: [补记行]}，写进该币决策段（无决策时单列一段）；交易经理否决导致的撤单会从 demo_events 自动补记。"""
@@ -187,6 +228,7 @@ def write(cfg, date, decisions, closed, reviews, weight_changes, pb_events, usag
          f"> 生成时间 {settings.now_str()}（北京时间）· 模式：" + ("**OKX 模拟盘直连（Demo Trading，x-simulated-trading: 1）· USDT 永续逐仓**，禁止实盘" if demo else "**纸面交易（paper）· OKX USDT 永续逐仓模拟**，不下真实订单")
          + ("· ⚠️ 本次为模拟 LLM 演练，结论无意义" if mock else ""), "",
          "## 一、账户概览" + ("（OKX 模拟盘）" if demo else "（纸面）"), "",
+         f"**{annualized_line(bk.get('live_equity', bk['equity']), bk['initial'], start_time(demo))}**", "",
          *([f"权益基准（{bk['equity_basis']}）{_f(bk['equity'])} USDT；模拟盘实时权益 {_f(bk['live_equity'])} USDT；初始权益 {_f(bk['initial'])} USDT；"
             f"下表“累计/今日已实现”仅为旧纸面仓。", ""] if demo else []),
          f"总名义占比的分母 = 权益基准（execution.equity_basis={bk.get('equity_basis', 'paper')}）{_f(bk['equity'])} USDT。", "",
