@@ -86,6 +86,7 @@ def test_every_role_every_flow(monkeypatch, reg, session, extra):
     seen = _run_analyze(monkeypatch, session, extra)
     for r in VOTERS:
         assert "## 当前挂着的条件单" in seen[r] and "触发价 2600" in seen[r], r
+        assert "## 决策节奏（固定时间决策）" in seen[r], r   # 2026-11-05：全体角色共享固定时间决策说明
         if extra:
             assert "再讨论" in seen[r], r
 

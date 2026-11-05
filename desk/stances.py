@@ -28,6 +28,17 @@ STANCE_RE = re.compile(r"【立场】\s*方向\s*[=:：]\s*(看多|看空|中性
                        r"\s*[；;,，]\s*止损价\s*[=:：]\s*" + _NUM + r"\s*[；;,，]\s*置信度\s*[=:：]\s*([0-9.]+)\s*[；;,，]\s*周期\s*[=:：]\s*([0-9]+)",
                        re.I)
 
+# 解析 v2（2026-11-02）：逐字段解析。v1 的 STANCE_RE 要求五字段同行、同序、全齐，任一偏差整行作废、
+# 静默掉到 LLM 粗抽。v2 改为在最后一个【立场】段内逐字段独立识别：顺序不限，目标/止损可缺省，
+# 置信度可写百分比（如 65%），周期可带单位（5天/5日/5 days）。语义与 v1 一致的部分：
+# 取最后一个“完整”立场（方向+置信度+周期齐全者优先，靠前的完整立场胜过靠后的残缺立场）；
+# 只有残缺立场时取最后一个带方向的，置信度缺失按 0.5 计并打 partial 标记（日报解析健康可见）。
+_DIR_RE = re.compile(r"方向\s*[=:：]\s*(看多|看空|中性|偏多|偏空|bullish|bearish|neutral)", re.I)
+_TGT_RE = re.compile(r"目标价\s*[=:：]\s*" + _NUM, re.I)
+_SL_RE = re.compile(r"止损价\s*[=:：]\s*" + _NUM, re.I)
+_CONF_RE = re.compile(r"置信度\s*[=:：]\s*([0-9][0-9.]*)\s*(%|％)?", re.I)
+_HZ_RE = re.compile(r"周期\s*[=:：]\s*([0-9]+)\s*(?:天|日|days?)?", re.I)
+
 
 def _num(s):
     try:
@@ -43,22 +54,62 @@ PEND_RE = re.compile(r"对现有挂单\s*[=:：]\s*(保留|改价|撤销|撤单|
 PEND_MAP = {"保留": "keep", "改价": "reprice", "撤销": "cancel", "撤单": "cancel", "改现价": "now", "现价": "now"}
 
 
-def parse_stance(text: str):
-    ms = STANCE_RE.findall(text or "")
-    if not ms:
+def _conf_value(m) -> float:
+    v = float(m.group(1))
+    if m.group(2) or v > 1:               # 写了 % 或数值 >1 按百分制理解（v1 会把 65 直接截成 1.0）
+        v = v / 100 if v <= 100 else 1.0
+    return max(0.0, min(1.0, v))
+
+
+def _stance_fields(seg: str):
+    """在单个【立场】段内逐字段提取；没有方向返回 None。_complete=置信度与周期齐全。"""
+    d = _DIR_RE.search(seg)
+    if not d:
         return None
-    d, tgt, sl, conf, hz = ms[-1]          # 取最后一次（辩论多轮时为最新观点）
-    out = {"direction": DIR_MAP[d], "target": _num(tgt), "stop": _num(sl),
-           "confidence": max(0.0, min(1.0, float(conf))), "horizon_days": int(hz), "source": "立场行"}
-    line = (text or "")[(text or "").rfind("【立场】"):].split("\n")[0]
-    em = ENTRY_RE.search(line)            # 可选：建议入场价位与条件
+    g = d.group(1)
+    out = {"direction": DIR_MAP.get(g) or DIR_MAP.get(g.lower())}
+    t, s = _TGT_RE.search(seg), _SL_RE.search(seg)
+    out["target"] = _num(t.group(1)) if t else None
+    out["stop"] = _num(s.group(1)) if s else None
+    c = _CONF_RE.search(seg)
+    out["confidence"] = _conf_value(c) if c else None
+    h = _HZ_RE.search(seg)
+    out["horizon_days"] = int(h.group(1)) if h else None
+    em = ENTRY_RE.search(seg)             # 可选：建议入场价位与条件
     if em:
         out["entry_px"] = _num(em.group(1))
         out["entry_condition"] = COND_MAP.get(em.group(2) or "", None)
-    pm = PEND_RE.search(line)
+    pm = PEND_RE.search(seg)
     if pm:
         out["pending_action"] = PEND_MAP[pm.group(1)]
+    out["_complete"] = c is not None and h is not None
     return out
+
+
+def parse_stance(text: str):
+    text = text or ""
+    idxs = [m.start() for m in re.finditer("【立场】", text)]
+    if not idxs:
+        return None
+    partial = None
+    for i in range(len(idxs) - 1, -1, -1):   # 自最后一个立场段向前找（辩论多轮时最新观点优先）
+        seg = text[idxs[i]: idxs[i + 1] if i + 1 < len(idxs) else len(text)].split("\n\n")[0]
+        f = _stance_fields(seg)
+        if not f:
+            continue
+        if f.pop("_complete"):
+            f["source"] = "立场行"
+            return f
+        if partial is None:
+            partial = f
+    if partial is None:
+        return None
+    partial.pop("_complete", None)
+    if partial["confidence"] is None:
+        partial["confidence"] = 0.5
+    partial["source"] = "立场行"
+    partial["partial"] = True
+    return partial
 
 
 RATING = {"buy": ("bullish", 0.8), "overweight": ("bullish", 0.6), "hold": ("neutral", 0.5),
@@ -216,3 +267,49 @@ def extract(fs: dict, cfg, tracker=None) -> dict:
 def _first_line(t: str) -> str:
     t = re.sub(r"[#*>`|]", "", t or "").strip()
     return t.split("\n")[0][:60] if t else ""
+
+
+# ---- 解析健康（2026-11-02）：降级不再静默 -------------------------------------
+# “降级”= 加权角色的立场没有走精确解析：LLM 粗抽、残缺立场（partial）或抽取失败。
+# 缺席/数据缺失是参与与数据问题（另有口径上报），不算解析降级。
+
+def degraded(s: dict) -> bool:
+    if not s:
+        return False
+    if s.get("partial") or s.get("status") == "failed":
+        return True
+    return str(s.get("source") or "").startswith(("LLM抽取", "抽取失败"))
+
+
+def _tier(s: dict) -> str:
+    src = str(s.get("source") or "")
+    if s.get("status") == "failed" or src.startswith("抽取失败"):
+        return "failed"
+    if src.startswith("LLM抽取"):
+        return "extracted"
+    if "结构化" in src:
+        return "structured"
+    if src.startswith("立场行"):
+        return "parsed"
+    return "other"
+
+
+def health(decisions, weights) -> dict:
+    """统计一组决策记录里加权角色（不含交易经理：执行角色，缺席另有 tm_absent_reason）的解析途径与降级清单。"""
+    tiers = {"parsed": 0, "structured": 0, "extracted": 0, "failed": 0, "other": 0}
+    bad = []
+    roles = [r for r in (weights or {}) if r != "trade_manager"]
+    for d in decisions or []:
+        st = d.get("stances") or {}
+        for r in roles:
+            s = st.get(r)
+            if not s:
+                continue
+            if s.get("status") in ("absent", "data_missing") or str(s.get("source") or "") == "无发言":
+                tiers["other"] += 1
+                continue
+            tiers[_tier(s)] += 1
+            if degraded(s):
+                bad.append({"inst_id": d.get("inst_id"), "role": r, "source": s.get("source"),
+                            "status": s.get("status"), "partial": bool(s.get("partial"))})
+    return {"tiers": tiers, "degraded": bad, "total": sum(tiers.values())}

@@ -224,6 +224,16 @@ def _prompt(cfg, coin, mk, pos, bk, st, w, S, texts, preview=None):
     from desk import analysis as _an
     _pb = _an.pending_brief(bk)
     lines += ["", _pb.replace(_an.PENDING_NOTE, "（以下是已挂出、尚未成交的条件入场单；如何处理见文末下单工具说明）")]
+    from desk import sessions as _sess
+    lines += ["", _sess.CADENCE_NOTE]
+    try:   # 近期止损披露（2026-11-05 用户决定：取消硬冷却改披露制，是否重开由交易经理知情后自行决定）；读取失败不阻断
+        from desk import stop_cooldown as _sc
+        _cside = "long" if S > 0 else ("short" if S < 0 else None)
+        _desc = _sc.describe(coin["inst_id"], _cside)
+        if _desc:
+            lines += ["", "## 近期止损披露", _desc]
+    except Exception:
+        pass
     lines += ["", f"## 各角色观点（权重为历史表现给出；加权共识 S={S:+.3f}，范围 -1~+1）",
                   f"你的角色：你不投票，权重不计。S={S:+.3f} 是全部投票角色按权重×置信度汇总的加权共识，方向由它决定，你不能翻转多空。"
                   "你是最终定点位和张数的人：综合下面所有角色意见和行情账户数据，用文末的下单工具给出这一单（或 hold/cancel_pending 否决）。"
@@ -372,6 +382,10 @@ def decide_and_execute(cfg, coin, trade_date, fs, st, tracker, source="daily") -
            "analysis_px": (ap or {}).get("px"), "analysis_px_time": (ap or {}).get("time"),
            "drift_check": agg.get("drift_check"), "drift_skipped": agg.get("drift_skipped"), "add_preview": preview,
            "stance_field_conflicts": {r: s["field_conflict"] for r, s in st.items() if s.get("field_conflict")} or None,
+           # 本 fork 的图没有独立 judge_decision 字段：研究经理对多空辩论的裁决即 investment_plan、
+           # 组合经理对风控辩论的裁决即 final_trade_decision，随决策记录一并落盘便于审计（2026-11-02）
+           "judge_texts": {k: v for k, v in (("research_manager", fs.get("investment_plan")),
+                                             ("portfolio_manager", fs.get("final_trade_decision"))) if v},
            "consensus_side": gate.get("consensus_side"), "tm_vetoed_consensus": gate.get("vetoed_consensus"),
            "tm_flip_blocked": gate.get("flip_blocked") or None,
            "config_hash": settings.config_hash(cfg), "playbook_versions": roles.versions(),   # L1 追溯

@@ -177,7 +177,8 @@ def analyze(cfg, coin: dict, trade_date: str, book: dict, tracker, extra_brief: 
     from desk import flows, tools, untrusted
     tools._AS_OF["date"] = trade_date
     ccy = coin["inst_id"].split("-")[0]
-    shared = position_brief(book, coin["inst_id"]) + "\n\n" + pending_brief(book)   # 所有角色共享：持仓 + 已挂条件单
+    from desk import sessions as _sess
+    shared = position_brief(book, coin["inst_id"]) + "\n\n" + pending_brief(book) + "\n\n" + _sess.CADENCE_NOTE   # 所有角色共享：持仓 + 已挂条件单 + 固定时间决策说明（2026-11-05 用户要求）
     if extra_brief:
         shared = (shared + "\n\n" + extra_brief).strip()
     roles.set_briefs({"*": shared})   # 资金流分析师在图外先运行，也要看到共享信息

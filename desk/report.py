@@ -435,6 +435,33 @@ def write(cfg, date, decisions, closed, reviews, weight_changes, pb_events, usag
             L.append(f"- 观察期结束保留：{ROLE_CN[e['role']]} v{e['version']:03d}（{_f(e['base'], pct=True)} → {_f(e['post'], pct=True)}）")
         else:
             L.append(f"- {ROLE_CN[e['role']]}：{e['type']} {e.get('why', '')}")
+    try:   # 立场解析健康（2026-11-02）：降级逐个点名；同角色连续两场降级单独告警。生成失败不阻断日报
+        from desk import stances as _stances
+        _h = _stances.health(decisions, w)
+        if _h["total"]:
+            _t = _h["tiers"]
+            L += ["", "### 立场解析健康", "",
+                  f"本场加权角色立场 {_h['total']} 条：立场行精确解析 {_t['parsed']} · 结构化 {_t['structured']} · "
+                  f"LLM 粗抽 {_t['extracted']} · 失败 {_t['failed']} · 缺席/数据缺失 {_t['other']}"]
+            for b in _h["degraded"]:
+                L.append(f"- ⚠️ 解析降级：{b['inst_id']} {CN.get(b['role'], b['role'])}"
+                         f"（来源：{b['source']}{'，残缺立场' if b['partial'] else ''}）")
+            try:
+                from desk import manager as _mgr
+                _cur_ids = {d.get("decision_id") for d in decisions}
+                _groups = {}
+                for _r in settings.read_jsonl(_mgr.DECISIONS):
+                    if _r.get("decision_id") not in _cur_ids:
+                        _groups.setdefault((_r.get("date"), _r.get("session")), []).append(_r)
+                if _groups:
+                    _last = sorted(_groups, key=lambda k: max(x.get("time", "") for x in _groups[k]))[-1]
+                    _prev_roles = {b["role"] for b in _stances.health(_groups[_last], w)["degraded"]}
+                    for _r in sorted({b["role"] for b in _h["degraded"]} & _prev_roles):
+                        L.append(f"- 🔴 连续两场解析降级：{CN.get(_r, _r)}（上一场 {_last[0]} {_last[1]} 亦未走精确解析）")
+            except Exception:
+                pass
+    except Exception:
+        pass
     if research:
         L += ["", f"### 每周自研（{research['week']}）", "",
               f"详见 research/report-{research['week']}.md；本次研究成本约 ${research.get('cost_usd', 0):.4f}，tokens {research.get('tokens', 0):,}"

@@ -171,7 +171,7 @@ risk:
   cost_buffer_pct: 0.002                # R1 止损距离额外加 0.2% 手续费与滑点缓冲
   max_price_drift_atr: 0.5              # D1 第 3 点：执行前最新价偏离分析价 > 0.5×ATR14 → 不执行（price_drift_skip）
   max_daily_bar_age_days: 2             # D1 第 2 点：最近一根已收盘日线（UTC）距今超过 2 天视为过期，不开仓（data_stale_no_trade）
-  stop_cooldown_hours: 24               # L6：同币某方向被止损后 24 小时内同向不开仓、不挂新条件单（cooldown_blocked）；反向不限；0=关闭
+  stop_cooldown_hours: 0                # L6：2026-11-05 用户决定由 24 改 0——取消止损后同向硬冷却，改信息披露制（最近一次止损写进交易经理提示词，是否同向重开由交易经理知情后自行决定，见 desk/stop_cooldown.describe）；止损记录照常写入 state/stop_cooldown.json 供披露；改回 >0 即恢复硬拦截
   min_rr_after_adjust: 1.5               # 开仓/早晚场调点后盈亏比 RR=止盈距/止损距（相对入场或持仓均价）不得低于 1.5；TM new_stop/new_tp 同一护栏
 
 # 2026-10-30 用户决定：是否加仓由交易经理权衡后决定
