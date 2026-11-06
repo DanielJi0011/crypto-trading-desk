@@ -404,7 +404,7 @@ def write(cfg, date, decisions, closed, reviews, weight_changes, pb_events, usag
           "| 角色 | 实用权重 | 影子权重 | 手册版本 | 已打分 | 命中率 | 近20 | 上涨市 | 下跌市 | 震荡市 | 止损有效/被洗出 | skill | Brier | 自带方案R(n) | 未触发 | 方向对齐 USDT |",
           "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     w_sh = settings.read_json(scoring.WEIGHTS_SHADOW, {})   # L1：学习冻结时实际决策用实用权重，影子权重只展示
-    st_by = {x["decision_id"]: x["stances"] for x in settings.read_jsonl(settings.STATE / "decisions.jsonl")}
+    st_by = {x["decision_id"]: x.get("stances", {}) for x in settings.read_jsonl(settings.STATE / "decisions.jsonl")}  # replay 记录（如 D-20261105-E-ETH-3）无 stances，缺省空 dict，方向归因跳过该记录
     for r in [k for k in ROLE_KEYS if k != "portfolio_manager"] + ["trade_manager"]:   # 组合经理只执行不投票，不列
         c = scoring.scorecard(r, trades, st_by)
         br = c["by_regime"]
