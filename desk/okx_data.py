@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import logging
+import random
+import threading
 import time
 
 import pandas as pd
@@ -17,6 +19,28 @@ log = logging.getLogger("desk.okx")
 _client = None
 _cache: dict = {}
 CACHE_TTL = 600
+
+# OKX 公共行情按 IP 限流（candles 40 次/2 秒、history-candles 20 次/2 秒，超限返回 50011）。
+# 2026-11-09 晚场事故：分析阶段多指标并发拉 K 线 + 翻页间隔仅 0.1 秒，瞬间打满 history-candles
+# 窗口，BTC/ETH 决策失败。对策：本进程内所有 K 线请求串行化并统一节流（相邻请求至少间隔
+# _PACE_INTERVAL 秒，叠加请求本身的网络耗时后稳低于 20 次/2 秒）；50011 在 _retry 里走
+# 指数退避，不再用短间隔整段硬重试。
+_candle_lock = threading.Lock()
+_last_candle_at = 0.0
+_PACE_INTERVAL = 0.15
+
+
+def _paced_candles(fn):
+    """在全局锁内执行一次 K 线请求，并与上一次 K 线请求保持最小间隔。"""
+    global _last_candle_at
+    with _candle_lock:
+        wait = _PACE_INTERVAL - (time.time() - _last_candle_at)
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            return fn()
+        finally:
+            _last_candle_at = time.time()
 
 
 class _NoCreds:
@@ -54,20 +78,21 @@ def candles(inst_id: str, bar: str = "1Dutc", days: int = 420) -> pd.DataFrame:
 
 def _candles(inst_id: str, bar: str = "1Dutc", days: int = 420) -> pd.DataFrame:
     """已收盘K线，升序。列：ts, Date(naive UTC 日期或时间), Open, High, Low, Close, Volume, VolumeUSDT"""
-    key = (inst_id, bar, days)
+    # 缓存按 (inst, bar) 存已拉到的最大窗口：不同指标/调用方要的天数不同（420/100/30…），
+    # 只要缓存窗口够大就切尾返回，不再按天数各拉一遍（同一场内同一币的重复拉取是 50011 的主因之一）。
+    key = (inst_id, bar)
     hit = _cache.get(key)
-    if hit and time.time() - hit[0] < CACHE_TTL:
-        return hit[1].copy()
+    if hit and time.time() - hit[0] < CACHE_TTL and len(hit[1]) >= days:
+        return hit[1].tail(days).reset_index(drop=True).copy()
     c = client()
-    rows = c.get_candles(inst_id, bar=bar, limit=300)
+    rows = _paced_candles(lambda: c.get_candles(inst_id, bar=bar, limit=300))
     after = rows[-1][0] if rows else None
     while len(rows) < days and after:
-        page = c.get_history_candles(inst_id, bar=bar, limit=100, after=after)
+        page = _paced_candles(lambda after=after: c.get_history_candles(inst_id, bar=bar, limit=100, after=after))
         if not page:
             break
         rows.extend(page)
         after = page[-1][0]
-        time.sleep(0.1)
     df = pd.DataFrame([r[:9] for r in rows], columns=["ts", "Open", "High", "Low", "Close", "Volume", "volCcy", "VolumeUSDT", "confirm"])
     df = df[df.confirm == "1"].copy()
     for k in ["Open", "High", "Low", "Close", "Volume", "VolumeUSDT"]:
@@ -76,20 +101,24 @@ def _candles(inst_id: str, bar: str = "1Dutc", days: int = 420) -> pd.DataFrame:
     df = df.drop_duplicates("ts").sort_values("ts").reset_index(drop=True)
     t = pd.to_datetime(df.ts, unit="ms", utc=True).dt.tz_localize(None)
     df["Date"] = t.dt.normalize() if bar.startswith("1D") else t
-    df = df[["ts", "Date", "Open", "High", "Low", "Close", "Volume", "VolumeUSDT"]].tail(days).reset_index(drop=True)
+    df = df[["ts", "Date", "Open", "High", "Low", "Close", "Volume", "VolumeUSDT"]].reset_index(drop=True)
     _cache[key] = (time.time(), df)
-    return df.copy()
+    return df.tail(days).reset_index(drop=True).copy()
 
 
 def _retry(fn, tries=4):
-    import time
     for i in range(tries):
         try:
             return fn()
-        except Exception:
+        except Exception as e:
             if i == tries - 1:
                 raise
-            time.sleep(2 * (i + 1))
+            if "50011" in str(e):
+                # OKX 限流：指数退避 + 抖动，给限流窗口留恢复时间；配合 _paced_candles 的节流，
+                # 重拉不会再把窗口打满（旧行为是 2/4/6 秒整段重拉，越限越压）。
+                time.sleep(min(30.0, 3 * (2 ** i)) + random.uniform(0, 1))
+            else:
+                time.sleep(2 * (i + 1))
 
 
 def funding_rate(inst_id: str) -> float:
