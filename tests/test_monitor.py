@@ -184,10 +184,38 @@ def test_stop_triggers_rediscuss_once_with_cooldown(env, monkeypatch):
     monitor.run_once(cfg)
     assert calls == [["--coin", "BTC", "--event", info["trade_id"], "--reason", "sl"]]
     tr = [t for t in ledger.store.read_trades() if t["trade_id"] == info["trade_id"]][0]
+    # 新语义（2026-11-09）：启动只记在途，未完成前重复调度不重复启动；完成落盘后才算已讨论
+    assert monitor.schedule_rediscuss(cfg, tr) == "再讨论进行中" and len(calls) == 1
+    assert monitor.complete_rediscuss(tr["inst_id"], tr["trade_id"]) is True
     assert monitor.schedule_rediscuss(cfg, tr) == "该事件已讨论过"
     ok, info2 = ledger.open_position(cfg, "BTC-USDT-SWAP", 200, 95.0, None, 5, "D2", "t", 1000)
     tr2 = dict(tr, trade_id=info2["trade_id"])
     assert monitor.schedule_rediscuss(cfg, tr2) == "冷却中" and len(calls) == 1
+
+
+def test_rediscuss_stale_inflight_resumes_and_spawn_failure_retries(env, monkeypatch):
+    cfg, ledger, monitor, pending, calls = env
+    tr = {"inst_id": "ETH-USDT-SWAP", "trade_id": "DEMO-999", "reason": "sl"}
+    assert monitor.schedule_rediscuss(cfg, tr) == "已启动" and len(calls) == 1
+    # 在途未超时 → 不重复启动
+    assert monitor.schedule_rediscuss(cfg, tr) == "再讨论进行中" and len(calls) == 1
+    # 在途超时（模拟子进程被杀）→ 续跑
+    st = settings.read_json(monitor.REDISCUSS, {})
+    stale = (settings.now() - dt.timedelta(hours=monitor.REDISCUSS_STALE_HOURS + 1)).strftime("%Y-%m-%d %H:%M:%S%z")
+    st["ETH-USDT-SWAP"]["inflight"]["DEMO-999"] = stale
+    st["ETH-USDT-SWAP"]["last"] = stale   # 冷却也已过，避免续跑被冷却挡住
+    settings.write_json(monitor.REDISCUSS, st)
+    assert monitor.schedule_rediscuss(cfg, tr) == "已启动" and len(calls) == 2
+    assert monitor.complete_rediscuss("ETH-USDT-SWAP", "DEMO-999") is True
+    assert monitor.schedule_rediscuss(cfg, tr) == "该事件已讨论过"
+    # 启动失败不留假在途 → 下次可重试
+    tr3 = {"inst_id": "SOL-USDT-SWAP", "trade_id": "DEMO-1000", "reason": "tp"}
+    monkeypatch.setattr(monitor, "SPAWN", lambda args, lf: (_ for _ in ()).throw(RuntimeError("boom")))
+    assert monitor.schedule_rediscuss(cfg, tr3) == "启动失败"
+    st = settings.read_json(monitor.REDISCUSS, {})
+    assert "DEMO-1000" not in st["SOL-USDT-SWAP"].get("inflight", {})
+    monkeypatch.setattr(monitor, "SPAWN", lambda args, lf: calls.append(args))
+    assert monitor.schedule_rediscuss(cfg, tr3) == "已启动"
 
 
 def test_aggregation_signed_and_pm_not_voting(env):

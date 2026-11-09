@@ -85,7 +85,10 @@ def test_shared_rediscuss_dedup_with_demo_watch(monkeypatch):
     t = {"inst_id": "DOGE-USDT-SWAP", "trade_id": "DEMO-888"}
     r1 = monitor.schedule_rediscuss(cfg, t)        # demo_watch 路径
     r2 = monitor.schedule_rediscuss(cfg, dict(t))  # WS 路径
-    assert r1 == "已启动" and r2 == "该事件已讨论过" and len(spawned) == 1
+    # 新语义（2026-11-09）：启动后在途未完成 → 不二次启动；完成落盘后才算已讨论过
+    assert r1 == "已启动" and r2 == "再讨论进行中" and len(spawned) == 1
+    assert monitor.complete_rediscuss(t["inst_id"], t["trade_id"]) is True
+    assert monitor.schedule_rediscuss(cfg, dict(t)) == "该事件已讨论过" and len(spawned) == 1
     t2 = {"inst_id": "DOGE-USDT-SWAP", "trade_id": "DEMO-889"}
     assert monitor.schedule_rediscuss(cfg, t2) == "冷却中"
 

@@ -98,9 +98,45 @@ def stats(rows=None) -> dict:
             "avg_rr": (sum(rr) / len(rr)) if rr else None, "rr_n": len(rr)}
 
 
+_VETO_MIN_ROLES = 3    # 定案门槛：同一周期至少 3 个不同角色有到期打分
+_VETO_TARGET_H = 5     # 定案周期：离 5 天最近者优先（台子的主打分周期）
+
+
+def _veto_outcome(ss):
+    """一组同决策的打分 → 定案用的事后价格结果（涨/跌/平）。
+
+    口径（2026-11-09 用户批准修改）：旧口径取排序后的第一条打分定案，实际等于由最先到期
+    的单个角色（多为 flows）说了算，样本单薄且口径任意。新口径：按周期分组，同一周期内
+    每个角色只取最新一条打分；只有角色数 ≥3 的周期才有资格定案，选离 5 天最近的周期
+    （并列时角色多者优先、再并列时周期长者优先）；该周期各角色 outcome 取中位数
+    （跌=-1、平=0、涨=1，偶数个取中间两值均值，均值落在 ±1 之内记平）。
+    无周期达标 → 返回 None（判定为“尚无结果”，等打分攒够再判，不硬判）。"""
+    by_h = {}
+    for s in ss:
+        if s.get("outcome") not in ("涨", "跌", "平"):
+            continue
+        slot = by_h.setdefault(s.get("horizon"), {})
+        prev = slot.get(s.get("role"))
+        if prev is None or str(s.get("scored_at") or "") >= str(prev.get("scored_at") or ""):
+            slot[s.get("role")] = s
+    cand = [(h, m) for h, m in by_h.items() if len(m) >= _VETO_MIN_ROLES]
+    if not cand:
+        return None
+
+    def keyf(item):
+        h, m = item
+        hv = _VETO_TARGET_H if h is None else h
+        return (abs(hv - _VETO_TARGET_H), -len(m), -hv)
+
+    h, m = min(cand, key=keyf)
+    vals = sorted({"跌": -1, "平": 0, "涨": 1}[s["outcome"]] for s in m.values())
+    n = len(vals)
+    med = vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2
+    return "涨" if med >= 1 else ("跌" if med <= -1 else "平")
+
+
 def veto_stats(decs=None, scores=None) -> dict:
-    """交易经理否决共识后的结果：用该决策的打分 outcome 判断共识方向事后是否落空。
-    优先取该决策交易经理立场的打分 outcome，没有则取该决策任一角色的打分（同一决策同一周期的价格结果相同）。"""
+    """交易经理否决共识后的结果：用该决策的打分 outcome 判断共识方向事后是否落空（定案口径见 _veto_outcome）。"""
     decs = settings.read_jsonl(DECISIONS) if decs is None else decs
     scores = (settings.read_jsonl(SCORES) if SCORES.exists() else []) if scores is None else scores
     vetoes = [d for d in decs if d.get("tm_vetoed_consensus")]
@@ -110,14 +146,12 @@ def veto_stats(decs=None, scores=None) -> dict:
     right = wrong = 0
     for d in vetoes:
         side = d.get("consensus_side")
-        ss = by.get(d.get("decision_id")) or []
-        ss = sorted([x for x in ss if x.get("outcome") in ("涨", "跌", "平")], key=lambda x: x.get("role") != "trade_manager")
-        ok = None
-        if ss and side:   # outcome：事后价格结果（涨/跌/平，带宽随 ATR）；共识方向是否兑现
-            ok = ss[0]["outcome"] == ("涨" if side == "long" else "跌")
-        if ok is None:
+        if not side:
             continue
-        if ok:
+        outcome = _veto_outcome(by.get(d.get("decision_id")) or [])
+        if outcome is None:
+            continue
+        if outcome == ("涨" if side == "long" else "跌"):
             wrong += 1     # 共识方向事后对了 → 否决错过行情
         else:
             right += 1     # 共识方向事后落空 → 否决避开亏损

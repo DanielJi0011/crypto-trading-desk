@@ -179,14 +179,22 @@ def test_ledger_idempotent_and_fields(ledger_clean):
 
 
 def test_veto_stats(ledger_clean):
+    # 新口径（2026-11-09）：同一周期 ≥3 个角色打分才定案，outcome 取中位数；单角色打分不定案
     L = ledger_clean
     decs = [{"decision_id": "D1", "tm_vetoed_consensus": True, "consensus_side": "short"},
             {"decision_id": "D2", "tm_vetoed_consensus": True, "consensus_side": "short"},
-            {"decision_id": "D3", "tm_vetoed_consensus": True, "consensus_side": "long"}]
-    sc = [{"decision_id": "D1", "role": "trade_manager", "outcome": "平"},
-          {"decision_id": "D2", "role": "market_analyst", "outcome": "跌"}]
+            {"decision_id": "D3", "tm_vetoed_consensus": True, "consensus_side": "long"},
+            {"decision_id": "D4", "tm_vetoed_consensus": True, "consensus_side": "short"}]
+    sc = ([{"decision_id": "D1", "role": r, "horizon": 5, "outcome": o}
+           for r, o in (("trade_manager", "平"), ("market", "平"), ("flows", "跌"))] +          # 中位数 平 → 共识空落空 → 否决对
+          [{"decision_id": "D2", "role": "flows", "horizon": 3, "outcome": "跌"}] +              # 只有 1 个角色 → 不定案
+          [{"decision_id": "D3", "role": r, "horizon": 5, "outcome": o}
+           for r, o in (("market", "涨"), ("flows", "涨"), ("news", "平"))] +                    # 中位数 涨 → 共识多兑现 → 否决错
+          [{"decision_id": "D4", "role": r, "horizon": 3, "outcome": "跌"} for r in ("a", "b", "c", "d", "e")] +
+          [{"decision_id": "D4", "role": r, "horizon": 5, "outcome": o}
+           for r, o in (("a", "涨"), ("b", "涨"), ("c", "平"))])                                  # 周期优先 5 天而非角色多的 3 天 → 涨 → 否决对
     v = L.veto_stats(decs, sc)
-    assert v == {"n": 3, "judged": 2, "veto_right": 1, "veto_wrong": 1}
+    assert v == {"n": 4, "judged": 3, "veto_right": 2, "veto_wrong": 1}
 
 
 def test_report_section_and_review(ledger_clean, monkeypatch):

@@ -69,6 +69,9 @@ def main(argv=None):
     settings.write_json(settings.STATE / "usage" / f"rediscuss-{dllm.RUN_ID}.json", usage)
     okx_demo.log_event("rediscuss_done", inst_id=coin["inst_id"], trade_id=a.event, reason=a.reason, decision_id=rec["decision_id"], action=rec["final_action"],
                   consensus=rec["consensus"], cost_usd=usage.get("cost_usd"), calls=usage.get("calls"))
+    if a.event:   # 决策已落盘 → 把事件从在途标记为已完成（monitor 的续跑语义靠这一步；HALT/异常退出不走这里，会被超时续跑）
+        from desk import monitor as _mon
+        _mon.complete_rediscuss(coin["inst_id"], a.event)
     print(f"[rediscuss] {coin['inst_id']}（{REASON_CN[a.reason]}后）S={rec['consensus']:+.3f} → {rec['final_action']}；{'；'.join(rec['notes'])}；"
           f"LLM {usage['calls']} 次 ${usage['cost_usd']:.4f}", flush=True)
     return 0

@@ -55,7 +55,9 @@ def test_schedule_tp_dedup_cooldown_and_reason(monkeypatch):
     cfg = settings.load_config()
     t = {"inst_id": "SOL-USDT-SWAP", "trade_id": "DEMO-910", "reason": "tp"}
     assert monitor.schedule_rediscuss(cfg, t) == "已启动"
-    assert monitor.schedule_rediscuss(cfg, dict(t)) == "该事件已讨论过"   # 每笔止盈只讨论一次
+    assert monitor.schedule_rediscuss(cfg, dict(t)) == "再讨论进行中"   # 在途未完成不二次启动（2026-11-09 新语义）
+    assert monitor.complete_rediscuss(t["inst_id"], t["trade_id"]) is True
+    assert monitor.schedule_rediscuss(cfg, dict(t)) == "该事件已讨论过"   # 完成落盘后：每笔止盈只讨论一次
     assert monitor.schedule_rediscuss(cfg, {**t, "trade_id": "DEMO-911"}) == "冷却中"   # 6 小时冷却沿用
     assert spawned == [["--coin", "SOL", "--event", "DEMO-910", "--reason", "tp"]]
     ev = [json.loads(l) for l in X.EVENTS.read_text().splitlines()] if hasattr(X, "EVENTS") and X.EVENTS.exists() else []
