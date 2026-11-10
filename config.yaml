@@ -199,6 +199,15 @@ manager:
   allow_stop_widen: false               # 已有持仓只允许上移止损，不允许放宽
   tp_min_gap_pct: 0.3                   # 交易经理 new_tp：新止盈须在现价盈利一侧且距现价至少 0.3%，避免改完立即触发（可调近可调远）
   tm_no_vote_weight: true               # 2026-10-30 方案一：交易经理不投票、不计权重、不参与权重学习；方向由其余投票角色加权共识 S 决定，交易经理只能否决不能翻转多空；false=旧行为（交易经理作为一票计入）
+  # 趋势市执行规则 A+（2026-11-11 用户批准）：只改趋势市里交易经理的入场方式（现价或近价触发），不改否决门槛与任何硬护栏；trend_rule_enabled=false 即整段回滚到提案前行为（提示词段、判定注入、距离护栏同时失效）
+  trend_rule_enabled: true              # A+ 总开关
+  trend_consensus: 0.30                 # 趋势市条件①：|加权共识 S| ≥ 0.30
+  trend_min_votes: 7                    # 趋势市条件②：同向投票角色 ≥ 7（共 11 个）
+  trend_ret20d_pct: 3.0                 # 趋势市条件③：20 日涨跌幅同向 ≥ 3%（做空 ≤ −3%），且 5 日同向不反转（做空 ≤ 0%）
+  trend_near_atr: 0.3                   # 趋势市近价：pending 触发价距现价 ≤ 0.3×ATR14，超出被 validate 退回
+  trend_oversold_lo_pct: 0.5            # 超卖降级：现价距 20 日极值（空头看低点）≤ 0.5% 即降级
+  trend_oversold_ret5d_pct: 8.0         # 超卖降级：5 日同向涨跌幅 ≥ 8%（做空 ≤ −8%）即降级
+  trend_oversold_risk_scale: 0.5        # 超卖降级：禁用现价 open，只许近价 pending，且 risk_scale ≤ 0.5
 
 # 止损止盈参考点位与同价位判定（desk/sizing.py）
 sizing:
