@@ -155,15 +155,22 @@ def _ct_val(inst, cache) -> float:
     return cache[inst]
 
 
+def drop_excluded(cache: dict) -> dict:
+    """清掉缓存里已排除的交易（排除清单生效前已写入的行，下次同步时不再出现）。"""
+    from desk import excluded_trades
+    return {k: v for k, v in cache.items() if not excluded_trades.is_excluded(k)}
+
+
 def closed_trades(rows: list[dict] | None = None, ct_vals: dict | None = None, use_cache=True) -> list[dict]:
     """模拟盘已平仓交易（不含冒烟测试单）。rows=None 时只读调用 OKX 模拟盘；失败则退回缓存。"""
     from desk import demo_exec, okx_demo as X
+    from desk import excluded_trades
     cache = settings.read_json(CACHE, {}) if use_cache else {}
     if rows is None:
         try:
             rows = _api_rows()
         except Exception:
-            return sorted(cache.values(), key=lambda t: t["exit_time"])
+            return sorted(drop_excluded(cache).values(), key=lambda t: t["exit_time"])
     events = settings.read_jsonl(X.EVENTS)
     ws = settings.read_jsonl(settings.STATE / "ledger" / "demo_ws_events.jsonl")
     reg, papers, cts = demo_exec.reg(), paper_trades(), dict(ct_vals or {})
@@ -174,7 +181,10 @@ def closed_trades(rows: list[dict] | None = None, ct_vals: dict | None = None, u
         if info["test"]:
             continue
         t = to_trade(row, info, _ct_val(row["instId"], cts), ws)
+        if excluded_trades.is_excluded(t["trade_id"]):
+            continue          # 用户排除的交易：不进缓存、不复盘、不记账
         cache[t["trade_id"]] = t
+    cache = drop_excluded(cache)
     if use_cache:
         settings.write_json(CACHE, cache)
     return sorted(cache.values(), key=lambda t: t["exit_time"])
@@ -182,12 +192,12 @@ def closed_trades(rows: list[dict] | None = None, ct_vals: dict | None = None, u
 
 def review_candidates(cfg, reviewed: set, demo: bool) -> list[dict]:
     """待复盘：本地纸面账本 closed（旧 BTC/ETH 纸面仓仍可能平仓）+ 模拟盘平仓，按 trade_id 去重。"""
-    from desk import ledger
+    from desk import excluded_trades, ledger
     out, seen = [], set(reviewed)
     pool = [t for t in ledger.store.read_trades() if t["status"] == "closed"]
     if demo:
         pool += closed_trades()
     for t in pool:
-        if t["trade_id"] not in seen:
+        if t["trade_id"] not in seen and not excluded_trades.is_excluded(t["trade_id"]):
             seen.add(t["trade_id"]); out.append(t)
     return out

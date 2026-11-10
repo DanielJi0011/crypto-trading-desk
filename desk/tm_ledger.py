@@ -74,6 +74,7 @@ def read() -> list[dict]:
 
 def record_closed(cfg, trades) -> list[dict]:
     """写入新平仓（已存在的 trade_id 跳过，保证幂等）。返回本次新写入的行。"""
+    from desk import excluded_trades
     if not enabled(cfg):
         return []
     seen = {x.get("trade_id") for x in read()}
@@ -81,6 +82,8 @@ def record_closed(cfg, trades) -> list[dict]:
     for t in trades or []:
         if t.get("status", "closed") != "closed" or not t.get("trade_id") or t["trade_id"] in seen or t.get("exit_px") in (None, ""):
             continue
+        if excluded_trades.is_excluded(t["trade_id"]):
+            continue          # 用户排除的交易不记账（2026-11-09 外国交易清除）
         decs = settings.read_jsonl(DECISIONS) if decs is None else decs
         row = entry_of(t, decs)
         PATH.parent.mkdir(parents=True, exist_ok=True)

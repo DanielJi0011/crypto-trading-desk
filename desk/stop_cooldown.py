@@ -28,6 +28,9 @@ def _dir(side: str | None, pos_side: str | None) -> str | None:
 
 
 def record(inst_id: str, side: str | None, pos_side: str | None = None, algo_id=None, now: float | None = None) -> str | None:
+    from desk import excluded_trades
+    if algo_id is not None and excluded_trades.is_excluded_algo(algo_id):
+        return None           # 用户排除的交易的止损不记录、不披露
     d = _dir(side, pos_side)
     if not inst_id or not d:
         return None
