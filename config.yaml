@@ -188,6 +188,7 @@ pending:
   immediate_band_pct: 0.3               # 聚合入场价距现价 ≤0.3% 视为现价成交
   rediscuss_after_stop: true            # 监控中止损后，后台对该币跑一次全角色讨论设定下次入场
   rediscuss_cooldown_hours: 6
+  rr_recheck_enabled: true              # 开仓后 RR 复核（2026-11-11）：新开仓按实际成交价重算 RR，< risk.min_rr_after_adjust 时对该仓位触发一次再讨论（desk/rr_recheck.py；首次运行只给已有持仓建基线、不追溯）；false=关闭检测与触发
 
 manager:
   # 加权共识分 S ∈ [-1,1]：S = Σ w_i·方向_i·置信度_i / Σ w_i

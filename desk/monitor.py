@@ -82,7 +82,9 @@ def SPAWN(args: list[str], logfile):
 
 # ---------------- 止损后再讨论（后台、每个止损事件至多一次 + 冷却）
 def schedule_rediscuss(cfg, trade: dict) -> str:
-    """止损/止盈→再讨论（trade["reason"] 为 "sl" 或 "tp"，缺省 "sl"）。demo_watch（轮询）与 demo_ws（WebSocket）共用：trade_id 统一为 'DEMO-<algoId>'，
+    """止损/止盈→再讨论（trade["reason"] 为 "sl" 或 "tp"，缺省 "sl"）；reason="rr_recheck" 为开仓后 RR 复核
+    （desk/rr_recheck.py，trade_id='DEMO-<posId>'，可带 trade["detail"] 事实包随事件存档；豁免跨事件冷却，见下）。
+    demo_watch（轮询）与 demo_ws（WebSocket）共用：trade_id 统一为 'DEMO-<algoId>'，
     已完成记录、在途记录与 6h 冷却都在 rediscuss.json；用文件锁保证跨进程同一笔止损只触发一次。
     标记语义（2026-11-09）：启动只记在途，子进程决策落盘后由 complete_rediscuss 移入已完成；在途超时（REDISCUSS_STALE_HOURS）视为进程已死可续跑。"""
     import fcntl
@@ -115,6 +117,8 @@ def complete_rediscuss(inst: str, trade_id: str) -> bool:
             del inflight[trade_id]
             if trade_id not in s["events"]:
                 s["events"].append(trade_id)
+            if s.get("details"):
+                s["details"].pop(trade_id, None)   # rr_recheck 的事实包随完成一并清理
             settings.write_json(REDISCUSS, st)
             return True
         finally:
@@ -133,12 +137,14 @@ def _schedule_rediscuss_locked(cfg, trade: dict) -> str:
     if trade["trade_id"] in s["events"]:
         return "该事件已讨论过"
     now = settings.now()
-    reason = "tp" if trade.get("reason") == "tp" else "sl"
+    reason = trade.get("reason") if trade.get("reason") in ("tp", "rr_recheck") else "sl"
 
     def _spawn() -> str:
         prev_last = s.get("last")
         s["last"] = settings.now_str()
         inflight[trade["trade_id"]] = s["last"]
+        if trade.get("detail"):
+            s.setdefault("details", {})[trade["trade_id"]] = trade["detail"]   # rr_recheck：事实包随事件存档，rediscuss 子进程读取
         settings.write_json(REDISCUSS, st)
         settings.LOGS.mkdir(parents=True, exist_ok=True)
         try:
@@ -146,6 +152,8 @@ def _schedule_rediscuss_locked(cfg, trade: dict) -> str:
                   settings.LOGS / f"rediscuss-{settings.today()}.log")
         except Exception as e:   # 启动失败不留假在途、也不起冷却，下个巡检周期可重试
             inflight.pop(trade["trade_id"], None)
+            if s.get("details"):
+                s["details"].pop(trade["trade_id"], None)
             s["last"] = prev_last
             settings.write_json(REDISCUSS, st)
             okx_demo.log_event("rediscuss_spawn_failed", inst_id=inst, trade_id=trade["trade_id"], reason=str(e)[:200])
@@ -165,7 +173,9 @@ def _schedule_rediscuss_locked(cfg, trade: dict) -> str:
         # 同一事件的续跑不受冷却约束：冷却只拦新事件，续跑被冷却挡住等于又把这次讨论吞掉
         okx_demo.log_event("rediscuss_resume", inst_id=inst, trade_id=trade["trade_id"], reason="在途超时未完成，续跑")
         return _spawn()
-    if s["last"] and now - _dt.datetime.strptime(s["last"], "%Y-%m-%d %H:%M:%S%z") < _dt.timedelta(hours=float(P["rediscuss_cooldown_hours"])):
+    # rr_recheck 豁免跨事件冷却：冷却是为止损后防 LLM 连环触发设的；RR 复核是活仓位几何异常的安全复核，
+    # 且每仓至多一次（rr_recheck.json 的 pkey 状态 + 此处 events 去重双重保证），被冷却吞掉等于没补上这个复核。
+    if reason != "rr_recheck" and s["last"] and now - _dt.datetime.strptime(s["last"], "%Y-%m-%d %H:%M:%S%z") < _dt.timedelta(hours=float(P["rediscuss_cooldown_hours"])):
         s["events"].append(trade["trade_id"])   # 冷却跳过与旧行为一致：记为已处理，不再重试
         settings.write_json(REDISCUSS, st)
         pending.event("再讨论跳过", inst, trade_id=trade["trade_id"], reason=f"冷却期 {P['rediscuss_cooldown_hours']}h 内", trigger=trade.get("reason", "sl"))

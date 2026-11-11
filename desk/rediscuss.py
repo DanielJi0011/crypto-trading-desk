@@ -12,11 +12,26 @@ import sys
 from desk import settings
 
 
-REASON_CN = {"sl": "止损", "tp": "止盈"}
+REASON_CN = {"sl": "止损", "tp": "止盈", "rr_recheck": "盈亏比复核"}
 
 
-def reason_brief(reason: str, event: str) -> str:
-    """传给全部角色的触发原因说明。"""
+def _fmt(x) -> str:
+    return "未知" if x is None else f"{float(x):.6g}"
+
+
+def reason_brief(reason: str, event: str, detail: dict | None = None) -> str:
+    """传给全部角色的触发原因说明。rr_recheck 时 detail 为开仓后 RR 复核的事实包（desk/rr_recheck.py 写入）。"""
+    if reason == "rr_recheck":
+        d = detail or {}
+        return (f"## 本次再讨论的触发原因：开仓后盈亏比复核（事件 {event}）\n"
+                f"刚开仓的这笔仓位实际成交价偏离了计划入场价：计划入场 {_fmt(d.get('planned_entry'))}"
+                f"（限价 {_fmt(d.get('limit_px'))}，按计划价算的盈亏比 RR={_fmt(d.get('planned_rr'))}），"
+                f"实际成交均价 {_fmt(d.get('fill'))}；止损 {_fmt(d.get('sl'))}（距成交价 {_fmt(d.get('sl_dist'))}）、"
+                f"止盈 {_fmt(d.get('tp'))}（距成交价 {_fmt(d.get('tp_dist'))}）是下单时按计划价定的绝对价，"
+                f"没有随实际成交价移动，因此按实际成交价计算的盈亏比只有 RR={_fmt(d.get('rr'))}，"
+                f"低于护栏下限 {_fmt(d.get('min_rr'))}。\n"
+                "本次讨论的任务：处置这笔已经开着的仓位——调整止损止盈（止损只许收紧）、减仓或平仓，"
+                "或者明确说明保持不变的理由。不要把本次复核当作反向开仓信号，也不要同向加仓放大这笔仓位的风险。")
     if reason == "tp":
         return (f"## 本次再讨论的触发原因：止盈成交（事件 {event}）\n"
                 "上一笔仓位刚在止盈价平仓，本次讨论的任务是定下一次入场点位。注意避免追单：价格已朝原方向走完一段，"
@@ -29,7 +44,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--coin", required=True)
     ap.add_argument("--event", default="")
-    ap.add_argument("--reason", choices=("sl", "tp"), default="sl")   # 触发原因：止损 / 止盈
+    ap.add_argument("--reason", choices=("sl", "tp", "rr_recheck"), default="sl")   # 触发原因：止损 / 止盈 / 开仓后 RR 复核
     ap.add_argument("--mock", action="store_true")
     a = ap.parse_args(argv)
     if a.mock:
@@ -58,10 +73,16 @@ def main(argv=None):
     if demo_exec.is_demo(cfg):
         okx_demo.startup(cfg)
     bk = demo_exec.book(cfg, prices) if demo_exec.is_demo(cfg) else ledger.book(cfg, prices)
-    res = analysis.analyze(cfg, coin, date, bk, tracker, extra_brief=reason_brief(a.reason, a.event))
+    detail = None
+    if a.reason == "rr_recheck" and a.event:   # 事实包由 monitor.schedule_rediscuss 随事件存进 rediscuss.json
+        from desk import monitor as _mon0
+        _st = settings.read_json(_mon0.REDISCUSS, {})
+        detail = ((_st.get(coin["inst_id"]) or {}).get("details") or {}).get(a.event)
+    res = analysis.analyze(cfg, coin, date, bk, tracker, extra_brief=reason_brief(a.reason, a.event, detail))
     fs = res["final_state"]; fs["_signal"] = res["signal"]
     st = stances.extract(fs, cfg, tracker)
-    rec = manager.decide_and_execute(cfg, coin, date, fs, st, tracker, source=f"{'post_tp' if a.reason == 'tp' else 'post_stop'}:{a.event}")
+    _src = {"tp": "post_tp", "sl": "post_stop", "rr_recheck": "rr_recheck"}[a.reason]
+    rec = manager.decide_and_execute(cfg, coin, date, fs, st, tracker, source=f"{_src}:{a.event}")
     rec["trigger_reason"] = a.reason
     rec["report_dir"] = res["report_dir"]
     scoring.record_stances(cfg, rec)

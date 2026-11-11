@@ -263,6 +263,14 @@ def run_once(cfg, source: str = "demo_watch 轮询") -> dict:
     except Exception as e:
         log(f"下单对账失败 {type(e).__name__}: {e}")
         X.log_event("reconcile_error", error=str(e)[:300])
+    # 2d) 开仓后 RR 复核：实际成交价偏离计划价使 RR 低于下限 → 对该仓位触发一次再讨论（desk/rr_recheck.py；HALT 时只登记不触发）
+    try:
+        from desk import rr_recheck
+        for line in rr_recheck.check(cfg, halt=halt):
+            log(line)
+    except Exception as e:
+        log(f"开仓后 RR 复核失败 {type(e).__name__}: {e}")
+        X.log_event("rr_recheck_error", error=str(e)[:300])
     # 3) 止损/止盈检测 → 再讨论
     from desk.monitor import schedule_rediscuss
     cur = int(r["watch"].get("last_algo_uts") or int(now.timestamp() * 1000))
