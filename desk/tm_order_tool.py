@@ -146,25 +146,26 @@ def validate(cfg, call: OrderToolCall, ctx: dict) -> list[str]:
             errs.append(f"[DIRECTION] 现有持仓方向 {pos.get('side')}，不反手（须先 close）")
         if errs:
             return errs
-    # 3.5) A+ 趋势市护栏（2026-11-11 用户批准）：只在代码判定趋势市成立、且下单方向与趋势方向一致时生效；
-    #      非趋势市完全不触发。作用域 = 新入场 open/pending/replace_pending（keep_pending 沿用原单，不在此列）。
+    # 3.5) 趋势市护栏（2026-11-11 改版：判定来源为 LLM 行情判定，desk/regime_judge）：只在本场判定生效
+    #      （方向与下单方向一致且强度 strong/moderate）时触发；判定失败/无趋势完全不触发。
+    #      作用域 = 新入场 open/pending/replace_pending（keep_pending 沿用原单，不在此列）。
     tr = ctx.get("trend") or {}
-    if tr.get("enabled") and tr.get("trend") and a in ("open", "pending", "replace_pending") and call.side == tr.get("side"):
+    if tr.get("enabled") and tr.get("active") and a in ("open", "pending", "replace_pending") and call.side == tr.get("side"):
         tc = tr.get("cfg") or {}
         atr, last = float(mk.get("atr14") or 0), float(mk["last"])
         rs = float(call.risk_scale if call.risk_scale is not None else 1.0)
         rs_cap = float(tc.get("oversold_risk_scale", 0.5))
-        if tr.get("oversold"):
+        if tr.get("downgrade"):
             if a == "open":
-                errs.append("[TREND_OVERSOLD] 趋势市超卖降级中：禁用现价 open，只许近价 pending"
+                errs.append("[TREND_OVERSOLD] 本场行情判定为末段衰竭（late_exhaustion）降级中：禁用现价 open，只许近价 pending"
                             f"（触发价距现价≤{float(tc.get('near_atr', 0.3)):g}×ATR14），且 risk_scale≤{rs_cap:g}")
             if rs > rs_cap + 1e-12:
-                errs.append(f"[TREND_OVERSOLD] 趋势市超卖降级中：risk_scale={rs:g} 超过降级上限 {rs_cap:g}，请改小后重试")
+                errs.append(f"[TREND_OVERSOLD] 本场行情判定为末段衰竭（late_exhaustion）降级中：risk_scale={rs:g} 超过降级上限 {rs_cap:g}，请改小后重试")
         if a in ("pending", "replace_pending") and atr > 0 and _num(call.trigger_px):
             cap = float(tc.get("near_atr", 0.3)) * atr
             dist = abs(float(call.trigger_px) - last)
             if dist > cap + 1e-9:
-                errs.append(f"[TREND_DIST] 趋势市近价护栏：触发价 {float(call.trigger_px):g} 距现价 {last:g} 为 {dist:.6g}，"
+                errs.append(f"[TREND_DIST] 趋势市近价护栏（依本场 LLM 行情判定）：触发价 {float(call.trigger_px):g} 距现价 {last:g} 为 {dist:.6g}，"
                             f"超过上限 {float(tc.get('near_atr', 0.3)):g}×ATR14={cap:.6g}；允许触发价范围 "
                             f"{last - cap:.6g}~{last + cap:.6g}（gte 小反弹或 lte 跌破均可），请改近后重试，"
                             "或改用 open 现价入场，不要改成 hold 绕过")
@@ -404,14 +405,17 @@ def instructions(ctx: dict, cfg=None) -> str:
     tr = ctx.get("trend") or {}
     if tr.get("enabled"):
         _na = float((tr.get("cfg") or {}).get("near_atr", 0.3))
-        lines.append(f"趋势市（定义见提示词）时请按趋势市执行规则选 open 或近价 pending；近价指触发价距现价≤{_na:g}×ATR14。")
+        lines.append(f"趋势市（以提示词中「本场行情判定（LLM）」为准）时请按趋势市执行规则选 open 或近价 pending；近价指触发价距现价≤{_na:g}×ATR14。")
         lines.append(f"趋势市里 pending 触发价距现价超过 {_na:g}×ATR14 会被校验退回并注明允许范围，请改近后重试，不要改成 hold 绕过。")
-        if tr.get("trend"):
+        if tr.get("active"):
+            _j = tr.get("judge") or {}
             _atr, _last = float(ctx["mk"].get("atr14") or 0), float(ctx["mk"]["last"])
             _cap = _na * _atr
-            lines.append(f"本币趋势市判定（代码计算）：{'空头' if tr.get('side') == 'short' else '多头'}趋势市成立，"
-                         f"超卖降级={'是' if tr.get('oversold') else '否'}；现价 {_last:g}，"
+            lines.append(f"本币本场行情判定（LLM）：{'空头' if tr.get('side') == 'short' else '多头'}趋势生效"
+                         f"（强度 {_j.get('strength')}，阶段 {_j.get('stage')}），末段衰竭降级={'是' if tr.get('downgrade') else '否'}；现价 {_last:g}，"
                          f"近价触发允许范围 {_last - _cap:.6g}~{_last + _cap:.6g}。")
+        elif tr.get("failed"):
+            lines.append("本币本场行情判定失败：趋势市规则不生效，按常规规则下单。")
     return "\n".join(lines)
 
 

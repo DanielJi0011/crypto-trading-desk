@@ -5,7 +5,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, PrivateAttr
 
-from desk import add_position, drift, ledger, okx_data, roles, settings, tm_order_tool
+from desk import add_position, drift, ledger, okx_data, regime_judge, roles, settings, tm_order_tool
 from desk import llm as dllm
 from desk.roles import INIT_WEIGHT, ROLE_CN, ROLE_KEYS
 from desk.stances import INVALID_STATUS, normalize as _norm_stance, role_texts, stance_status
@@ -37,97 +37,10 @@ def voters(cfg=None) -> list:
     return [r for r in VOTERS if r != "trade_manager"] if tm_no_vote(cfg if cfg is not None else settings.load_config()) else list(VOTERS)
 
 
-# ------------------------------------------------------------------ 趋势市执行规则 A+（2026-11-11 用户批准）
-# 只改趋势市里交易经理的入场方式：趋势市成立时不许把唯一入场押在远反弹位上，必须现价 open 或
-# 近价 pending（≤trend_near_atr×ATR14）；超卖降级时禁用 open、risk_scale 封顶。否决门槛与硬护栏不动。
-# 阈值在 config.yaml manager 段；trend_rule_enabled=false 即整段回滚（判定注入、提示词段、validate 护栏同时失效）。
-
-def trend_cfg(cfg) -> dict:
-    M = _mcfg(cfg)
-    return {"enabled": bool(M.get("trend_rule_enabled", True)),
-            "consensus": float(M.get("trend_consensus", 0.30)),
-            "min_votes": int(M.get("trend_min_votes", 7)),
-            "ret20d_pct": float(M.get("trend_ret20d_pct", 3.0)),
-            "near_atr": float(M.get("trend_near_atr", 0.3)),
-            "oversold_lo_pct": float(M.get("trend_oversold_lo_pct", 0.5)),
-            "oversold_ret5d_pct": float(M.get("trend_oversold_ret5d_pct", 8.0)),
-            "oversold_risk_scale": float(M.get("trend_oversold_risk_scale", 0.5))}
-
-
-def trend_regime(mk, S, st, w=None, cfg=None) -> dict:
-    """趋势市机械判定（只用 TM 提示词里实际出现的数据：S、同向票数、ret_5d/ret_20d、20 日区间位置）。
-    做空四条全中才成立（做多镜像）：①|S|≥trend_consensus 且空头同向；②同向票 ≥trend_min_votes；
-    ③ret_20d 同向 ≥trend_ret20d_pct 且 ret_5d 同向不反转；④现价在 20 日区间同向半部（空=下半部）。
-    超卖降级（独立标记）：现价距 20 日同向极值 ≤oversold_lo_pct，或 ret_5d 同向 ≥oversold_ret5d_pct。"""
-    tc = trend_cfg(cfg)
-    out = {"enabled": tc["enabled"], "trend": False, "side": None, "oversold": False, "cfg": tc,
-           "S": round(float(S or 0), 4), "votes": {"long": 0, "short": 0}, "pos_in_range": None, "edge_pct": None}
-    if not tc["enabled"]:
-        return out
-    vv = valid_voters(st or {}, w)
-    for r in vv:
-        d = ((st or {}).get(r) or {}).get("direction")
-        if d == "bullish":
-            out["votes"]["long"] += 1
-        elif d == "bearish":
-            out["votes"]["short"] += 1
-    last, hi, lo = float(mk["last"]), float(mk["hi_20"]), float(mk["lo_20"])
-    r5, r20 = float(mk["ret_5d"]), float(mk["ret_20d"])
-    if hi > lo:
-        out["pos_in_range"] = (last - lo) / (hi - lo)
-    for side, sg in (("short", -1), ("long", 1)):
-        if sg * float(S or 0) < tc["consensus"]:
-            continue
-        if out["votes"]["short" if side == "short" else "long"] < tc["min_votes"]:
-            continue
-        if sg * r20 < tc["ret20d_pct"] or sg * r5 < 0:
-            continue
-        pos = out["pos_in_range"]
-        if pos is None or (pos > 0.5 if side == "short" else pos < 0.5):
-            continue
-        out.update(trend=True, side=side)
-        edge = (last - lo) / last * 100 if side == "short" else (hi - last) / last * 100
-        out["edge_pct"] = round(edge, 3)
-        out["oversold"] = bool(edge <= tc["oversold_lo_pct"] or sg * r5 >= tc["oversold_ret5d_pct"])
-        break
-    return out
-
-
-def trend_line(regime: dict, mk) -> str:
-    """提示词里的「趋势市判定」一行：代码结论 + 逐条依据，TM 不得自行推翻。"""
-    tc, v = regime["cfg"], regime["votes"]
-    pos = regime.get("pos_in_range")
-    head = (f"## 趋势市判定（代码计算，以本行为准，不得自行推翻）\n"
-            f"依据：加权共识 S={regime['S']:+.3f}（门槛 |S|≥{tc['consensus']:g}）；同向票 多 {v['long']} / 空 {v['short']}"
-            f"（门槛 ≥{tc['min_votes']}）；20 日 {float(mk['ret_20d']):+.2f}%（门槛同向 ≥{tc['ret20d_pct']:g}%）、"
-            f"5 日 {float(mk['ret_5d']):+.2f}%（门槛同向不反转）；现价在 20 日区间位置 "
-            f"{('%.0f%%' % (pos * 100)) if pos is not None else '未知'}（空头趋势看下半部、多头趋势看上半部）；"
-            f"ATR14 {float(mk['atr14']):.6g}，近价距离上限 {tc['near_atr']:g}×ATR14={tc['near_atr'] * float(mk['atr14']):.6g}。")
-    if not regime.get("trend"):
-        return head + "\n结论：趋势市不成立，本币按常规规则决策（下方趋势市执行规则不生效）。"
-    side_cn = "空头" if regime["side"] == "short" else "多头"
-    s = head + f"\n结论：{side_cn}趋势市成立。"
-    if regime.get("oversold"):
-        s += (f"超卖降级=是（现价距 20 日{'低' if regime['side'] == 'short' else '高'}点 {regime.get('edge_pct')}%，"
-              f"或 5 日同向涨跌幅已达降级线）：禁用现价 open，只许近价 pending，且 risk_scale≤{tc['oversold_risk_scale']:g}。")
-    else:
-        s += "超卖降级=否。"
-    return s
-
-
-def trend_rule_text(tc: dict) -> str:
-    """提示词末尾的趋势市执行规则段（阈值取自 trend_cfg，与判定/护栏同一口径）。"""
-    return ("## 趋势市执行规则（只改趋势市的入场方式，不改否决门槛）\n"
-            f"趋势市定义（做空方向，做多镜像对称），四条全中才成立：①加权共识 S≤-{tc['consensus']:g} 且看空投票角色≥{tc['min_votes']} 个；"
-            f"②20 日涨跌幅≤-{tc['ret20d_pct']:g}% 且 5 日涨跌幅≤0%；③现价位于 20 日高低区间下半部；"
-            "④本段上方「趋势市判定」一行由代码计算，以代码结论为准。\n"
-            f"趋势市里，禁止把唯一入场押在远反弹上：不得给出距现价超过 {tc['near_atr']:g}×ATR14 的单一触发单作为唯一入场。"
-            f"必须二选一：(a) 现价入场（open）；(b) 近价挂单（pending），触发价距现价≤{tc['near_atr']:g}×ATR14（做空：gte 小反弹触发或 lte 跌破触发均可）。"
-            "现价单若因价格漂移被拦，改走 (b)，不许因此改为 hold 或远反弹单。\n"
-            f"超卖降级：现价距 20 日低点≤{tc['oversold_lo_pct']:g}% 或 5 日跌幅≥{tc['oversold_ret5d_pct']:g}% 时，不用 open，只许 (b) 且 risk_scale≤{tc['oversold_risk_scale']:g}。\n"
-            "趋势市里仍可 hold，但 rationale 必须逐条写明：定义四条里哪一条不成立，或哪条硬护栏不允许下单。"
-            "只写「等反弹确认」「把握不足」视为未说明，会在日报中被标出。\n"
-            "非趋势市一切照旧。")
+# ------------------------------------------------------------------ 趋势市执行规则（2026-11-11 改版）
+# A+（2026-11-11 晨）的代码机械判定 trend_regime 已按用户决定整体移除：判定改由 LLM 在每场
+# 决策前基于趋势特征表给出（desk/regime_judge.py），代码只按判定执行近价护栏与末段衰竭降级。
+# trend_rule_enabled=false 即整段回滚（不调判定、提示词段、validate 护栏同时失效）。
 
 
 def weights(cfg=None) -> dict:
@@ -288,6 +201,7 @@ def market_ctx(inst: str) -> dict:
 def _prompt(cfg, coin, mk, pos, bk, st, w, S, texts, preview=None, regime=None):
     """交易经理提示词：行情/账户/观点与硬护栏；下单参数说明由 tm_order_tool.instructions 给出（调用方拼在后面）。"""
     g = cfg["guardrails"]
+    _tc = regime_judge.trend_cfg(cfg)
     _stop_cap = min(float(g['max_stop_loss_pct']), float((cfg.get('risk') or {}).get('stop_max_pct', 0.08)) * 100)
     lines = [f"你是加密货币交易台的交易经理，负责对 {coin['name']}（OKX 永续 {coin['inst_id']}）做今日最终执行决策。",
              f"标的是 OKX USDT 永续合约（OKX 模拟盘 Demo Trading 执行，逐仓），可以做多也可以做空，新开仓杠杆上限 {__import__('desk.config_safety', fromlist=['x']).max_open_leverage(cfg):g} 倍（代码强制）。",
@@ -308,6 +222,8 @@ def _prompt(cfg, coin, mk, pos, bk, st, w, S, texts, preview=None, regime=None):
                      f"浮盈亏 {pos['upnl']:+.2f} USDT，到期 {pos['deadline']}")
     else:
         lines.append("本币无持仓。")
+    if _tc["enabled"] and regime and regime.get("features"):
+        lines += ["", regime_judge.feature_block(regime["features"], mk)]
     if pos and add_position.enabled(cfg):
         lines += ["", "## 加仓预览（代码按加仓规则预算，只是信息）",
                   describe_add_preview(preview) if preview else "加仓预览：未能计算（无数据），不影响决策流程。",
@@ -339,18 +255,17 @@ def _prompt(cfg, coin, mk, pos, bk, st, w, S, texts, preview=None, regime=None):
     lines += ["", "## 投资组合经理最终意见（TradingAgents）", texts["portfolio_manager"][-3000:],
               "", "## 交易员方案", texts["trader"][-2000:]]
     R = cfg.get("risk") or {}
-    _tc = trend_cfg(cfg)
     if _tc["enabled"]:
-        _reg = regime if regime is not None else trend_regime(mk, S, st, w, cfg)
-        lines += ["", trend_line(_reg, mk)]
+        if regime is not None:
+            lines += ["", regime_judge.regime_block(regime, mk)]
+        else:
+            lines += ["", "## 本场行情判定（LLM）\n（本场未取得判定结果，趋势市执行规则不生效，按常规规则决策。）"]
     lines += ["", "## 硬护栏（代码强制，违反会被退回）",
               f"止损距入场≤{_stop_cap:g}%（做多在下方、做空在上方）；盈亏比 RR=止盈距/止损距≥{float(R.get('min_rr_after_adjust', 1.5)):g}；"
               "已有持仓止损只能收紧；new_tp 须在现价盈利一侧且距现价至少 "
               f"{float((cfg.get('manager') or dict()).get('tp_min_gap_pct', 0.3)):g}%；组合层保证金、总名义、在途风险、当日亏损上限见上方账户段。"]
-    if _tc["enabled"]:
-        lines += ["", trend_rule_text(_tc)]
     lines += ["点位必须是具体数字，不得写区间或「沿用/附近」。没有足够把握就 hold"
-              + ("（趋势市按上一段执行）" if _tc["enabled"] else "") + "。止损请依据结构位/ATR。理由用中文。"]
+              + ("（本场判定为趋势市时按上方判定段的执行规则）" if _tc["enabled"] else "") + "。止损请依据结构位/ATR。理由用中文。"]
     return "\n".join(lines)
 
 
@@ -407,6 +322,32 @@ def tool_context(cfg, inst, mk, bk, pos, S, regime=None) -> dict:
             "consensus_side": "long" if S > th else ("short" if S < -th else None)}
 
 
+def _run_regime_judge(cfg, coin, mk, st, w, S, texts, tracker) -> dict:
+    """本场行情判定（LLM）：特征计算或判定调用任一失败 → judge=None（本场趋势规则不生效），绝不阻断决策。"""
+    try:
+        feat = regime_judge.features(coin["inst_id"])
+    except Exception:
+        feat = None
+    judge = None
+    if feat is not None:
+        try:   # 判定准备（票数/提示词）与调用任一异常都按判定失败处理，绝不阻断决策
+            vv = valid_voters(st, w)
+            votes = {"valid": len(vv),
+                     "long": sum(1 for r in vv if (st.get(r) or {}).get("direction") == "bullish"),
+                     "short": sum(1 for r in vv if (st.get(r) or {}).get("direction") == "bearish")}
+            votes["neutral"] = votes["valid"] - votes["long"] - votes["short"]
+            prompt = regime_judge.judge_prompt(coin["name"], coin["inst_id"], feat, mk, S, votes,
+                                               ((texts or {}).get("market") or "")[-1200:])
+            tok = dllm.STAGE.set(f"{coin['inst_id']}/行情判定")
+            try:
+                judge = regime_judge.call_judge(cfg, tracker, prompt)
+            finally:
+                dllm.STAGE.reset(tok)
+        except Exception:
+            judge = None
+    return regime_judge.build_regime(cfg, judge, feat)
+
+
 def decide_and_execute(cfg, coin, trade_date, fs, st, tracker, source="daily") -> dict:
     inst = coin["inst_id"]
     mk = market_ctx(inst)
@@ -433,10 +374,14 @@ def decide_and_execute(cfg, coin, trade_date, fs, st, tracker, source="daily") -
         preview = add_preview(cfg, inst, mk, bk, pos, st, w, S)
     except Exception as e:   # 预览只是信息，算不出不阻断
         preview = {"items": [], "error": f"预览计算失败（{type(e).__name__}）", "base_sl": (pos or {}).get("sl_px"), "base_tp": (pos or {}).get("tp_px")} if pos else None
-    try:
-        regime = trend_regime(mk, S, st, w, cfg)   # A+：趋势市判定（纯函数，失败不阻断决策，按未启用处理）
-    except Exception:
-        regime = None
+    regime = None
+    if regime_judge.trend_cfg(cfg)["enabled"]:
+        regime = _run_regime_judge(cfg, coin, mk, st, w, S, texts, tracker)   # LLM 行情判定（失败不阻断，规则不生效）
+        try:
+            regime_judge.log_call(date=trade_date, session=record_session(source), source=source,
+                                  inst=inst, decision_id=did, regime=regime)
+        except Exception:
+            pass
     tok = dllm.STAGE.set(f"{inst}/交易经理")
     try:
         # L5：交易经理也读自己的角色手册（playbooks/trade_manager 当前版本）
@@ -492,8 +437,10 @@ def decide_and_execute(cfg, coin, trade_date, fs, st, tracker, source="daily") -
                                              ("portfolio_manager", fs.get("final_trade_decision"))) if v},
            "consensus_side": gate.get("consensus_side"), "tm_vetoed_consensus": gate.get("vetoed_consensus"),
            "tm_flip_blocked": gate.get("flip_blocked") or None,
-           "trend_regime": ({k: regime.get(k) for k in ("enabled", "trend", "side", "oversold", "votes", "pos_in_range", "edge_pct")}
-                            if regime else None),
+           "llm_regime": ({"judge": regime.get("judge"), "features": regime.get("features"),
+                           "active": regime.get("active"), "side": regime.get("side"),
+                           "downgrade": regime.get("downgrade"),
+                           "regime_judge_failed": bool(regime.get("failed"))} if regime else None),
            "config_hash": settings.config_hash(cfg), "playbook_versions": roles.versions(),   # L1 追溯
            **({"tm_order_tool": {"attempts": tool_res["attempts"], "call": tool_res["call"], "rejected": tool_res["history"],
                                  "receipt": tool_res.get("receipt"), "ignored": tool_res.get("ignored"),

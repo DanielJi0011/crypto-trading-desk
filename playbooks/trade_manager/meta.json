@@ -1,5 +1,5 @@
 {
-  "current": 5,
+  "current": 6,
   "history": [
     {
       "version": 1,
@@ -74,6 +74,22 @@
           "op": "新增",
           "rule": "## 趋势市执行规则（2026-11-11 起，v005，A+）",
           "why": "否决定案 5 对 10 错、错过全是趋势下跌的机会成本；2026-11-10 全天未成交为最新样本"
+        }
+      ],
+      "baseline_hit": null,
+      "baseline_n": 0,
+      "scored_at_edit": 0,
+      "eval_status": "baseline"
+    },
+    {
+      "version": 6,
+      "time": "2026-11-11 14:43:23+0800",
+      "reason": "用户决定（2026-11-11，原话「直接换成 LLM 判定」）：趋势市判定由代码机械判定改为 LLM 判定——代码只算趋势特征表（MA/斜率/偏离/RSI/区间位置），与交易经理同一模型席位在每场决策前做结构化行情判定，护栏改按判定执行（近价 0.3×ATR 不变，late_exhaustion 取代超卖降级口径，判定失败=规则不生效并记 regime_judge_failed）",
+      "changes": [
+        {
+          "op": "新增",
+          "rule": "## 行情判定改由 LLM（2026-11-11 起，v006，取代 v005 的代码判定）",
+          "why": "代码阈值判定滞后、四条条件同源不独立、阈值未经回测；LLM 读特征表综合判定并留痕（state/ledger/regime_calls.jsonl）待打分"
         }
       ],
       "baseline_hit": null,

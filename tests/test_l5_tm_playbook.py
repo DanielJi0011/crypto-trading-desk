@@ -20,10 +20,10 @@ def test_tm_wrapped_in_playbook():
     assert 'roles.PlaybookLLM(dllm.make_llm(cfg, "deep", tracker, role="trade_manager")' in src
 
 
-def test_repo_playbook_v005():
+def test_repo_playbook_v006():
     import json, pathlib
     m = json.loads((pathlib.Path(__file__).parents[1] / "playbooks/trade_manager/meta.json").read_text(encoding="utf-8"))
-    assert m["current"] == 5
+    assert m["current"] == 6
 
 
 def test_risk_scale_veto_and_default():

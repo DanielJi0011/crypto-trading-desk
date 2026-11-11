@@ -28,6 +28,11 @@ def env(desk_env, monkeypatch):
             return self
 
         def invoke(self, prompt, *a, **k):
+            from desk.regime_judge import RegimeJudgment
+            if box.get("schema") is RegimeJudgment:
+                # 行情判定（2026-11-11 改版新增的决策前调用）：固定无趋势判定，不消耗 TM 脚本、不计入 TM 提示记录
+                return {"direction": "none", "strength": "none", "stage": "mid", "confidence": 0.5,
+                        "evidence": [], "summary": "测试固定判定：无趋势"}
             calls["prompts"].append(prompt)
             out = box["script"].pop(0) if box["script"] else None
             if isinstance(out, Exception):

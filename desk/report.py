@@ -346,6 +346,14 @@ def write(cfg, date, decisions, closed, reviews, weight_changes, pb_events, usag
               f"- 交易经理（{'不投票，定点位' if 'trade_manager' not in d.get('weights', {}) and d.get('decided_by') else '投票角色之一'}）建议：" + tm_advice_text(d),
               f"- 失效条件：{m.get('invalidation') or '—'}",
               f"- 理由：{m.get('rationale')}"]
+        _lr = d.get("llm_regime") or {}
+        if _lr.get("regime_judge_failed"):
+            L.append("- 本场行情判定（LLM）：**判定失败**，本场趋势市规则不生效")
+        elif _lr.get("judge"):
+            _j = _lr["judge"]
+            _dcn = {"short": "空头趋势", "long": "多头趋势", "none": "无趋势/震荡"}.get(_j.get("direction"), "—")
+            L.append(f"- 本场行情判定（LLM）：{_dcn}（强度 {_j.get('strength')}，阶段 {_j.get('stage')}，置信 {_j.get('confidence')}）"
+                     + (f"——{_j.get('summary')}" if _j.get("summary") else ""))
         _iw = untriggered_intent_line(d)
         if _iw:
             L.append(_iw)
