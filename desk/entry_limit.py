@@ -3,18 +3,30 @@
 !! 禁止实盘：所有调用都经 desk/okx_demo.py（OKX_DEMO_* + x-simulated-trading: 1）。只处理本模块登记过的条件单
 !! （place_trigger 在 entry_limit.enabled 时登记），不碰其它任何现有订单。
 
+超时语义由 execution.entry_limit.fallback_market 决定：
+  false（默认，2026-11-11 用户决定「这个兜底就没有必要了，就等它触发」）：取消市价兜底。
+    超时撤子单后绝不市价追单——过护栏后看现价与触发价的相对位置：价格回到等待侧
+    （gte 单现价<触发价 / lte 单现价>触发价，即触发条件当前不成立）→ 以原触发价/止损止盈/
+    剩余张数重挂一张条件单（沿用原到期 expires 与原 decision 关联，可多轮重挂、始终受原到期约束）；
+    价格已穿过触发价且未回（条件当前成立）→ 本次入场作罢（entry_missed_no_chase），等下一场重新决策。
+    已成交部分照常重挂保护。市价兜底事故背景：2026-11-11 ETH 计划 2075、市价兜底成交 2055.74、RR 1.76→1.007。
+  true（旧行为，回滚用）：撤单后市价补剩余（filling/protecting 状态机），且补单发出前先过兜底前判定
+    （desk/fallback_judge.py）：交易经理身份 + 快速模型判断当前价位入场是否仍合理，结论落
+    entries[algoId].fallback_judge 后再执行；否决/判定失败 → result=abandoned，开关 fallback_judge_enabled。
+
 状态文件 state/ledger/entry_limit.json：entries[algoId] = {...,status}
   armed      已挂条件单，未触发
   triggered  已触发，记录 ordId（限价子单）与 triggered_ms（触发时间；demo_ws 收到触发事件时先记，否则取算法单历史 triggerTime/uTime）
   cancelling 已决定撤限价子单（先落盘再发请求）
-  filling    已生成市价补单 clOrdId（先落盘再下单；重入时按 clOrdId 查单，不会重复补单）
-  protecting 补单已完成，正在按总仓位重挂止损止盈
-  done       终态（filled / fallback_done / blocked / gone 等，见 result）
+  filling    （仅 fallback_market=true）已生成市价补单 clOrdId（先落盘再下单；重入时按 clOrdId 查单，不会重复补单）
+  protecting （仅 fallback_market=true）补单已完成，正在按总仓位重挂止损止盈
+  done       终态（filled / fallback_done / blocked / abandoned / rearmed / missed_no_chase / gone 等，见 result）
 防重入：fcntl 文件锁 state/ledger/entry_limit.lock（非阻塞，拿不到锁本轮跳过）+ 上述状态机。
 """
 from __future__ import annotations
 
 import contextlib
+import datetime as _dt
 import fcntl
 import time
 
@@ -236,6 +248,103 @@ def _protect_add_leg(aid, e):
     return new_id
 
 
+# ------------------------------------------------------------------ 等待/重挂（fallback_market=false）
+def _resolve_condition_expires(aid, e):
+    """重挂所需的触发条件（gte/lte）与原到期时刻：优先本条登记，其次 demo_orders 登记表
+    （触发后 watch 处理完会 pop，只能尽力），再次按 decision_id 查决策记录的 pending。任一来源命中即用。"""
+    cond, exp = e.get("condition"), e.get("expires")
+    if cond not in ("gte", "lte") or not exp:
+        try:
+            from desk import demo_exec as DX
+            m = (DX.reg().get("triggers") or {}).get(str(aid)) or {}
+            if cond not in ("gte", "lte"):
+                cond = m.get("condition")
+            exp = exp or m.get("expires")
+        except Exception:
+            pass
+    if (cond not in ("gte", "lte") or not exp) and e.get("decision_id"):
+        try:
+            from desk import manager
+            for r in settings.read_jsonl(manager.DECISIONS):
+                if r.get("decision_id") == e.get("decision_id"):
+                    p = r.get("pending") or {}
+                    if cond not in ("gte", "lte"):
+                        cond = p.get("condition")
+                    exp = exp or p.get("expires")
+        except Exception:
+            pass
+    return cond, exp
+
+
+def _wait_or_end(cfg, aid, e, filled, remain) -> str:
+    """fallback_market=false 的超时收尾：绝不市价追单。
+    remain<=0 → nothing_left；护栏不过 → 与旧 blocked 相同收尾（已成交部分照常保护）；
+    价格已穿过触发价（条件当前成立）/ 原到期已过 / 条件或到期无法确定 → entry_missed_no_chase，本次入场作罢；
+    价格回到等待侧 → submit_trigger 以原触发价/止损止盈/剩余张数重挂（原到期、原 decision_id），
+    本条 done(result=rearmed, rearmed_to=新 algoId)，新单照常登记跟踪，可多轮重挂但始终受原到期约束。"""
+    inst = e["inst"]
+    if remain <= 0:
+        _update(aid, status="done", result="nothing_left", accFillSz=X._dec(filled))
+        return "blocked"
+    reasons = _guard(cfg, {**e, "accFillSz": X._dec(filled), "remain": X._dec(remain)})
+    if reasons:
+        X.log_event("entry_limit_fallback_skipped", algoId=aid, inst_id=inst, remain=X._dec(remain), reasons=reasons)
+        if filled > 0:
+            _protect_total(aid, {**e})
+        _update(aid, status="done", result="blocked", accFillSz=X._dec(filled))
+        return "blocked"
+    if filled > 0:
+        _protect_total(aid, {**e})
+    trigger = _num(e.get("trigger_px"))
+    try:
+        spot = float(X.get("/api/v5/market/ticker", instId=inst)["data"][0]["last"])
+    except Exception as ex:
+        X.log_event("entry_missed_no_chase", algoId=aid, inst_id=inst, trigger_px=trigger, spot=None,
+                    reason=f"现价读取失败（{type(ex).__name__}），无法确认等待侧，不重挂")
+        _update(aid, status="done", result="missed_no_chase", accFillSz=X._dec(filled))
+        return "missed"
+    cond, expires = _resolve_condition_expires(aid, e)
+    exp_dt = None
+    if expires:
+        try:
+            exp_dt = _dt.datetime.strptime(str(expires), "%Y-%m-%d %H:%M:%S%z")
+        except Exception:
+            exp_dt = None
+    if cond not in ("gte", "lte") or not expires or exp_dt is None or settings.now() >= exp_dt:
+        why = ("原单已过有效期" if (exp_dt is not None and settings.now() >= exp_dt)
+               else "触发条件/原到期无法确定，不重挂")
+        X.log_event("entry_missed_no_chase", algoId=aid, inst_id=inst, trigger_px=trigger, spot=spot,
+                    condition=cond, expires=expires, reason=why)
+        _update(aid, status="done", result="missed_no_chase", accFillSz=X._dec(filled))
+        return "missed"
+    waiting = (spot < trigger) if cond == "gte" else (spot > trigger)
+    if not waiting:
+        X.log_event("entry_missed_no_chase", algoId=aid, inst_id=inst, trigger_px=trigger, spot=spot,
+                    deviation=round(spot - trigger, 6), condition=cond)
+        _update(aid, status="done", result="missed_no_chase", accFillSz=X._dec(filled))
+        return "missed"
+    from desk import demo_exec as DX
+    n = int(e.get("rearms") or 0) + 1
+    o = {"decision_id": e.get("decision_id"), "source": e.get("source"), "side": e["side"],
+         "leverage": float(e.get("lever") or 1), "trigger_px": trigger, "condition": cond,
+         "stop_loss": e.get("stop_loss"), "take_profit": e.get("take_profit"),
+         "size_pct": e.get("size_pct"), "horizon_days": e.get("horizon_days"),
+         "consensus": e.get("consensus"), "reason": e.get("reason")}
+    try:
+        meta = DX.submit_trigger(cfg, inst, o, X._dec(remain), expires,
+                                 extra={"rearm_of": str(aid), "rearm_n": n}, keep_lev=True)
+    except Exception as ex:
+        X.log_event("entry_rearm_failed", algoId=aid, inst_id=inst, error=f"{type(ex).__name__}: {ex}")
+        _update(aid, status="done", result="rearm_failed", accFillSz=X._dec(filled))
+        return "rearm_failed"
+    new_id = str(meta["algoId"])
+    _update(new_id, rearms=n, rearm_of=str(aid))
+    X.log_event("entry_rearmed", algoId=aid, new_algoId=new_id, inst_id=inst, trigger_px=trigger, spot=spot,
+                remain=X._dec(remain), expires=expires, rearms=n, condition=cond)
+    _update(aid, status="done", result="rearmed", rearmed_to=new_id, accFillSz=X._dec(filled))
+    return "rearmed"
+
+
 # ------------------------------------------------------------------ 主流程（demo_watch 每轮调用）
 def check_timeouts(cfg, now_ms=None) -> list:
     from desk import demo_exec as DX
@@ -307,14 +416,48 @@ def _step(cfg, el, aid, e, now_ms) -> str:
             return "filled"
         lot = float(_ct(inst)["lotSz"])
         remain = round((total - filled) / lot) * lot
-        reasons = [] if el.get("fallback_market") else ["fallback_market=false"]
-        reasons += _guard(cfg, {**e, "accFillSz": X._dec(filled), "remain": X._dec(remain)}) if not reasons else []
+        if not el.get("fallback_market"):
+            # 2026-11-11 用户决定：取消市价兜底，就等它触发（等待/重挂语义，见 _wait_or_end）
+            return _wait_or_end(cfg, aid, e, filled, remain)
+        reasons = _guard(cfg, {**e, "accFillSz": X._dec(filled), "remain": X._dec(remain)})
         if reasons or remain <= 0:
             X.log_event("entry_limit_fallback_skipped", algoId=aid, inst_id=inst, remain=X._dec(remain), reasons=reasons)
             if filled > 0:
                 _protect_total(aid, {**e})
             _update(aid, status="done", result="blocked" if reasons else "nothing_left", accFillSz=X._dec(filled))
             return "blocked"
+        # 兜底前判定（2026-11-11 用户指令，desk/fallback_judge.py）：护栏通过后、市价补单发出前，
+        # 由交易经理身份 + 快速模型判断当前价位入场是否仍合理。结论先落盘（fallback_judge 字段）再执行，
+        # 重入/重启不重复判定；已记录 proceed 时本段整段跳过，直接走原 filling 路径。
+        prev_judge = e.get("fallback_judge") or {}
+        if prev_judge.get("verdict") not in ("proceed", "abandon"):
+            from desk import fallback_judge
+            if fallback_judge.judge_cfg(cfg)["enabled"]:
+                outcome, facts, judgment = fallback_judge.judge_fallback(
+                    cfg, e, filled=filled, remain=remain, now_ms=now_ms)
+                _update(aid, fallback_judge={"verdict": outcome, "judgment": judgment, "facts": facts,
+                                             "at": settings.now_str()})
+                prev_judge = {"verdict": outcome}
+                if outcome == "proceed":
+                    X.log_event("fallback_judge_proceed", algoId=aid, inst_id=inst,
+                                reason=(judgment or {}).get("reason"), **facts)
+                elif outcome == "skip":
+                    X.log_event("fallback_judge_skipped", algoId=aid, inst_id=inst, **facts)
+                    prev_judge = {"verdict": "proceed"}   # 现价取不到（见 fallback_judge 模块头注）：按旧行为放行
+                else:   # abandon / failed（failed 按未批准处理）：不发市价单，与 blocked 同样收尾
+                    if outcome == "failed":
+                        X.log_event("fallback_judge_failed", algoId=aid, inst_id=inst, **facts)
+                    X.log_event("fallback_abandoned", algoId=aid, inst_id=inst,
+                                judge_outcome=outcome, reason=(judgment or {}).get("reason"), **facts)
+                    if filled > 0:
+                        _protect_total(aid, {**e})
+                    _update(aid, status="done", result="abandoned", accFillSz=X._dec(filled))
+                    return "abandoned"
+        elif prev_judge.get("verdict") == "abandon":   # 判定已落盘否决但上次未及收尾（防御）：直接收尾
+            if filled > 0:
+                _protect_total(aid, {**e})
+            _update(aid, status="done", result="abandoned", accFillSz=X._dec(filled))
+            return "abandoned"
         e = _update(aid, status="filling", accFillSz=X._dec(filled), remain=X._dec(remain),
                     fallback_cl=_det("elf", aid, X._dec(remain)), attach_new=filled <= 0)
         st = "filling"

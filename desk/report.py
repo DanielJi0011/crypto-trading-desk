@@ -200,6 +200,25 @@ def annualized_line(equity, initial, start, now=None) -> str:
     return f"综合年化收益 {ann * 100:+.2f}%（累计 {cum * 100:+.2f}%，已运行 {days:.1f} 天）{tail}"
 
 
+def env_skill_lines() -> list[str]:
+    """自我迭代 v2 第一层：分环境 skill 诊断小节（权重保持冻结；诊断不参与决策、不影响权重）。
+    只列预测席位；n<ENV_MIN_N 的格子标“样本不足”、不下结论。"""
+    rows = scoring.env_skill_table()
+    L = ["### 分环境 skill 诊断（自我迭代 v2：诊断用，不参与决策、不影响权重）", "",
+         "| 角色 | 行情 | 币种 | n | 命中率 | skill | Brier | 样本 |",
+         "|---|---|---|---|---|---|---|---|"]
+    for e in rows:
+        if e["sufficient"]:
+            L.append(f"| {CN[e['role']]} | {e['regime']} | {e['inst_id']} | {e['n']} | {_f(e['hit'], pct=True)} | "
+                     f"{_f(e['skill'], 3)} | {_f(e['brier'], 3)} | 充足 |")
+        else:
+            L.append(f"| {CN[e['role']]} | {e['regime']} | {e['inst_id']} | {e['n']} | 样本不足 | 样本不足 | 样本不足 | 样本不足 |")
+    up_n = sum(e["n"] for e in rows if e["regime"] == "上涨")
+    L += ["", f"说明：只列预测席位（市场/情绪/新闻/资金流/研究经理）；多空辩手与风控席位按职责不做方向命中排名。"
+              f"n<{scoring.ENV_MIN_N} 的格子标“样本不足”、不下结论。当前上涨市样本合计 {up_n} 条。", ""]
+    return L
+
+
 def write(cfg, date, decisions, closed, reviews, weight_changes, pb_events, usage, prices, errors, mock=False,
           research=None, name=None, coin_notes=None, prices_time=None, macro=None, banner=None) -> str:
     """coin_notes：{inst_id: [补记行]}，写进该币决策段（无决策时单列一段）；交易经理否决导致的撤单会从 demo_events 自动补记。"""
@@ -426,6 +445,7 @@ def write(cfg, date, decisions, closed, reviews, weight_changes, pb_events, usag
               f"w0·clip(exp(k·Σskill/(n+n0)), 0.5, 2)，n0={cfg['scoring'].get('n0', 30)}，k={cfg['scoring'].get('k', 4)}，同日多币算一个样本。",
           f"累计已打分观点 {n_sc} 条。"
               f"手册修订需≥{cfg['learning']['min_scored_before_edit']} 条新打分，每次最多 {cfg['learning']['max_changes_per_edit']} 处。", ""]
+    L += env_skill_lines()
     L += ["## 六、角色手册与权重变动", ""]
     if not weight_changes and not pb_events:
         L.append("今日无变动。")

@@ -104,13 +104,14 @@ def current_text(role: str) -> str:
 
 
 def save_new_version(role: str, learned: str, reason: str, changes: list, baseline_hit, baseline_n, scored_at_edit,
-                     rollback_of=None) -> int:
+                     rollback_of=None, env_scope=None) -> int:
     m = read_meta(role)
     v = max(h["version"] for h in m["history"]) + 1
     version_path(role, v).write_text(compose(role, v, learned), encoding="utf-8")
     m["history"].append({"version": v, "time": settings.now_str(), "reason": reason, "changes": changes,
                          "baseline_hit": baseline_hit, "baseline_n": baseline_n, "scored_at_edit": scored_at_edit,
                          "eval_status": "rollback" if rollback_of else "pending", "rollback_of": rollback_of,
+                         "env_scope": env_scope,   # 自我迭代 v2：修订针对的环境（regime/inst），评估时只用该环境样本；None=无环境范围（旧记录），评估回退全局
                          "previous": m["current"]})
     m["current"] = v
     settings.write_json(meta_path(role), m)

@@ -124,6 +124,25 @@ def _since(role, t):
     return [s for s in scoring.scores(role) if s["time"] > t]
 
 
+# ------------------------------------------------ 自我迭代 v2：按环境评估修订
+def env_scope_of(samples: list[dict]):
+    """由触发修订的打分样本推出修订针对的环境：出现最多的 (regime, inst_id) 组合。
+    无样本 → None（无环境范围，评估回退全局）。"""
+    from collections import Counter
+    pairs = Counter((s.get("regime"), s.get("inst_id")) for s in samples if s.get("regime") and s.get("inst_id"))
+    if not pairs:
+        return None
+    (g, inst), n = pairs.most_common(1)[0]
+    return {"regime": g, "inst_id": inst, "basis_n": n, "mixed": len(pairs) > 1}
+
+
+def _scoped(xs: list[dict], scope) -> list[dict]:
+    """只保留 scope 环境（同行情、同币种）的样本；scope 为空 → 原样返回（全局）。"""
+    if not scope or not scope.get("regime") or not scope.get("inst_id"):
+        return xs
+    return [x for x in xs if x.get("regime") == scope["regime"] and x.get("inst_id") == scope["inst_id"]]
+
+
 def evaluate_and_rollback(cfg) -> list[dict]:
     L = cfg["learning"]
     if L.get("auto_edit_playbooks", False):
@@ -135,10 +154,13 @@ def evaluate_and_rollback(cfg) -> list[dict]:
     events = []
     for r in ROLE_KEYS:
         m = roles.read_meta(r)
-        cur = next(h for h in m["history"] if h["version"] == m["current"])
-        if cur.get("eval_status") != "pending":
+        cur = next((h for h in m["history"] if h["version"] == m["current"]), None)
+        if cur is None or cur.get("eval_status") != "pending":
             continue
-        after = _since(r, cur["time"])
+        # 自我迭代 v2：只用修订针对的环境（同行情、同币种）的样本评估；
+        # 修订记录没有 env_scope（旧记录/无环境范围）时回退全局，并标注 eval_global。
+        scope = cur.get("env_scope")
+        after = _scoped(_since(r, cur["time"]), scope)
         if len(after) < L["eval_window_after_edit"]:
             continue
         post = _hit(after[:L["eval_window_after_edit"]])
@@ -156,6 +178,8 @@ def evaluate_and_rollback(cfg) -> list[dict]:
             cur["eval_status"] = "kept"; cur["post_hit"] = post
             settings.write_json(roles.meta_path(r), m)
             ev = {"role": r, "type": "保留", "version": cur["version"], "base": base, "post": post}
+        ev["env_scope"] = scope
+        ev["eval_global"] = not bool(scope)   # True=无环境范围、按全局样本评估（已标注）
         ev["time"] = settings.now_str()
         settings.append_jsonl(PB_LOG, ev)
         events.append(ev)
@@ -170,18 +194,21 @@ def _last_proposal(role: str) -> str:
     return settings.read_json(proposals_dir(role) / "last.json", {}).get("time", "")
 
 
-def _write_proposal(role: str, ed, n_fresh: int) -> dict:
-    """L1：修订建议只落盘，不改 meta.json、不生成新版本。"""
+def _write_proposal(role: str, ed, n_fresh: int, scope=None) -> dict:
+    """L1：修订建议只落盘，不改 meta.json、不生成新版本。scope=建议针对的环境（自我迭代 v2）。"""
     d = proposals_dir(role); d.mkdir(parents=True, exist_ok=True)
     ts = settings.now_str()
     if ed.no_change or not ed.changes or not ed.learned_rules.strip():
         ev = {"role": role, "type": "建议无改动", "n_fresh": n_fresh}
     else:
+        scope_line = (f"针对环境：{scope['regime']} / {scope['inst_id']}（触发样本 {scope['basis_n']} 条）"
+                      if scope else "针对环境：无（全局）")
         f = d / f"{ts[:10]}-{ts[11:19].replace(':', '')}.md"
-        f.write_text(f"# {ROLE_CN.get(role, role)} 手册修订建议（未生效，需用户确认）\n\n时间：{ts}\n\n## 改动\n"
+        f.write_text(f"# {ROLE_CN.get(role, role)} 手册修订建议（未生效，需用户确认）\n\n时间：{ts}\n\n{scope_line}\n\n## 改动\n"
                      + "\n".join(f"- {c.op}：{c.rule}（依据：{c.why}）" for c in ed.changes)
                      + "\n\n## 建议的经验规则全文\n" + ed.learned_rules.strip() + "\n", encoding="utf-8")
         ev = {"role": role, "type": "建议", "file": str(f.name), "changes": [c.model_dump() for c in ed.changes]}
+    ev["env_scope"] = scope
     settings.write_json(d / "last.json", {"time": ts})
     return ev
 
@@ -197,13 +224,16 @@ def maybe_edit_playbooks(cfg, tracker) -> list[dict]:
     events = []
     for r in ROLE_KEYS:
         m = roles.read_meta(r)
-        cur = next(h for h in m["history"] if h["version"] == m["current"])
+        cur = next((h for h in m["history"] if h["version"] == m["current"]), None)
+        if cur is None:
+            continue                       # 无手册历史记录（如测试空环境），跳过不炸
         if cur.get("eval_status") == "pending":
             continue                       # 正在观察期，不叠加修改
         t0 = max(cur["time"], m.get("last_review", ""), _last_proposal(r) if mode == "propose" else "")
         fresh = _since(r, t0)
         if len(fresh) < L["min_scored_before_edit"]:
             continue
+        scope = env_scope_of(fresh)        # 自我迭代 v2：本次修订针对的环境（由触发样本推出）
         allsc = scoring.scores(r)
         card = scoring.scorecard(r)
         misses = [s for s in fresh if not s["hit"]][-15:]
@@ -225,7 +255,7 @@ def maybe_edit_playbooks(cfg, tracker) -> list[dict]:
         finally:
             dllm.STAGE.reset(tok)
         if mode == "propose":
-            ev = _write_proposal(r, ed, len(fresh))
+            ev = _write_proposal(r, ed, len(fresh), scope)
             ev["time"] = settings.now_str()
             settings.append_jsonl(PB_LOG, ev)
             events.append(ev)
@@ -236,10 +266,14 @@ def maybe_edit_playbooks(cfg, tracker) -> list[dict]:
         elif len(ed.changes) > L["max_changes_per_edit"]:
             ev = {"role": r, "type": "拒绝修订", "why": f"改动 {len(ed.changes)} 处超过上限 {L['max_changes_per_edit']}"}
         else:
-            base = _hit(allsc[-L["eval_window_after_edit"]:])
+            # 自我迭代 v2：基线也只用同一环境的修订前样本，与评估口径一致；无环境范围时回退全局
+            base_pool = _scoped(allsc, scope)
+            base = _hit(base_pool[-L["eval_window_after_edit"]:])
             v = roles.save_new_version(r, ed.learned_rules, "依据打分与复盘修订", [c.model_dump() for c in ed.changes],
-                                       base, min(len(allsc), L["eval_window_after_edit"]), len(allsc))
-            ev = {"role": r, "type": "修订", "version": v, "baseline_hit": base, "changes": [c.model_dump() for c in ed.changes]}
+                                       base, min(len(base_pool), L["eval_window_after_edit"]), len(allsc),
+                                       env_scope=scope)
+            ev = {"role": r, "type": "修订", "version": v, "baseline_hit": base, "env_scope": scope,
+                  "changes": [c.model_dump() for c in ed.changes]}
         ev["time"] = settings.now_str()
         settings.append_jsonl(PB_LOG, ev)
         events.append(ev)

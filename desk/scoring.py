@@ -333,6 +333,41 @@ def scorecard(role: str, trades=None, stances_by_decision=None) -> dict:
     return card
 
 
+# 自我迭代 v2 第一层：分环境 skill 只作诊断仪表盘，不参与决策、不影响权重。
+# 只列预测型席位；多空辩手（倡导对立论证）与风控三席（负责挑毛病）不按方向命中率排名。
+FORECAST_ROLES = ["market", "sentiment", "news", "flows", "research_manager"]
+ENV_REGIMES = ("上涨", "下跌", "震荡")
+ENV_MIN_N = 20   # 与 learning.min_scored_before_edit 同口径：样本不足不给结论
+
+
+def env_skill_table(min_n: int = ENV_MIN_N) -> list[dict]:
+    """角色 × 行情 × 币种 的分环境成绩（诊断用）。
+
+    n/命中率口径与 scorecard 一致（hit 非空的已打分观点）；skill/Brier 只用 v2 打分均值。
+    只返回 n>0 的格子；sufficient = n>=min_n，样本不足的格子调用方只标示、不下结论。"""
+    out = []
+    for r in FORECAST_ROLES:
+        ss = scores(r)
+        v2 = [x for x in ss if x.get("scoring_v") == 2]
+        insts = sorted({x["inst_id"] for x in ss})
+        for g in ENV_REGIMES:
+            for inst in insts:
+                cell = [x for x in ss if x["regime"] == g and x["inst_id"] == inst]
+                if not cell:
+                    continue
+                cv = [x for x in v2 if x["regime"] == g and x["inst_id"] == inst]
+
+                def _mean(xs):
+                    xs = [x for x in xs if x is not None]
+                    return round(sum(xs) / len(xs), 4) if xs else None
+                out.append({"role": r, "regime": g, "inst_id": inst, "n": len(cell),
+                            "hit": round(sum(x["hit"] for x in cell) / len(cell), 4),
+                            "skill": _mean([x.get("skill") for x in cv]),
+                            "brier": _mean([x.get("brier") for x in cv]),
+                            "sufficient": len(cell) >= min_n})
+    return out
+
+
 def weight_roles(cfg=None) -> dict:
     """参与权重调整的角色及初始权重：ROLE_KEYS 去掉组合经理（只执行、不投票）。
     manager.tm_no_vote_weight=true（方案一）时交易经理不投票、不参与权重学习（立场打分统计照常保留）；false=旧行为加上交易经理。"""

@@ -148,7 +148,7 @@ def run_once(cfg, source: str = "demo_watch 轮询") -> dict:
     except Exception as e:
         log(f"风险复核失败 {type(e).__name__}: {e}")
         X.log_event("trigger_review_error", error=str(e)[:300])
-    # 0) 限价入场超时：触发后限价子单超过 entry_limit.timeout_minutes 未完全成交 → 撤单 + 市价补剩余（desk/entry_limit.py）
+    # 0) 限价入场超时：触发后限价子单超过 entry_limit.timeout_minutes 未完全成交 → 撤单后按 fallback_market 语义处理（默认 false=等触发/重挂，不市价追单；desk/entry_limit.py）
     try:
         from desk import entry_limit
         for aid, res in ([] if halt else entry_limit.check_timeouts(cfg)):

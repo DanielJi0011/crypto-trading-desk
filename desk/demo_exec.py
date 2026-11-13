@@ -30,7 +30,8 @@ def ecfg(cfg) -> dict:
     return out
 
 
-ENTRY_LIMIT_DEFAULTS = {"enabled": True, "offset_pct": 0.1, "timeout_minutes": 3, "fallback_market": True, "ws_check_secs": 20}
+ENTRY_LIMIT_DEFAULTS = {"enabled": True, "offset_pct": 0.1, "timeout_minutes": 3, "fallback_market": False, "ws_check_secs": 20,
+                        "fallback_judge_enabled": True, "fallback_judge_model": "deepseek-flash", "fallback_judge_provider": "deepseek"}
 
 
 def entry_limit_px(side: str, trigger_px: float, offset_pct: float, tick: float) -> float:
@@ -601,6 +602,8 @@ def submit_trigger(cfg, inst, o: dict, sz: str, expires: str, force_market: bool
         entry_limit.register(d["algoId"], inst=inst, side=side, pos_side=ps, sz=sz, order_px=order_px, trigger_px=px,
                              stop_loss=o.get("stop_loss"), take_profit=o.get("take_profit"),
                              attach_cl=att["attachAlgoClOrdId"], lever=lev, decision_id=o.get("decision_id"),
+                             condition=o.get("condition"), expires=expires, source=o.get("source"),
+                             horizon_days=o.get("horizon_days"),
                              **({"add": dict(extra["add"])} if (extra or {}).get("add") else {}))
     try:   # 挂单即时提醒（与开平仓同一 webhook 通道；按 algoId 去重，entry_limit_registered 不再另发）
         from desk.demo_ws import notify_placed

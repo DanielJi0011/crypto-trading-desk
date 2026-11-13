@@ -23,7 +23,10 @@ execution:
     offset_pct: 0.1                     # 限价偏移（百分比，0.1 即 0.1%）：做多限价=触发价×(1-偏移)，做空限价=触发价×(1+偏移)，按合约 tickSz 四舍五入取整
     timeout_minutes: 3                  # 从触发时刻起超过这么多分钟限价子单仍未完全成交 → 撤掉子单（demo_watch 每轮检查）
     ws_check_secs: 20                   # R6b：demo_ws 常驻进程每隔这么多秒检查一次限价入场超时（只在有已触发未完结的限价单时调用，与 demo_watch 共用每币执行锁）；0=关闭，只靠 demo_watch 轮询；改动需重启 demo_ws 生效
-    fallback_market: true               # 撤单后剩余数量是否用市价补单（同方向、带原止损止盈；补单前过 KILL/当日亏损护栏）；false=只撤单并保护已成交部分
+    fallback_market: false              # 市价兜底开关（2026-11-11 用户决定关闭：「这个兜底就没有必要了，就等它触发」）。false=超时撤子单后绝不市价追单：价格回到等待侧→以原触发价/止损止盈/剩余张数重挂条件单等触发（沿用原到期，可多轮重挂）；价格已穿过触发价→本次入场作罢，等下一场重新决策；已成交部分照常挂保护。true=旧行为：市价补剩余（补单前过护栏与兜底前判定）
+    fallback_judge_enabled: true        # 兜底前判定（2026-11-11 用户指令，desk/fallback_judge.py）：市价补单发出前，由交易经理身份 + 快速模型判断当前价位入场是否仍合理；否决/判定失败=放弃本次入场（fallback_abandoned）；false=恢复原无条件兜底
+    fallback_judge_model: deepseek-flash   # 判定模型：快速档（与 llm.quick_model 同档），不用交易经理席位的 opus 推理档（巡检周期内要快）
+    fallback_judge_provider: deepseek      # 判定模型 provider（与 llm.provider 同名时走 make_llm 的 quick 通道）
 
 llm:
   provider: deepseek                    # TradingAgents 内置 provider（OpenAI 兼容，含 DeepSeek 思考模式适配）
@@ -282,7 +285,7 @@ learning:                               # 防过拟合规则
   research_write_playbook: false        # false=每周自研通过的规则只写 research/candidates.jsonl，不写手册
   # 第三批 L1（默认值保持冻结，不改变当前运行行为）
   ta_memory_inject: false               # false=关闭 TradingAgents 内置记忆：不结算旧决策（不调用反思 LLM），不向组合经理注入 past_context
-  playbook_proposals: false             # true=冻结期间仍让交易经理审阅打分并把修订建议写到 playbooks/<角色>/proposals/（会调用 LLM，不生效）；false=完全不审阅
+  playbook_proposals: true             # true=冻结期间仍让交易经理审阅打分并把修订建议写到 playbooks/<角色>/proposals/（会调用 LLM，不生效）；false=完全不审阅
 
 # ---------------- 每周自研：分析师提出假设 → 预注册 → OKX 历史样本内/样本外检验 → 通过才写入手册
 research:
