@@ -1,4 +1,4 @@
-"""技术分析师专属工具：在 OKX 历史K线上跑 Python 回测（复用 ai_trader/backtest.py）。"""
+"""技术分析师专属工具：在 OKX 历史K线上跑 Python 回测（复用 /workspace/ai-trader/backtest.py）。"""
 from __future__ import annotations
 
 import json
@@ -46,12 +46,58 @@ def run_backtest(symbol: str, entry_expr: str, sl_pct: float = 5.0, tp_pct: floa
     return json.dumps({k: v for k, v in res.items() if k != "trades"}, ensure_ascii=False, default=str)[:3000]
 
 
+# ------------------------------------------------------------------ 工具输出上限
+# 2026-11-14 用量事故定位结论之一：分析师工具（get_stock_data / get_indicators / get_news /
+# get_prediction_markets / get_macro_indicators 等 vendor 工具）返回的是原始数据载荷，全系统
+# 没有任何体积上限；这些结果进入图的共享消息状态后会被后续每一轮分析师调用反复重发，是全仓
+# 唯一能产生十万级 token 的输入通道。当晚 gpt 席位图内输入由 20 万涨到 54 万即与此通道吻合。
+# 这里在交易台的工具安装咽喉给每个分析师工具套上输出上限：只截字符串结果的尾部并注明，
+# 工具名/参数 schema/调用方式完全不变，分析师的决策语义不变（数据本来就是抽样看的）。
+TOOL_OUTPUT_CAP = 24_000   # 单个工具结果进入 LLM 上下文的字符上限（实测正常载荷 ≤ 约 1.1 万字符）
+
+
+def cap_tool_output(t, cap: int = TOOL_OUTPUT_CAP):
+    """给一个 langchain 工具套输出上限（幂等：已套过的原样返回）。非字符串结果不处理。"""
+    if getattr(t, "_ta_desk_capped", False):
+        return t
+    from langchain_core.tools import StructuredTool
+    orig = t
+
+    def _run(**kwargs):
+        out = orig.func(**kwargs) if getattr(orig, "func", None) else orig.invoke(kwargs)
+        if isinstance(out, str) and len(out) > cap:
+            return (out[:cap] + f"\n……（工具输出过长，代码已截断：原文共 {len(out)} 字符，"
+                    f"仅保留前 {cap} 字符；需要更细的数据请缩小查询范围）")
+        return out
+
+    w = StructuredTool.from_function(func=_run, name=orig.name,
+                                     description=orig.description, args_schema=orig.args_schema)
+    w._ta_desk_capped = True
+    return w
+
+
+def install_tool_caps():
+    """把全部分析师工具换成带输出上限的版本（模块 TOOLS 与图执行规格同步替换，幂等）。"""
+    import dataclasses
+
+    import tradingagents.graph.analyst_execution as ae
+    from tradingagents.agents.analysts import fundamentals_analyst as fa
+    from tradingagents.agents.analysts import market_analyst as ma
+    from tradingagents.agents.analysts import news_analyst as na
+    for key, mod in (("market", ma), ("news", na), ("fundamentals", fa)):
+        capped = tuple(cap_tool_output(t) for t in mod.TOOLS)
+        mod.TOOLS = capped
+        spec = ae.ANALYST_NODE_SPECS.get(key)
+        if spec is not None:
+            ae.ANALYST_NODE_SPECS[key] = dataclasses.replace(spec, tools=capped)
+
+
 def install_market_tools():
-    """把 run_backtest 加入 TradingAgents 市场分析师的工具集（幂等）。"""
+    """把 run_backtest 加入 TradingAgents 市场分析师的工具集，并给全部分析师工具套输出上限（幂等）。"""
     import dataclasses
     import tradingagents.agents.analysts.market_analyst as ma
     import tradingagents.graph.analyst_execution as ae
-    if any(getattr(t, "name", "") == "run_backtest" for t in ma.TOOLS):
-        return
-    ma.TOOLS = tuple(ma.TOOLS) + (run_backtest,)
+    if not any(getattr(t, "name", "") == "run_backtest" for t in ma.TOOLS):
+        ma.TOOLS = tuple(ma.TOOLS) + (run_backtest,)
+    install_tool_caps()
     ae.ANALYST_NODE_SPECS["market"] = dataclasses.replace(ae.ANALYST_NODE_SPECS["market"], tools=ma.TOOLS)
