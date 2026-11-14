@@ -195,6 +195,10 @@ def run_once(cfg, source: str = "demo_watch 轮询") -> dict:
             r["positions"][m["inst_id"]] = {"decision_id": m.get("decision_id"), "side": m.get("side"), "opened": settings.now_str(),
                                             "from_algo": aid, "child_ordId": child, "horizon_days": float(m.get("horizon_days") or 5),
                                             "deadline": (now + _dt.timedelta(days=float(m.get("horizon_days") or 5))).strftime("%Y-%m-%d %H:%M:%S%z")}
+            if m.get("exit_mode") == "trailing":   # 移动止损仓位：退出方式与棘轮初始状态随登记落盘（desk/trailing_stop.py）
+                r["positions"][m["inst_id"]].update({"exit_mode": "trailing", "plan_tp": m.get("plan_tp"),
+                                                     "atr14_open": m.get("atr14_open"),
+                                                     "trail": {"activated": False, "best_px": None, "stop_px": m.get("stop_loss")}})
             X.log_event("trigger_fired", inst_id=m["inst_id"], algoId=aid, ordId=child)
             _adv(aid, "triggered", inst_id=m["inst_id"], child_ordId=child)
             log(f"条件单 {aid} {m['inst_id']} 已触发（子单 {child}，成交以子单状态为准）")
@@ -221,6 +225,8 @@ def run_once(cfg, source: str = "demo_watch 轮询") -> dict:
             if verdict in ("live", "unknown"):
                 continue
             X.log_event("registry_position_cleared", inst_id=inst, child_ordId=m.get("child_ordId"), verdict=verdict)
+            from desk import trailing_stop as _tsexit   # 移动止损仓位：清登记前暂存退出标记，供第 3 步止损事件区分 reason
+            _tsexit.note_exit(r, inst, m, int(now.timestamp() * 1000))
             k = _es_key(m)
             if ES.get(k) in ("filled", "partial"):
                 if ES.get(k) == "partial":
@@ -271,6 +277,16 @@ def run_once(cfg, source: str = "demo_watch 轮询") -> dict:
     except Exception as e:
         log(f"开仓后 RR 复核失败 {type(e).__name__}: {e}")
         X.log_event("rr_recheck_error", error=str(e)[:300])
+    # 2e) 移动止损棘轮（2026-11-14）：登记为 exit_mode=trailing 的持仓——激活前止损不动，激活后只向有利方向
+    #     跟进（desk/trailing_stop.py）。HALT 全冻结期间零动作（check 内再守一道，双保险）。
+    if not halt:
+        try:
+            from desk import trailing_stop
+            for line in trailing_stop.check(cfg):
+                log(line)
+        except Exception as e:
+            log(f"移动止损棘轮失败 {type(e).__name__}: {e}")
+            X.log_event("trailing_stop_error", error=str(e)[:300])
     # 3) 止损/止盈检测 → 再讨论
     from desk.monitor import schedule_rediscuss
     cur = int(r["watch"].get("last_algo_uts") or int(now.timestamp() * 1000))
@@ -279,6 +295,7 @@ def run_once(cfg, source: str = "demo_watch 轮询") -> dict:
     # 任一处理方（例如旧代码进程）推过水位也不会吞掉事件。首次上线把水位以内的历史单一次性标为已处理，避免重跑旧事件。
     first = "handled_algos" not in r["watch"]
     handled = r["watch"].setdefault("handled_algos", {})
+    trailing_hits = []   # 本轮判定为移动止损退出的币：暂存消费要在末尾重读的登记上落盘
     floor = int(now.timestamp() * 1000) - RESCAN_MS
     for t in ("oco", "conditional"):
         for a in X.get("/api/v5/trade/orders-algo-history", ordType=t, state="effective", instType="SWAP").get("data", []):
@@ -295,8 +312,16 @@ def run_once(cfg, source: str = "demo_watch 轮询") -> dict:
                     continue
                 handled[a["algoId"]] = u
                 why = "止损" if a["actualSide"] == "sl" else "止盈"
+                reason = a["actualSide"]
+                if reason == "sl":
+                    # 移动止损退出在交易所侧同样是 actualSide=sl：靠持仓登记（还在时）或清登记前的暂存标记区分，
+                    # 命中则 reason=trailing_stop 唤醒专门再讨论，且不记止损冷却（它通常是盈利退出，记入会污染披露）
+                    from desk import trailing_stop as _tsr
+                    if _tsr.position_is_trailing(a["instId"]) or _tsr.consume_exit_reason(r, a["instId"], u):
+                        reason, why = "trailing_stop", "移动止损"
+                        trailing_hits.append(a["instId"])
                 X.log_event("stop_detected" if a["actualSide"] == "sl" else "tp_detected", inst_id=a["instId"], algoId=a["algoId"], px=a.get("actualPx"))
-                if a["actualSide"] == "sl":   # 止盈不记止损冷却（不禁止同向）
+                if reason == "sl":   # 止盈/移动止损不记止损冷却（不禁止同向）
                     try:   # L6：记下被止损方向
                         from desk import stop_cooldown
                         stop_cooldown.record(a["instId"], a.get("side"), a.get("posSide"), a.get("algoId"),
@@ -308,12 +333,16 @@ def run_once(cfg, source: str = "demo_watch 轮询") -> dict:
                     log(f"检测到演练合约{why} {a['instId']} algo {a['algoId']}，不启动再讨论"); continue
                 if halt:
                     log(f"检测到模拟盘{why} {a['instId']} algo {a['algoId']}，HALT 生效不启动再讨论"); continue
-                log(f"检测到模拟盘{why} {a['instId']} algo {a['algoId']} → 再讨论：{schedule_rediscuss(cfg, {'inst_id': a['instId'], 'trade_id': 'DEMO-' + a['algoId'], 'reason': a['actualSide']})}")
+                log(f"检测到模拟盘{why} {a['instId']} algo {a['algoId']} → 再讨论：{schedule_rediscuss(cfg, {'inst_id': a['instId'], 'trade_id': 'DEMO-' + a['algoId'], 'reason': reason})}")
             else:
                 X.log_event("close_algo_filled", inst_id=a["instId"], algoId=a["algoId"], side=a.get("actualSide"))
     keep = {k: v for k, v in handled.items() if v >= floor - RESCAN_MS}   # 只保留 48 小时内的已处理记录
     r = DX.reg(); r["watch"]["last_algo_uts"] = max(newest, int(r["watch"].get("last_algo_uts") or 0))
     r["watch"]["handled_algos"] = {**{k: v for k, v in (r["watch"].get("handled_algos") or {}).items() if v >= floor - RESCAN_MS}, **keep}
+    for _ti in trailing_hits:   # 移动止损退出暂存的消费落盘（第 3 步中途的 r 在此处被重读，只改内存副本不算数）
+        (r["watch"].get("trailing_exits") or {}).pop(_ti, None)
+    from desk import trailing_stop as _tsp
+    _tsp.prune_stash(r, floor - RESCAN_MS)
     DX.save_reg(r)
     log(f"完成：模拟盘持仓 {len(held)}，条件单 {len(live)}，权益基准 {bk['equity']:.2f}（实时 {bk['live_equity']:.2f}）")
     return {"ok": True}

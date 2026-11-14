@@ -28,6 +28,13 @@ execution:
     fallback_judge_model: deepseek-flash   # 判定模型：快速档（与 llm.quick_model 同档），不用交易经理席位的 opus 推理档（巡检周期内要快）
     fallback_judge_provider: deepseek      # 判定模型 provider（与 llm.provider 同名时走 make_llm 的 quick 通道）
 
+  # 移动止损替代固定止盈（desk/trailing_stop.py；2026-11-14 用户批准）：本场 LLM 行情判定生效（方向与订单一致、
+  # 强度 strong/moderate）且阶段非 late_exhaustion 时，新开仓位不挂固定止盈单，改用移动止损退出；TM 的计划止盈
+  # 照常用于下单 RR≥1.5 等全部硬护栏校验与激活线计算，一项不改。late_exhaustion / 非趋势 / 判定失败保持固定止盈。
+  trailing_stop:
+    enabled: true                       # 开关：false=全部仓位固定止盈（改动前行为）
+    activation_frac_of_tp: 0.5          # 激活线：价格向有利方向走出「计划止盈距离」的这一比例后，移动止损开始跟踪
+    trail_atr_mult: 1.0                 # 跟踪距离 = 该倍数 × 开仓时 ATR14（日线口径，与止损标尺同源）
 llm:
   provider: deepseek                    # TradingAgents 内置 provider（OpenAI 兼容，含 DeepSeek 思考模式适配）
   base_url_env: TA_LLM_BASE_URL         # 未设置时用 default_base_url
@@ -233,12 +240,12 @@ sessions:                               # 每日两场（desk/sessions.py）；�
   morning:                              # 早场：沿用原 O1 窗口
     tz: Asia/Shanghai                   # 早场按北京时间定义
     start: "08:00"                      # 开场时刻（当地时间）
-    window: ["07:55", "12:00"]          # 允许运行的窗口（当地时间），窗口外退出
+    window: ["07:30", "12:00"]          # 允许运行的窗口（当地时间），窗口外退出
     missing_after_minutes: 90           # 仅说明用；早场缺失告警仍由 alerts.daily_missing_after 控制
   evening:                              # 晚场盘中复盘（2026-10-23 用户批准），流程与早场完全相同
     tz: America/New_York                # 按纽约时间定义，随美国夏令时自动切换（夏令时=北京 20:30，冬令时=北京 21:30）
     start: "08:30"                      # 开场时刻（纽约时间）；例行任务用 CRON_TZ=America/New_York 30 8 * * *
-    window: ["08:25", "10:30"]          # 允许运行的窗口（纽约时间）
+    window: ["07:55", "10:30"]          # 允许运行的窗口（纽约时间）
     missing_after_minutes: 60           # 开场后 60 分钟仍无 state/daily_done/<日期>-evening → evening_missing 告警（每天一次）
 offsite:                                # 离机备份与心跳（2026-10-23 用户批准接到 <BACKUP_HOST>，见 desk/offsite.py）
   enabled: true                         # run_daily 成功并本机备份后，用 sftp 上传备份包；失败只告警（offsite_backup_failed），不影响日报

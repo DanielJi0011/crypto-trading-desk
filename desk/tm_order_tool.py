@@ -171,6 +171,16 @@ def validate(cfg, call: OrderToolCall, ctx: dict) -> list[str]:
                             "或改用 open 现价入场，不要改成 hold 绕过")
         if errs:
             return errs
+    # 3.6) 移动止损退出标记（2026-11-14 用户批准，desk/trailing_stop.py）：趋势市生效（方向一致、强度
+    #      strong/moderate）、非末段衰竭的新入场（open，或无持仓时的 pending/replace_pending）→ 该仓位
+    #      改用移动止损退出。此处只把计划止盈与开仓 ATR 记进 ctx（执行层据此不挂固定止盈单）；
+    #      TM 的计划止盈仍照常过下面 §4 的 RR 等全部硬护栏校验，一项不改。加仓腿/keep_pending 不在范围。
+    if a in ("open", "pending", "replace_pending") and not (a != "open" and pos):
+        from desk import demo_exec as _DX
+        if (_DX.ecfg(cfg)["trailing_stop"].get("enabled") and tr.get("enabled") and tr.get("active")
+                and not tr.get("downgrade") and call.side and call.side == tr.get("side")
+                and _num(call.take_profit) and float(mk.get("atr14") or 0) > 0):
+            ctx["_trailing_exit"] = {"plan_tp": float(call.take_profit), "atr14": float(mk["atr14"])}
     # 4) 点位硬护栏（止损侧向、距离≤stop_max_pct、止盈侧向、RR≥min_rr）
     if a in OPEN_ACTS or a == "keep_pending":
         px = float(mk["last"]) if a in ("open", "add") else float(call.trigger_px)
@@ -374,6 +384,8 @@ def to_decision(call: OrderToolCall, ctx: dict):
     dec = manager.ManagerDecision(**{**base, **d})
     dec._order_tool = {"action": a, "margin_pct": _num(call.margin_pct), "call": call.model_dump(),
                        "keep_expiry_at": (ctx.get("existing") or {}).get("expires") if call.keep_expiry and a in ("keep_pending", "replace_pending") else None}
+    if ctx.get("_trailing_exit"):   # 移动止损退出（validate §3.6 已判定资格）：执行层据此不挂固定止盈
+        dec._trailing_exit = dict(ctx["_trailing_exit"])
     return dec
 
 
@@ -416,6 +428,15 @@ def instructions(ctx: dict, cfg=None) -> str:
                          f"近价触发允许范围 {_last - _cap:.6g}~{_last + _cap:.6g}。")
         elif tr.get("failed"):
             lines.append("本币本场行情判定失败：趋势市规则不生效，按常规规则下单。")
+    if cfg is not None and tr.get("enabled"):
+        try:
+            from desk import demo_exec as _DX
+            if _DX.ecfg(cfg)["trailing_stop"].get("enabled"):
+                lines.append("退出方式（代码决定，不用你选）：本场行情判定生效且阶段不是末段衰竭时，你的新仓改用移动止损"
+                             "退出、不挂固定止盈单——你给的 take_profit 只用于盈亏比校验与移动止损激活线，请照常按 RR≥1.5 给点位；"
+                             "末段衰竭或无趋势时仍为固定止盈。")
+        except Exception:
+            pass
     return "\n".join(lines)
 
 

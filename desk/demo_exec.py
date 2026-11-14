@@ -27,7 +27,11 @@ def ecfg(cfg) -> dict:
          "protected_algo_ids": [], "trigger_px_type": "last", "stop_coverage_auto_replace": False}
     out = {**d, **(cfg.get("execution") or {})}
     out["entry_limit"] = {**ENTRY_LIMIT_DEFAULTS, **(out.get("entry_limit") or {})}
+    out["trailing_stop"] = {**TRAILING_DEFAULTS, **(out.get("trailing_stop") or {})}
     return out
+
+
+TRAILING_DEFAULTS = {"enabled": False, "activation_frac_of_tp": 0.5, "trail_atr_mult": 1.0}
 
 
 ENTRY_LIMIT_DEFAULTS = {"enabled": True, "offset_pct": 0.1, "timeout_minutes": 3, "fallback_market": False, "ws_check_secs": 20,
@@ -399,7 +403,9 @@ def cancel_triggers(cfg, inst, why) -> list:
     return done
 
 
-def open_now(cfg, bk, inst, size_pct, sl, tp, side, lev, decision_id, horizon_days, ref_px):
+def open_now(cfg, bk, inst, size_pct, sl, tp, side, lev, decision_id, horizon_days, ref_px, exit_meta=None):
+    # exit_meta（移动止损）：{"exit_mode": "trailing", "plan_tp": ..., "atr14_open": ...} 时调用方传 tp=None
+    # （只附带止损、不挂固定止盈），本函数把退出方式与棘轮初始状态写进持仓登记，供 desk/trailing_stop.py 接管。
     _require()
     notional = size_pct * bk["equity"] / 100 * lev
     sz = X.contracts(inst, notional / ref_px)
@@ -424,16 +430,23 @@ def open_now(cfg, bk, inst, size_pct, sl, tp, side, lev, decision_id, horizon_da
     d = X.post("/api/v5/trade/order", body)["data"][0]
     r = reg(); r["positions"][inst] = {"decision_id": decision_id, "side": side, "opened": settings.now_str(), "child_ordId": d.get("ordId"),
                                        "deadline": (settings.now() + _dt.timedelta(days=horizon_days)).strftime("%Y-%m-%d %H:%M:%S%z")}
+    if exit_meta:
+        r["positions"][inst].update(exit_meta)
+        r["positions"][inst]["trail"] = {"activated": False, "best_px": None, "stop_px": sl}
     save_reg(r)
     from desk import entry_state
     entry_state.advance(d.get("ordId"), "open_sent", inst_id=inst, decision_id=decision_id)
-    X.log_event("open_ok", inst_id=inst, decision_id=decision_id, ordId=d.get("ordId"), sz=sz, side=side, lever=lev, sl=sl, tp=tp)
+    X.log_event("open_ok", inst_id=inst, decision_id=decision_id, ordId=d.get("ordId"), sz=sz, side=side, lever=lev, sl=sl, tp=tp,
+                **({"exit_mode": "trailing", "plan_tp": exit_meta.get("plan_tp")} if exit_meta else {}))
     return True, {"trade_id": f"DEMO-{inst}-{ps}", "ord_id": d.get("ordId"), "sz": sz, "qty": qty, "px": ref_px, "side": side,
-                  "leverage": lev, "margin": qty * ref_px / lev, "notional": qty * ref_px, "liq_px": checks.get("liq_px"), "checks": checks}
+                  "leverage": lev, "margin": qty * ref_px / lev, "notional": qty * ref_px, "liq_px": checks.get("liq_px"), "checks": checks,
+                  **({"exit_mode": "trailing", "plan_tp": exit_meta.get("plan_tp")} if exit_meta else {})}
 
 
-def place_trigger(cfg, bk, inst, o: dict):
-    """条件入场单：OKX trigger 算法单（市价触发）+ attachAlgoOrds 止损止盈。o 同旧 pending 字段。"""
+def place_trigger(cfg, bk, inst, o: dict, extra: dict | None = None):
+    """条件入场单：OKX trigger 算法单（市价触发）+ attachAlgoOrds 止损止盈。o 同旧 pending 字段。
+    extra 透传给 submit_trigger 写进登记表 meta（移动止损的 exit_mode/plan_tp/atr14_open 走这里；
+    o["take_profit"]=None 时只附带止损、不挂固定止盈）。"""
     _require()
     side, lev, px = o["side"], float(o.get("leverage") or 1), float(o["trigger_px"])
     sz = X.contracts(inst, float(o["size_pct"]) * bk["equity"] / 100 * lev / px)
@@ -450,7 +463,7 @@ def place_trigger(cfg, bk, inst, o: dict):
     if trigger_orders(inst):
         return False, {"reasons": ["该币已有受保护的条件单，不替换"], "checks": checks}
     expires = (settings.now() + _dt.timedelta(hours=float(o.get("expire_hours") or 24))).strftime("%Y-%m-%d %H:%M:%S%z")
-    meta = submit_trigger(cfg, inst, o, sz, expires)
+    meta = submit_trigger(cfg, inst, o, sz, expires, extra=extra)
     return True, {**meta, "id": meta["algoId"]}
 
 
@@ -596,7 +609,8 @@ def submit_trigger(cfg, inst, o: dict, sz: str, expires: str, force_market: bool
     r = reg(); r["triggers"][d["algoId"]] = meta; save_reg(r)
     from desk import entry_state
     entry_state.advance(d["algoId"], "armed", inst_id=inst, decision_id=o.get("decision_id"))
-    X.log_event("trigger_placed", **{k: meta[k] for k in ("inst_id", "algoId", "sz", "side", "trigger_px", "stop_loss", "take_profit", "decision_id", "order_px")})
+    X.log_event("trigger_placed", **{k: meta[k] for k in ("inst_id", "algoId", "sz", "side", "trigger_px", "stop_loss", "take_profit", "decision_id", "order_px")},
+                **({"exit_mode": meta["exit_mode"], "plan_tp": meta.get("plan_tp")} if meta.get("exit_mode") else {}))
     if order_px != "-1":   # 限价入场：登记到超时跟踪（desk/entry_limit.py，由 demo_watch 每轮检查）
         from desk import entry_limit
         entry_limit.register(d["algoId"], inst=inst, side=side, pos_side=ps, sz=sz, order_px=order_px, trigger_px=px,
@@ -604,7 +618,9 @@ def submit_trigger(cfg, inst, o: dict, sz: str, expires: str, force_market: bool
                              attach_cl=att["attachAlgoClOrdId"], lever=lev, decision_id=o.get("decision_id"),
                              condition=o.get("condition"), expires=expires, source=o.get("source"),
                              horizon_days=o.get("horizon_days"),
-                             **({"add": dict(extra["add"])} if (extra or {}).get("add") else {}))
+                             **({"add": dict(extra["add"])} if (extra or {}).get("add") else {}),
+                             **({"exit_mode": meta["exit_mode"], "plan_tp": meta.get("plan_tp"),
+                                 "atr14_open": meta.get("atr14_open")} if meta.get("exit_mode") else {}))
     try:   # 挂单即时提醒（与开平仓同一 webhook 通道；按 algoId 去重，entry_limit_registered 不再另发）
         from desk.demo_ws import notify_placed
         notify_placed(meta)

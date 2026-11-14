@@ -12,7 +12,7 @@ import sys
 from desk import settings
 
 
-REASON_CN = {"sl": "止损", "tp": "止盈", "rr_recheck": "盈亏比复核"}
+REASON_CN = {"sl": "止损", "tp": "止盈", "rr_recheck": "盈亏比复核", "trailing_stop": "移动止损"}
 
 
 def _fmt(x) -> str:
@@ -36,6 +36,12 @@ def reason_brief(reason: str, event: str, detail: dict | None = None) -> str:
         return (f"## 本次再讨论的触发原因：止盈成交（事件 {event}）\n"
                 "上一笔仓位刚在止盈价平仓，本次讨论的任务是定下一次入场点位。注意避免追单：价格已朝原方向走完一段，"
                 "不要在现价直接追同向；优先考虑等回抽到关键位再入场的条件单，或者确认反转再反向，没有好位置就观望。")
+    if reason == "trailing_stop":
+        return (f"## 本次再讨论的触发原因：移动止损触发平仓（事件 {event}）\n"
+                "上一笔仓位是趋势市里的移动止损仓位（desk/trailing_stop.py）：价格先朝有利方向走出激活线、止损随后跟进最有利价，"
+                "最终一段回撤触及移动止损平仓——这通常意味着趋势告一段落或反转，多数情况下是盈利退出，不要当作看错方向的普通止损。"
+                "本次讨论的任务是定下一次入场：重新评估趋势是否仍在；同向再入场优先等回抽到关键位的条件单，不要在现价直接追；"
+                "确认反转再考虑反向，没有好位置就观望。")
     return (f"## 本次再讨论的触发原因：止损成交（事件 {event}）\n"
             "上一笔仓位刚被止损，本次讨论的任务是重新评估并定下一次入场点位；同向开仓有冷却期限制。")
 
@@ -44,7 +50,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--coin", required=True)
     ap.add_argument("--event", default="")
-    ap.add_argument("--reason", choices=("sl", "tp", "rr_recheck"), default="sl")   # 触发原因：止损 / 止盈 / 开仓后 RR 复核
+    ap.add_argument("--reason", choices=("sl", "tp", "rr_recheck", "trailing_stop"), default="sl")   # 触发原因：止损 / 止盈 / RR 复核 / 移动止损
     ap.add_argument("--mock", action="store_true")
     a = ap.parse_args(argv)
     if a.mock:
@@ -81,7 +87,7 @@ def main(argv=None):
     res = analysis.analyze(cfg, coin, date, bk, tracker, extra_brief=reason_brief(a.reason, a.event, detail))
     fs = res["final_state"]; fs["_signal"] = res["signal"]
     st = stances.extract(fs, cfg, tracker)
-    _src = {"tp": "post_tp", "sl": "post_stop", "rr_recheck": "rr_recheck"}[a.reason]
+    _src = {"tp": "post_tp", "sl": "post_stop", "rr_recheck": "rr_recheck", "trailing_stop": "post_trailing"}[a.reason]
     rec = manager.decide_and_execute(cfg, coin, date, fs, st, tracker, source=f"{_src}:{a.event}")
     rec["trigger_reason"] = a.reason
     rec["report_dir"] = res["report_dir"]

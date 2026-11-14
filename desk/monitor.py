@@ -137,7 +137,7 @@ def _schedule_rediscuss_locked(cfg, trade: dict) -> str:
     if trade["trade_id"] in s["events"]:
         return "该事件已讨论过"
     now = settings.now()
-    reason = trade.get("reason") if trade.get("reason") in ("tp", "rr_recheck") else "sl"
+    reason = trade.get("reason") if trade.get("reason") in ("tp", "rr_recheck", "trailing_stop") else "sl"
 
     def _spawn() -> str:
         prev_last = s.get("last")

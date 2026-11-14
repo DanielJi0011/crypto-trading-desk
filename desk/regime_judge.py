@@ -8,6 +8,16 @@ TM 决策前做一次，输出严格结构化结果。代码再按判定执行�
 数据缺口，绝不因判定失败中断场次。总开关 manager.trend_rule_enabled=false 时整段关闭
 （不调判定、不注入提示词、护栏同时失效，回到 A+ 之前行为）。
 每次判定（含特征快照）另存 state/ledger/regime_calls.jsonl，供日后与实际走势对照打分（打分未建）。
+
+判定标准 v2（judge_standard=2，2026-11-14 用户批准）：审计发现 v1 标准下 18 次场次判定 16 次
+late_exhaustion、事后 8 次独立观测 8/8 沿趋势延续、衰竭证据恒收敛于 RSI 超卖/区间底部/偏离过深/
+短期跌幅四个「伸展变量」，肯定式衰竭证据引用 0/18——stage 边界实质是拉伸程度阈值而非趋势失败
+检验。v2 改为：① late_exhaustion 必须给出正面衰竭证据 exhaustion_signals（五项闭集，见下）；
+② RSI/区间位置/偏离/短期涨跌幅归类为伸展变量，只支持 direction/strength，不许推出 late；
+③ early/mid 给正面定义，结构完整时默认 mid；④ 代码门（apply_stage_gate）：返回 late 但
+exhaustion_signals 无任何闭集内有效值 → 生效 stage 强制降为 mid，原始 stage 与覆盖标记随判定
+一并存档——纯提示词约束已被审计证明会被模型绕过（自述「动量未衰竭」仍判衰竭），故由代码裁定。
+v1 存档记录无 judge_standard 字段，打分时按 v1 分段。
 """
 from __future__ import annotations
 
@@ -20,6 +30,14 @@ from desk import llm as dllm
 
 REGIME_CALLS = settings.STATE / "ledger" / "regime_calls.jsonl"
 FEATURE_BARS = 260          # MA200 与其 5 日斜率需要 ≥205 根已收盘日线，取 260 留余量
+JUDGE_STANDARD = 2          # 判定标准版本（v1=2026-11-11 上线版，无此字段；v2=2026-11-14 衰竭证据门）
+
+# 正面衰竭证据闭集（v2）：stage=late_exhaustion 时必须至少给出一项（代码侧校验，闭集外值无效）。
+EXHAUSTION_SIGNALS = ("slope_flattening", "deepening_pullbacks", "structure_break",
+                      "momentum_divergence", "volume_stall")
+_EXHAUSTION_CN = {"slope_flattening": "均线斜率收敛/走平", "deepening_pullbacks": "反弹/回撤深度递增",
+                  "structure_break": "高低点结构破坏", "momentum_divergence": "动量背离",
+                  "volume_stall": "放量滞跌/滞涨"}
 
 
 def trend_cfg(cfg) -> dict:
@@ -107,7 +125,13 @@ def feature_block(feat, mk) -> str:
 class RegimeJudgment(BaseModel):
     direction: Literal["short", "long", "none"] = Field(description="趋势方向：short=空头趋势，long=多头趋势，none=无趋势/震荡")
     strength: Literal["strong", "moderate", "none"] = Field(description="趋势强度：strong=多项特征同向且显著，moderate=同向但一般；direction=none 时填 none")
-    stage: Literal["early", "mid", "late_exhaustion"] = Field(description="趋势阶段：early=刚确立，mid=进行中，late_exhaustion=末段衰竭（走势拉伸、贴极值、偏离过深）")
+    stage: Literal["early", "mid", "late_exhaustion"] = Field(description="趋势阶段：early=刚确立，mid=进行中，late_exhaustion=末段衰竭。"
+        "late_exhaustion 只许在 exhaustion_signals 至少给出一项正面衰竭证据时返回；RSI 极端、贴区间边缘、偏离均线深、"
+        "短期涨跌幅大都是伸展变量，在强趋势中是常态，只支持 direction/strength，永远不构成衰竭证据")
+    exhaustion_signals: list[str] = Field(default_factory=list, description="正面衰竭证据（闭集，可多选；stage 非 late_exhaustion 时留空）："
+        "slope_flattening=均线斜率收敛/走平；deepening_pullbacks=反弹/回撤深度递增；structure_break=高低点结构破坏；"
+        "momentum_divergence=动量背离实际出现（evidence 中须指明哪个指标与价格背离）；volume_stall=放量滞跌/滞涨。"
+        "stage=late_exhaustion 时必须非空且只能取上述值，否则代码校验会把 stage 强制降为 mid")
     confidence: float = Field(description="0~1，对本次行情判定的置信度")
     evidence: list[str] = Field(description="支撑判定的证据，每条引用具体特征值（如「MA50 斜率 -1.23%」「RSI14 31.2」）")
     summary: str = Field(description="一句话中文结论（≤60 字）")
@@ -125,6 +149,8 @@ def normalize_judgment(obj) -> dict | None:
             obj = dict(obj)
             if isinstance(obj.get("evidence"), str):   # 模型偶尔把 evidence 给成单个字符串，先包成列表再校验
                 obj["evidence"] = [obj["evidence"]]
+            if isinstance(obj.get("exhaustion_signals"), str):
+                obj["exhaustion_signals"] = [obj["exhaustion_signals"]]
             d = RegimeJudgment(**obj).model_dump()
         else:
             return None
@@ -138,10 +164,20 @@ def normalize_judgment(obj) -> dict | None:
     ev = d.get("evidence") or []
     if isinstance(ev, str):
         ev = [ev]
+    sig_raw_in = d.get("exhaustion_signals") or []
+    if isinstance(sig_raw_in, str):
+        sig_raw_in = [sig_raw_in]
+    elif not isinstance(sig_raw_in, (list, tuple)):
+        sig_raw_in = [sig_raw_in]
+    sig_raw = [str(x)[:40] for x in list(sig_raw_in)[:8]]
+    sig_valid = list(dict.fromkeys(s for s in sig_raw if s in EXHAUSTION_SIGNALS))   # 闭集过滤+保序去重
     return {"direction": d["direction"], "strength": d["strength"], "stage": d["stage"],
             "confidence": max(0.0, min(1.0, float(conf))),
             "evidence": [str(x)[:120] for x in list(ev)[:8]],
-            "summary": str(d.get("summary") or "")[:120]}
+            "summary": str(d.get("summary") or "")[:120],
+            "exhaustion_signals": sig_valid,
+            "exhaustion_signals_raw": sig_raw,
+            "judge_standard": JUDGE_STANDARD}
 
 
 def judge_prompt(coin_name: str, inst: str, feat, mk, S: float, votes: dict, market_text: str) -> str:
@@ -157,9 +193,25 @@ def judge_prompt(coin_name: str, inst: str, feat, mk, S: float, votes: dict, mar
     lines += ["", "判定口径：",
               "- direction：多项特征一致指向单边行情时给 short/long；方向混杂、均线纠缠、震荡特征明显时给 none。",
               "- strength：strong=多项特征同向且幅度显著；moderate=同向但幅度一般、或个别特征不一致；direction=none 时 strength=none。",
-              "- stage：early=趋势刚确立；mid=趋势进行中；late_exhaustion=末段衰竭——做空看：现价贴近 20 日低点/区间底部、"
-              "RSI 极低、短期跌幅过大、现价对均线偏离过深（做多镜像：贴近高点、RSI 极高、偏离过高），"
-              "此时继续追单边容易被反向波动打穿。",
+              "- stage 的两类变量必须分清（v2 标准）：",
+              "  · 伸展变量：RSI14 水平、20 日区间位置、现价偏离均线的距离、5 日/20 日涨跌幅。它们只说明行情已经走了多远。"
+              "强趋势中 RSI 长期钉在极值区、价格贴着区间边缘运行是常态（强下跌里 RSI 20 上下、贴区间底可以持续很多天），"
+              "因此伸展变量只许用来支撑 direction 与 strength，单独或任意组合都不许推出 late_exhaustion。",
+              "  · 衰竭证据：只有出现「趋势正在失败」的正面信号，才谈得上末段衰竭（见 stage 定义的闭集）。",
+              "- stage（正面定义）：",
+              "  · early=趋势刚确立：均线刚转为同向排列、斜率刚转向趋势方向、现价与均线距离尚近、顺趋势的新极值刚开始出现。",
+              "  · mid=趋势进行中且结构完整：均线斜率稳定或还在加深、回调浅且很快被趋势方向重新吞没、高低点结构沿趋势方向推进"
+              "（下跌看更低的低点/高点，上涨镜像）。只要结构未破，即使伸展变量已经很极端，也判 mid，不要因为「跌多了/涨多了」改判衰竭。",
+              "  · late_exhaustion=末段衰竭：必须至少出现一项正面衰竭证据，并把选中的项填入 exhaustion_signals（只能取下列闭集值，可多选），"
+              "同时在 evidence 中为每一项写明对应的具体特征数值：",
+              "    slope_flattening=均线斜率收敛/走平（以单时点近似：趋势方向上 MA20 斜率绝对值已明显小于 MA50 斜率、或斜率绝对值本身接近 0）；",
+              "    deepening_pullbacks=逆趋势反弹/回撤的深度一轮比一轮深；",
+              "    structure_break=高低点结构破坏（下跌趋势出现更高的低点并站稳、或更高的高点；上涨镜像）；",
+              "    momentum_divergence=动量背离实际出现（evidence 须指明哪个指标与价格如何背离，如「价格创新低而 RSI14 未创新低」；"
+              "只写「无背离」或指标未提及不算）；",
+              "    volume_stall=放量滞跌/滞涨（量能放大但价格无法继续沿趋势方向推进）。",
+              "  · 若拿不到任何一项衰竭证据，stage 不许给 late_exhaustion；系统有代码校验：返回 late_exhaustion 但 exhaustion_signals "
+              "为空或含闭集外的值，生效 stage 会被强制降为 mid 并记入存档。",
               "只输出结构化结果，不要输出其他文字。"]
     return "\n".join(lines)
 
@@ -189,13 +241,39 @@ def call_judge(cfg, tracker, prompt: str) -> dict | None:
 
 
 # ------------------------------------------------------------------ 判定结果 → 规则/提示词/日志
+def apply_stage_gate(judge) -> dict | None:
+    """v2 代码门：stage=late_exhaustion 但 exhaustion_signals 无任何闭集内有效值（normalize 已做闭集
+    过滤，此处只看过滤后的列表）→ 生效 stage 强制降为 mid。返回标注后的判定副本：stage=生效值、
+    stage_raw=模型原始值、stage_overridden 标记、exhaustion_signals 一律为闭集内有效值（防御性再过滤
+    一次，未经 normalize 的直构 dict 也受同一门约束）。原始判定不丢：raw 与覆盖动作都随判定进存档。"""
+    if not judge:
+        return None
+    j = dict(judge)
+    sig = [s for s in (j.get("exhaustion_signals") or []) if s in EXHAUSTION_SIGNALS]
+    j["exhaustion_signals"] = list(dict.fromkeys(sig))
+    raw = j.get("stage")
+    j["stage_raw"] = raw
+    if raw == "late_exhaustion" and not j["exhaustion_signals"]:
+        j["stage"] = "mid"
+        j["stage_overridden"] = True
+        j["stage_override_reason"] = "late_exhaustion_without_exhaustion_signals"
+    else:
+        j["stage_overridden"] = False
+        j.pop("stage_override_reason", None)
+    j.setdefault("judge_standard", JUDGE_STANDARD)
+    return j
+
+
 def build_regime(cfg, judge, feat) -> dict:
-    """把判定结果整理成 validate/提示词/决策记录共用的 regime dict。
+    """把判定结果整理成 validate/提示词/决策记录共用的 regime dict。judge 先过 v2 代码门
+    （apply_stage_gate），此后所有消费者（降级、移动止损资格、提示词、存档）只见生效 stage。
     规则生效（active）= 方向为 long/short 且强度 strong/moderate；late_exhaustion 在生效时即降级。"""
     tc = trend_cfg(cfg)
+    judge = apply_stage_gate(judge)
     active = bool(judge and judge["direction"] in ("long", "short") and judge["strength"] in ("strong", "moderate"))
     return {"enabled": tc["enabled"], "source": "llm", "failed": judge is None,
             "judge": judge, "features": feat, "cfg": tc, "active": active,
+            "judge_standard": JUDGE_STANDARD,
             "side": judge["direction"] if active else None,
             "downgrade": bool(active and judge["stage"] == "late_exhaustion")}
 
@@ -217,6 +295,12 @@ def regime_block(regime: dict, mk) -> str:
             f"阶段={_STAGE_CN[j['stage']]}（{j['stage']}）；置信 {j['confidence']:.2f}。\n"
             f"结论：{j['summary']}\n"
             "证据：" + ("；".join(j["evidence"]) if j["evidence"] else "（无）"))
+    if j.get("stage_overridden"):
+        head += ("\n注：判定员原始阶段为末段衰竭（late_exhaustion），但未给出任何正面衰竭证据"
+                 "（exhaustion_signals 为空），已按判定标准 v2 代码校验强制降为中段（mid）生效，末段衰竭降级不触发。")
+    elif j["stage"] == "late_exhaustion" and j.get("exhaustion_signals"):
+        head += ("\n衰竭证据（正面信号）：" + "；".join(
+            f"{_EXHAUSTION_CN.get(s, s)}（{s}）" for s in j["exhaustion_signals"]))
     if not regime.get("active"):
         return head + "\n本场趋势市执行规则不生效（判定无趋势或强度不足），按常规规则决策。"
     cap = tc["near_atr"] * float((mk or {}).get("atr14") or 0)
@@ -235,7 +319,7 @@ def regime_block(regime: dict, mk) -> str:
 def log_call(*, date, session, source, inst, decision_id, regime) -> dict:
     """每次判定追加一行 state/ledger/regime_calls.jsonl（判定 + 特征快照），供日后对照实际走势打分。"""
     rec = {"time": settings.now_str(), "date": date, "session": session, "source": source,
-           "inst_id": inst, "decision_id": decision_id,
+           "inst_id": inst, "decision_id": decision_id, "judge_standard": JUDGE_STANDARD,
            "judge": regime.get("judge"), "failed": bool(regime.get("failed")),
            "active": bool(regime.get("active")), "downgrade": bool(regime.get("downgrade")),
            "features": regime.get("features")}

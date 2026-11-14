@@ -332,7 +332,12 @@ def _wait_or_end(cfg, aid, e, filled, remain) -> str:
          "consensus": e.get("consensus"), "reason": e.get("reason")}
     try:
         meta = DX.submit_trigger(cfg, inst, o, X._dec(remain), expires,
-                                 extra={"rearm_of": str(aid), "rearm_n": n}, keep_lev=True)
+                                 extra={"rearm_of": str(aid), "rearm_n": n,
+                                        # 移动止损仓位重挂必须保留退出方式（o["take_profit"] 本就是 None），
+                                        # 否则重挂单成交后会变成无计划止盈的裸奔仓位、棘轮也接不上
+                                        **({"exit_mode": e["exit_mode"], "plan_tp": e.get("plan_tp"),
+                                            "atr14_open": e.get("atr14_open")} if e.get("exit_mode") else {})},
+                                 keep_lev=True)
     except Exception as ex:
         X.log_event("entry_rearm_failed", algoId=aid, inst_id=inst, error=f"{type(ex).__name__}: {ex}")
         _update(aid, status="done", result="rearm_failed", accFillSz=X._dec(filled))

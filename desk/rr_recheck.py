@@ -116,6 +116,8 @@ def planned_for(inst, side, reg_meta) -> dict:
         out = {"planned_entry": trig, "limit_px": float(lp) if lp not in (None, "", "-1") else None,
                "planned_sl": float(e["stop_loss"]) if e.get("stop_loss") else None,
                "planned_tp": float(e["take_profit"]) if e.get("take_profit") else None}
+        if out["planned_tp"] is None and e.get("exit_mode") == "trailing" and e.get("plan_tp"):
+            out["planned_tp"] = float(e["plan_tp"])   # 移动止损仓位：计划止盈在登记里，不在交易所附带单上
         out["planned_rr"] = sizing.rr_ratio(side, trig, out["planned_sl"], out["planned_tp"])
         return out
     try:
@@ -130,6 +132,10 @@ def planned_for(inst, side, reg_meta) -> dict:
             out["planned_rr"] = sizing.rr_ratio(side, float(a["triggerPx"]), out["planned_sl"], out["planned_tp"])
     except Exception:
         pass
+    if not out.get("planned_tp") and (reg_meta or {}).get("exit_mode") == "trailing" and (reg_meta or {}).get("plan_tp"):
+        out["planned_tp"] = float(reg_meta["plan_tp"])   # 移动止损仓位：附带单上没有止盈，计划值在持仓登记里
+        if out.get("planned_entry") and out.get("planned_sl"):
+            out["planned_rr"] = sizing.rr_ratio(side, out["planned_entry"], out["planned_sl"], out["planned_tp"])
     return out
 
 
@@ -184,6 +190,12 @@ def check(cfg, positions=None, halt=False, now=None, schedule=None, sltp=None, p
                 changed = True
                 continue
             sl, tp = (sltp or sltp_for)(it["inst_id"], it["pos_side"])
+            tp_from_plan = False
+            if tp is None:
+                # 移动止损仓位按设计不挂止盈单：复核改用登记里的计划止盈（与下单校验同一基准），不算「止盈缺失」
+                _meta = _reg_meta(it["inst_id"])
+                if _meta.get("exit_mode") == "trailing" and _meta.get("plan_tp"):
+                    tp = float(_meta["plan_tp"]); tp_from_plan = True
             try:
                 fill = float(it["avg_px"] or 0)
             except (TypeError, ValueError):
@@ -198,7 +210,8 @@ def check(cfg, positions=None, halt=False, now=None, schedule=None, sltp=None, p
                     changed = True
                 continue
             rr = sizing.rr_ratio(rec["side"], fill, sl, tp)
-            rec.update(fill=fill, sl=sl, tp=tp, rr=rr, min_rr=mrr, checked_at=settings.now_str())
+            rec.update(fill=fill, sl=sl, tp=tp, rr=rr, min_rr=mrr, checked_at=settings.now_str(),
+                       **({"tp_source": "plan_trailing"} if tp_from_plan else {}))
             changed = True
             if rr is not None and rr + 1e-12 >= mrr:
                 rec["status"] = "ok"

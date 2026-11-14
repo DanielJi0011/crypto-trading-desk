@@ -43,8 +43,13 @@ def _st(bear=0, bull=0, cfg=None):
 
 def _judge(**over):
     j = {"direction": "short", "strength": "strong", "stage": "mid", "confidence": 0.8,
-         "evidence": ["MA50 斜率 -1.20%", "RSI14 38.5"], "summary": "空头趋势进行中"}
+         "evidence": ["MA50 斜率 -1.20%", "RSI14 38.5"], "summary": "空头趋势进行中",
+         "exhaustion_signals": []}
     j.update(over)
+    if j["stage"] == "late_exhaustion" and "exhaustion_signals" not in over:
+        # v2 代码门：无正面衰竭证据的 late 会被强制降为 mid；测「真 late」语义时默认带一项合法信号，
+        # 测代码门本身则显式传 exhaustion_signals=[] 或闭集外值。
+        j["exhaustion_signals"] = ["structure_break"]
     return j
 
 
@@ -385,3 +390,110 @@ def test_validate_no_downgrade_no_risk_cap(vctx):
     # 生效但非末段衰竭：risk_scale=0.8 的近价单不受降级上限影响
     cfg, ctx = vctx(_reg())
     assert T.validate(cfg, _pend(102.0, "gte", 104.5, 98.0, risk_scale=0.8), ctx) == []
+
+
+# ---------------- 判定标准 v2（2026-11-14：衰竭证据门 + 代码门 + 版本号） ----------------
+
+def test_judge_standard_v2_and_signal_set():
+    assert RJ.JUDGE_STANDARD == 2
+    assert set(RJ.EXHAUSTION_SIGNALS) == {"slope_flattening", "deepening_pullbacks", "structure_break",
+                                          "momentum_divergence", "volume_stall"}
+
+
+def test_normalize_signals_filtered_raw_kept_and_versioned():
+    j = RJ.normalize_judgment({"direction": "short", "strength": "strong", "stage": "late_exhaustion",
+                               "confidence": 0.7, "evidence": ["价格创新低而 RSI14 未创新低"], "summary": "衰竭",
+                               "exhaustion_signals": ["momentum_divergence", "rsi_oversold", "momentum_divergence"]})
+    assert j["exhaustion_signals"] == ["momentum_divergence"]            # 闭集过滤 + 去重
+    assert j["exhaustion_signals_raw"] == ["momentum_divergence", "rsi_oversold", "momentum_divergence"]
+    assert j["judge_standard"] == 2 and j["stage"] == "late_exhaustion"   # normalize 只解析，覆盖在代码门
+
+
+def test_normalize_signals_string_wrapped_and_missing_default():
+    j = RJ.normalize_judgment({"direction": "short", "strength": "strong", "stage": "late_exhaustion",
+                               "confidence": 0.7, "evidence": [], "summary": "s",
+                               "exhaustion_signals": "volume_stall"})
+    assert j["exhaustion_signals"] == ["volume_stall"]
+    j2 = RJ.normalize_judgment({"direction": "short", "strength": "strong", "stage": "mid",
+                                "confidence": 0.7, "evidence": [], "summary": "s"})
+    assert j2["exhaustion_signals"] == [] and j2["exhaustion_signals_raw"] == []
+
+
+def test_gate_overrides_late_without_signals():
+    r = RJ.build_regime(_cfg(), _judge(stage="late_exhaustion", exhaustion_signals=[]), None)
+    j = r["judge"]
+    assert j["stage"] == "mid" and j["stage_raw"] == "late_exhaustion" and j["stage_overridden"] is True
+    assert j["stage_override_reason"] == "late_exhaustion_without_exhaustion_signals"
+    assert r["active"] and not r["downgrade"]                             # 生效口径用被覆盖后的 stage
+
+
+def test_gate_overrides_late_with_only_invalid_signals():
+    raw = RJ.normalize_judgment({"direction": "short", "strength": "strong", "stage": "late_exhaustion",
+                                 "confidence": 0.9, "evidence": ["RSI14 22", "贴 20 日区间底部"], "summary": "跌深了",
+                                 "exhaustion_signals": ["rsi_oversold", "range_bottom"]})
+    assert raw["exhaustion_signals"] == []                                # 闭集外值在 normalize 即被过滤
+    r = RJ.build_regime(_cfg(), raw, None)
+    assert r["judge"]["stage"] == "mid" and r["judge"]["stage_overridden"] is True and not r["downgrade"]
+
+
+def test_gate_keeps_late_with_valid_signals():
+    r = RJ.build_regime(_cfg(), _judge(stage="late_exhaustion",
+                                       exhaustion_signals=["momentum_divergence", "slope_flattening"]), None)
+    j = r["judge"]
+    assert j["stage"] == "late_exhaustion" and j["stage_raw"] == "late_exhaustion"
+    assert j["stage_overridden"] is False and r["downgrade"]             # 合法 late：降级照旧生效
+    assert j["exhaustion_signals"] == ["momentum_divergence", "slope_flattening"]
+
+
+def test_gate_mid_early_untouched():
+    for st in ("early", "mid"):
+        j = RJ.build_regime(_cfg(), _judge(stage=st), None)["judge"]
+        assert j["stage"] == st and j["stage_raw"] == st and j["stage_overridden"] is False
+
+
+def test_gate_defensive_without_normalize():
+    # 未经 normalize 的直构 dict（缺 exhaustion_signals 字段）同样受代码门约束
+    j = RJ.apply_stage_gate({"direction": "short", "strength": "strong", "stage": "late_exhaustion",
+                             "confidence": 0.5, "evidence": [], "summary": "s"})
+    assert j["stage"] == "mid" and j["stage_overridden"] is True and j["exhaustion_signals"] == []
+    assert RJ.apply_stage_gate(None) is None
+
+
+def test_judge_prompt_v2_wording():
+    p = RJ.judge_prompt("比特币", "BTC-USDT-SWAP", dict(FEAT), dict(MK), -0.5,
+                        {"valid": 11, "long": 1, "short": 8, "neutral": 2}, "")
+    assert "伸展变量" in p and "只许用来支撑 direction 与 strength" in p
+    assert "都不许推出 late_exhaustion" in p and "强趋势中 RSI 长期钉在极值区" in p
+    for key in ("slope_flattening", "deepening_pullbacks", "structure_break",
+                "momentum_divergence", "volume_stall", "exhaustion_signals"):
+        assert key in p
+    assert "结构未破" in p and "强制降为 mid" in p                        # mid 正面定义 + 代码门明示
+    assert "现价贴近 20 日低点/区间底部" not in p                          # v1 的拉伸即衰竭定义已删除
+
+
+def test_prompt_override_note_and_no_downgrade(vctx):
+    cfg = _cfg()
+    p = _prompt(_reg(judge=_judge(stage="late_exhaustion", exhaustion_signals=[]), cfg=cfg), cfg)
+    assert "原始阶段为末段衰竭" in p and "强制降为中段（mid）生效" in p and "降级生效" not in p
+    # 被覆盖后 validate 也不再按衰竭降级：现价 open 不被 [TREND_OVERSOLD] 拦
+    _, ctx = vctx(_reg(judge=_judge(stage="late_exhaustion", exhaustion_signals=[]), cfg=cfg))
+    call = OTC(action="open", side="short", entry=100.0, stop_loss=102.5, take_profit=95.5, **INV)
+    assert not any("[TREND_OVERSOLD]" in e for e in T.validate(cfg, call, ctx))
+
+
+def test_prompt_late_with_signals_lists_them():
+    cfg = _cfg()
+    p = _prompt(_reg(judge=_judge(stage="late_exhaustion",
+                                  exhaustion_signals=["momentum_divergence"]), cfg=cfg), cfg)
+    assert "衰竭证据（正面信号）" in p and "动量背离（momentum_divergence）" in p and "降级生效" in p
+
+
+def test_log_call_v2_fields():
+    reg = RJ.build_regime(_cfg(), _judge(stage="late_exhaustion", exhaustion_signals=[]), dict(FEAT))
+    RJ.log_call(date="2026-11-14", session="evening", source="daily", inst="BTC-USDT-SWAP",
+                decision_id="D-20261114-BTC", regime=reg)
+    row = settings.read_jsonl(RJ.REGIME_CALLS)[-1]
+    assert row["judge_standard"] == 2                                     # 记录级版本位：v1 旧记录无此字段
+    assert row["judge"]["judge_standard"] == 2
+    assert row["judge"]["stage"] == "mid" and row["judge"]["stage_raw"] == "late_exhaustion"
+    assert row["judge"]["stage_overridden"] is True and row["downgrade"] is False

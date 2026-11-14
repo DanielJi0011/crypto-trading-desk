@@ -446,6 +446,8 @@ def session_label(source=None, session=None, decision_id=None) -> str:
         return "止损后再讨论"
     if src.startswith("post_tp"):
         return "止盈后再讨论"
+    if src.startswith("post_trailing"):
+        return "移动止损后再讨论"
     did = str(decision_id or "")
     tag = {"morning": "8点早场", "evening": "20:30晚场"}
     if not session and re.match(r"^D-\d{8}-", did):
@@ -547,7 +549,11 @@ def handle(ev: dict, st: State, cfg=None, rediscuss=None, notifier=notify) -> di
         if not ev:
             return None
         if ev["kind"] in ("stop_loss", "take_profit"):
-            if ev["kind"] == "stop_loss":   # 止盈不记止损冷却（不禁止同向）
+            _trailing = False
+            if ev["kind"] == "stop_loss":
+                from desk import trailing_stop as _tsw   # 移动止损仓位的止损事件：登记还在时直接按登记区分
+                _trailing = _tsw.position_is_trailing(ev.get("inst_id"))
+            if ev["kind"] == "stop_loss" and not _trailing:   # 止盈/移动止损不记止损冷却（移动止损通常是盈利退出，记入会污染披露）
                 try:   # L6：记下被止损方向，冷却期内同向不再开仓
                     from desk import stop_cooldown
                     stop_cooldown.record(ev.get("inst_id"), ev.get("side"), ev.get("posSide"), ev.get("algoId"))
@@ -557,7 +563,7 @@ def handle(ev: dict, st: State, cfg=None, rediscuss=None, notifier=notify) -> di
                 from desk.monitor import schedule_rediscuss as rediscuss
             if _drill(ev.get("inst_id")):   # 演练合约：不启动再讨论
                 rediscuss = lambda _c, _t: "演练跳过"
-            ev["rediscuss_reason"] = "tp" if ev["kind"] == "take_profit" else "sl"
+            ev["rediscuss_reason"] = "tp" if ev["kind"] == "take_profit" else ("trailing_stop" if _trailing else "sl")
             try:   # trade_id 与 demo_watch 一致：'DEMO-<algoId>'，共用 rediscuss.json 去重与冷却
                 ev["rediscuss"] = rediscuss(cfg if cfg is not None else settings.load_config(),
                                             {"inst_id": ev["inst_id"], "trade_id": "DEMO-" + str(ev["algoId"]),

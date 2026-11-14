@@ -268,13 +268,22 @@ def write(cfg, date, decisions, closed, reviews, weight_changes, pb_events, usag
             L += ["## 宏观数据（FRED）", "", f"宏观小节生成失败：{type(e).__name__}", ""]
     L += ["## 二、当前持仓", "", f"现价 = OKX 公共行情最新成交价（last），本报告统一使用 {prices_time} 的同一次快照；"
           "浮盈亏 =（现价 − 均价）× 数量 × 方向，按该快照重算（不含手续费）。第四节“决策时价格”是各币决策当时的价格。", ""]
+    _trail_pos = {}
+    if demo:
+        try:
+            _trail_pos = {i: m for i, m in (demo_exec.reg().get("positions") or {}).items() if m.get("exit_mode") == "trailing"}
+        except Exception:
+            _trail_pos = {}
     if bk["positions"]:
         L += ["| 编号 | 品种 | 方向 | 杠杆 | 保证金 | 名义 | 数量 | 均价 | 现价 | 止损 | 止盈 | 强平价 | 资金费 | 浮盈亏 | 到期 |",
               "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
         for p in bk["positions"]:
+            _tm = _trail_pos.get(p["inst_id"])
+            _tp_cell = (f"移动止损[TRAILING]{'（已激活）' if (_tm.get('trail') or {}).get('activated') else '（未激活）'}"
+                        if _tm else _px(p['tp_px']))
             L.append(f"| {p['trade_id']}{'（旧纸面仓）' if p.get('legacy') else ''} | {p['inst_id']} | {'空' if p['side'] == 'short' else '多'} | {p['leverage']:g}x | {p['margin']:.2f} | "
                      f"{p['notional']:.2f} | {p['qty']:.6g} | {_px(p['avg_px'])} | {_px(p['price'])} | {_px(p['sl_px'])} | "
-                     f"{_px(p['tp_px'])} | {_px(p['liq_px'])} | {p['funding']:+.4f} | {p['upnl']:+.2f} | {p['deadline'] or '—'} |")
+                     f"{_tp_cell} | {_px(p['liq_px'])} | {p['funding']:+.4f} | {p['upnl']:+.2f} | {p['deadline'] or '—'} |")
     else:
         L.append("无持仓。")
     from desk import pending as _pend
@@ -286,7 +295,7 @@ def write(cfg, date, decisions, closed, reviews, weight_changes, pb_events, usag
             for t in bk["triggers"]:
                 at = (t.get("attachAlgoOrds") or [{}])[0]; m = rg.get(t["algoId"], {})
                 L.append(f"| {t['algoId']} | {t['instId']} | {t.get('posSide') or t['side']} | {t['sz']} | {t['triggerPx']} | {limit_px(t, m)} | "
-                         f"{at.get('slTriggerPx') or '—'} | {at.get('tpTriggerPx') or '—'} | {m.get('decision_id') or '—'} | {m.get('expires') or '—'} |")
+                         f"{at.get('slTriggerPx') or '—'} | {'移动止损[TRAILING]' if m.get('exit_mode') == 'trailing' else (at.get('tpTriggerPx') or '—')} | {m.get('decision_id') or '—'} | {m.get('expires') or '—'} |")
         else:
             L.append("模拟盘当前无条件单。")
         from desk import okx_demo as _od
@@ -359,7 +368,8 @@ def write(cfg, date, decisions, closed, reviews, weight_changes, pb_events, usag
               f"- TradingAgents 组合经理评级：{d.get('ta_signal') or '—'}；角色加权共识 S = {d['consensus']:+.3f}",
               f"- 加权聚合（组合经理只执行）：方向 {({'long': '做多', 'short': '做空'}).get((d.get('aggregate') or {}).get('side'), '不交易')}，"
               f"入场 {_px((d.get('aggregate') or {}).get('entry_px'))}（{(d.get('aggregate') or {}).get('condition', '—')}），"
-              f"止损 {_px((d.get('aggregate') or {}).get('stop_loss'))}，止盈 {_px((d.get('aggregate') or {}).get('take_profit'))}，"
+              f"止损 {_px((d.get('aggregate') or {}).get('stop_loss'))}，止盈 {_px((d.get('aggregate') or {}).get('take_profit'))}"
+              f"{'（移动止损 [TRAILING]：止盈不挂单，仅作 RR 校验与激活线）' if (d.get('aggregate') or {}).get('exit_mode') == 'trailing' else ''}，"
               f"保证金 {_f((d.get('aggregate') or {}).get('size_pct') or 0, 1)}%，杠杆 {(d.get('aggregate') or {}).get('leverage', '—')}"
               + _sizing_line((d.get('aggregate') or {}).get('sizing'), d.get('aggregate') or {}),
               f"- 交易经理（{'不投票，定点位' if 'trade_manager' not in d.get('weights', {}) and d.get('decided_by') else '投票角色之一'}）建议：" + tm_advice_text(d),

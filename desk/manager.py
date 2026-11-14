@@ -678,7 +678,7 @@ def record_session(source) -> str:
     """决策记录的场次：止盈/止损后再讨论记 rediscuss（不再误记为 morning），持有期到期全员讨论记 expiry，其余按当前场次。"""
     if str(source).startswith("expiry"):
         return "expiry"
-    return "rediscuss" if str(source).startswith(("post_tp", "post_stop")) else settings.SESSION
+    return "rediscuss" if str(source).startswith(("post_tp", "post_stop", "post_trailing")) else settings.SESSION
 
 
 def pending_widen_guard(cfg, inst, ex, bk):
@@ -1019,6 +1019,10 @@ def _pm_execute_tool(cfg, coin, did, st, w, mk, bk, pos, rationale, source, tm, 
     if tp_hold:
         notes.append("止盈后再讨论：交易经理条件单方向与共识相反 → 观望不下单")
     agg["tm_order_tool"] = {"action": a, "margin_pct": t.get("margin_pct")}
+    # 移动止损退出（validate §3.6 判定，to_decision 透传）：仅新入场 open / 无持仓的 pending 生效；
+    # 执行时不挂固定止盈（tp=None），计划止盈与开仓 ATR 随登记落盘，供 desk/trailing_stop.py 棘轮接管。
+    trail = getattr(tm, "_trailing_exit", None)
+    agg["exit_mode"] = "trailing" if trail else "fixed"
     if t.get("keep_expiry_at") and a == "replace_pending":   # keep_expiry：新单沿用原到期时刻，按执行时剩余小时重算
         from desk import tm_order_tool as _T
         h = _T.remaining_hours(t["keep_expiry_at"])
@@ -1099,21 +1103,36 @@ def _pm_execute_tool(cfg, coin, did, st, w, mk, bk, pos, rationale, source, tm, 
                             action = "hold(护栏拒单)"; notes.append("条件加仓单护栏拒单：" + "；".join(inf["reasons"]))
                 elif a == "open":
                     DX.cancel_triggers(cfg, inst, "改为现价成交")
-                    ok, inf = DX.open_now(cfg, bk, inst, size, sl, tp, side, lev, did, agg["horizon_days"], mk["last"])
+                    if trail:
+                        _tsc = DX.ecfg(cfg)["trailing_stop"]
+                        notes.append(f"[TRAILING] 本仓改用移动止损退出：不挂固定止盈（计划止盈 {tp:g} 仅作 RR 校验与激活线基准）；"
+                                     f"激活线=入场向有利方向 {_tsc['activation_frac_of_tp']:g}×计划止盈距离，"
+                                     f"跟踪距离={_tsc['trail_atr_mult']:g}×ATR14（{float(trail['atr14']):g}）")
+                    ok, inf = DX.open_now(cfg, bk, inst, size, sl, None if trail else tp, side, lev, did, agg["horizon_days"], mk["last"],
+                                          **({"exit_meta": {"exit_mode": "trailing", "plan_tp": tp,
+                                                            "atr14_open": float(trail["atr14"])}} if trail else {}))
                     execd = {"type": "open", "ok": ok, **inf}
                     action = ("buy" if side == "long" else "short") if ok else "hold(护栏拒单)"
                     if not ok:
                         notes.append("护栏拒单：" + "；".join(inf["reasons"]))
                 else:
+                    if trail:
+                        _tsc = DX.ecfg(cfg)["trailing_stop"]
+                        notes.append(f"[TRAILING] 本单成交后改用移动止损退出：不挂固定止盈（计划止盈 {tp:g} 仅作 RR 校验与激活线基准）；"
+                                     f"激活线=入场向有利方向 {_tsc['activation_frac_of_tp']:g}×计划止盈距离，"
+                                     f"跟踪距离={_tsc['trail_atr_mult']:g}×ATR14（{float(trail['atr14']):g}）")
                     ok, inf = DX.place_trigger(cfg, bk, inst, {
                         "decision_id": did, "source": source, "side": side, "leverage": lev, "trigger_px": px,
-                        "condition": agg["condition"], "stop_loss": sl, "take_profit": tp, "size_pct": size,
+                        "condition": agg["condition"], "stop_loss": sl, "take_profit": None if trail else tp, "size_pct": size,
                         "horizon_days": agg["horizon_days"], "expire_hours": float(tm.entry_expire_hours), "consensus": agg["S"],
-                        "reason": (tm.rationale or rationale or "")[:200]})
+                        "reason": (tm.rationale or rationale or "")[:200]},
+                        **({"extra": {"exit_mode": "trailing", "plan_tp": tp,
+                                      "atr14_open": float(trail["atr14"])}} if trail else {}))
                     if ok:
                         pend = inf; action = "pending"
                         notes.append(f"模拟盘条件单 {inf['algoId']}：{'多' if side == 'long' else '空'} {lev:g}x "
-                                     f"{'≥' if agg['condition'] == 'gte' else '≤'} {px:.6g}，止损 {sl:.6g}，止盈 {tp:.6g}，"
+                                     f"{'≥' if agg['condition'] == 'gte' else '≤'} {px:.6g}，止损 {sl:.6g}，"
+                                     f"{'止盈不挂（移动止损 [TRAILING]，计划止盈 ' + format(tp, 'g') + '）' if trail else '止盈 ' + format(tp, '.6g')}，"
                                      f"{inf.get('sz')} 张，{float(tm.entry_expire_hours):.0f} 小时有效")
                     else:
                         action = "hold(护栏拒单)"; notes.append("护栏拒单：" + "；".join(inf["reasons"]))

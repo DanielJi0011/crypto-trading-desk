@@ -67,14 +67,15 @@ def link(row: dict, events: list[dict], reg: dict, papers: list[dict]) -> dict:
     """为一条 positions-history 找本地决策 id / 止损止盈 / 入场理由。返回 {decision_id, sl, tp, reason, source, test}。"""
     inst, c = row["instId"], int(row["cTime"])
     side = "short" if row.get("posSide") == "short" or row.get("direction") == "short" else "long"
-    r = {"decision_id": None, "sl": None, "tp": None, "reason": "", "source": "", "test": False}
+    r = {"decision_id": None, "sl": None, "tp": None, "reason": "", "source": "", "test": False, "exit_mode": None,
+         "trail_activated": False}
     placed = {str(e.get("algoId")): e for e in events if e.get("event") == "trigger_placed"}
     p = (reg.get("positions") or {}).get(inst) or {}
     if p.get("decision_id") and p.get("side", side) == side and _near(p.get("opened"), c):
-        r.update(decision_id=p["decision_id"], source="registry.positions")
+        r.update(decision_id=p["decision_id"], source="registry.positions", exit_mode=p.get("exit_mode"))
         tp = placed.get(str(p.get("from_algo")))
         if tp:
-            r.update(sl=tp.get("stop_loss"), tp=tp.get("take_profit"))
+            r.update(sl=tp.get("stop_loss"), tp=tp.get("take_profit"), exit_mode=tp.get("exit_mode") or r["exit_mode"])
     for e in events:
         if r["decision_id"] or e.get("inst_id") != inst or not _near(e.get("time"), c):
             continue
@@ -82,9 +83,10 @@ def link(row: dict, events: list[dict], reg: dict, papers: list[dict]) -> dict:
         if ev in ("trigger_filled", "trigger_fired") and str(e.get("algoId")) in placed:   # R12：新事件名 trigger_fired，旧记录 trigger_filled 兼容
             tp = placed[str(e["algoId"])]
             r.update(decision_id=tp.get("decision_id"), sl=tp.get("stop_loss"), tp=tp.get("take_profit"),
-                     source=f"demo_events.trigger_filled({e['algoId']})")
+                     exit_mode=tp.get("exit_mode"), source=f"demo_events.trigger_filled({e['algoId']})")
         elif ev == "open_ok" and e.get("decision_id"):
-            r.update(decision_id=e["decision_id"], sl=e.get("sl"), tp=e.get("tp"), source="demo_events.open_ok")
+            r.update(decision_id=e["decision_id"], sl=e.get("sl"), tp=e.get("tp"), exit_mode=e.get("exit_mode"),
+                     source="demo_events.open_ok")
         elif ev == "eth_backfill_ok" or (ev or "").endswith("backfill_ok"):
             r.update(sl=e.get("sl"), tp=e.get("tp"), source=f"demo_events.{ev}")
             sl = _f(e.get("sl"))
@@ -95,6 +97,10 @@ def link(row: dict, events: list[dict], reg: dict, papers: list[dict]) -> dict:
                 t = cand[-1]
                 r.update(decision_id=t["signal_id"], reason=t.get("entry_reason", ""),
                          source=f"demo_events.{ev} → 纸面仓 {t['trade_id']}")
+    if r.get("exit_mode") == "trailing" and r.get("decision_id"):
+        # 是否真正激活过（激活/跟进事件带 decision_id 落在 demo 事件流里）：未激活先触原始止损的仍按「止损」记账
+        r["trail_activated"] = any(e.get("event") in ("trailing_activated", "trailing_stop_moved")
+                                   and e.get("decision_id") == r["decision_id"] for e in events)
     if not r["decision_id"]:
         r["test"] = any(e.get("event") in TEST_EVENTS and e.get("inst_id") == inst and
                         (_near(e.get("time"), c, 60_000) or _near(e.get("time"), row.get("uTime") or c, 60_000))
@@ -102,14 +108,16 @@ def link(row: dict, events: list[dict], reg: dict, papers: list[dict]) -> dict:
     return r
 
 
-def _exit_reason(row, sl, tp, ws_events) -> str:
+def _exit_reason(row, sl, tp, ws_events, exit_mode=None) -> str:
     typ = str(row.get("type") or "")
     if typ in ("3", "4", "5"):
         return CLOSE_TYPE[typ]
     px, u = _f(row.get("closeAvgPx")), int(row.get("uTime") or 0)
     for e in ws_events:
         if e.get("inst_id") == row["instId"] and e.get("kind") in ("stop_loss", "take_profit") and _near(e.get("time"), u, 120_000):
-            return "止损" if e["kind"] == "stop_loss" else "止盈"
+            if e["kind"] == "stop_loss":
+                return "移动止损" if exit_mode == "trailing" else "止损"   # 移动止损仓位的止损事件单独标注
+            return "止盈"
     if px and sl and abs(px - float(sl)) / px <= 0.003:
         return "止损"
     if px and tp and abs(px - float(tp)) / px <= 0.003:
@@ -133,7 +141,8 @@ def to_trade(row: dict, info: dict, ct_val: float, ws_events=()) -> dict:
             "sl_px": "" if info.get("sl") in (None, "") else f"{float(info['sl']):g}",
             "tp_px": "" if info.get("tp") in (None, "") else f"{float(info['tp']):g}",
             "exit_time": _ts(row["uTime"]), "exit_px": f"{exit_:g}",
-            "exit_reason": _exit_reason(row, _f(info.get("sl")), _f(info.get("tp")), ws_events),
+            "exit_reason": _exit_reason(row, _f(info.get("sl")), _f(info.get("tp")), ws_events,
+                                        "trailing" if (info.get("exit_mode") == "trailing" and info.get("trail_activated")) else None),
             "fee_usd": f"{fee:.6f}", "funding_usd": row.get("fundingFee") or "0", "gross_pnl_usd": row.get("pnl") or "",
             "pnl_usd": f"{pnl:.6f}", "pnl_pct": f"{pnl / margin * 100:.4f}" if margin else "0",
             "signal_id": info.get("decision_id") or "", "decision_id": info.get("decision_id") or "",
