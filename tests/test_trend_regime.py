@@ -71,6 +71,7 @@ def _df(closes):
 def test_features_downtrend(monkeypatch):
     closes = [200.0 - 0.4 * i for i in range(260)]          # 单边下跌 200 → 96.4
     monkeypatch.setattr(okx_data, "candles", lambda inst, bar="1Dutc", days=420: _df(closes))
+    monkeypatch.setattr(RJ, "flow_features", lambda inst: {"flow_missing": True})   # 资金面离线打桩
     f = RJ.features("BTC-USDT-SWAP")
     assert f["bars"] == 260 and f["ma200"] is not None
     assert f["ma20"] < f["ma50"] < f["ma200"]
@@ -82,6 +83,7 @@ def test_features_downtrend(monkeypatch):
 def test_features_insufficient_history(monkeypatch):
     closes = [100.0 + 0.1 * i for i in range(120)]           # 只有 120 根：MA200 不可得，其余照常
     monkeypatch.setattr(okx_data, "candles", lambda inst, bar="1Dutc", days=420: _df(closes))
+    monkeypatch.setattr(RJ, "flow_features", lambda inst: {"flow_missing": True})   # 资金面离线打桩
     f = RJ.features("SOL-USDT-SWAP")
     assert f["ma200"] is None and f["ma200_slope_pct"] is None and f["dev_ma200_pct"] is None
     assert f["ma50"] is not None and f["ma50_slope_pct"] > 0 and f["rsi14"] == 100.0
@@ -395,9 +397,9 @@ def test_validate_no_downgrade_no_risk_cap(vctx):
 # ---------------- 判定标准 v2（2026-11-14：衰竭证据门 + 代码门 + 版本号） ----------------
 
 def test_judge_standard_v2_and_signal_set():
-    assert RJ.JUDGE_STANDARD == 2
+    assert RJ.JUDGE_STANDARD == 3
     assert set(RJ.EXHAUSTION_SIGNALS) == {"slope_flattening", "deepening_pullbacks", "structure_break",
-                                          "momentum_divergence", "volume_stall"}
+                                          "momentum_divergence", "volume_stall", "forced_flow_exhaustion"}
 
 
 def test_normalize_signals_filtered_raw_kept_and_versioned():
@@ -406,7 +408,7 @@ def test_normalize_signals_filtered_raw_kept_and_versioned():
                                "exhaustion_signals": ["momentum_divergence", "rsi_oversold", "momentum_divergence"]})
     assert j["exhaustion_signals"] == ["momentum_divergence"]            # 闭集过滤 + 去重
     assert j["exhaustion_signals_raw"] == ["momentum_divergence", "rsi_oversold", "momentum_divergence"]
-    assert j["judge_standard"] == 2 and j["stage"] == "late_exhaustion"   # normalize 只解析，覆盖在代码门
+    assert j["judge_standard"] == 3 and j["stage"] == "late_exhaustion"   # normalize 只解析，覆盖在代码门
 
 
 def test_normalize_signals_string_wrapped_and_missing_default():
@@ -493,7 +495,200 @@ def test_log_call_v2_fields():
     RJ.log_call(date="2026-11-14", session="evening", source="daily", inst="BTC-USDT-SWAP",
                 decision_id="D-20261114-BTC", regime=reg)
     row = settings.read_jsonl(RJ.REGIME_CALLS)[-1]
-    assert row["judge_standard"] == 2                                     # 记录级版本位：v1 旧记录无此字段
-    assert row["judge"]["judge_standard"] == 2
+    assert row["judge_standard"] == 3                                     # 记录级版本位：v1 旧记录无此字段
+    assert row["judge"]["judge_standard"] == 3
     assert row["judge"]["stage"] == "mid" and row["judge"]["stage_raw"] == "late_exhaustion"
     assert row["judge"]["stage_overridden"] is True and row["downgrade"] is False
+
+
+# ---------------- 判定标准 v3（2026-11-14：特征扩建 + 第六项资金面衰竭） ----------------
+
+def _df2(closes, vols):
+    return pd.DataFrame({"Date": pd.date_range("2026-01-01", periods=len(closes), freq="D"),
+                         "Open": closes, "High": [c * 1.01 for c in closes], "Low": [c * 0.99 for c in closes],
+                         "Close": closes, "Volume": vols, "VolumeUSDT": vols,
+                         "ts": list(range(len(closes)))})
+
+
+def test_features_slope_history_and_volume_z(monkeypatch):
+    # 前 240 根陡峭下跌（-3/根）、后 20 根近乎走平（-0.2/根）：MA20 当前斜率应明显比 5 日前收窄
+    closes = [1000.0 - 3.0 * i for i in range(240)] + [283.0 - 0.2 * j for j in range(1, 21)]
+    vols = [90.0 if i % 2 == 0 else 110.0 for i in range(259)] + [500.0]   # 末根量能爆量
+    monkeypatch.setattr(okx_data, "candles", lambda inst, bar="1Dutc", days=420: _df2(closes, vols))
+    monkeypatch.setattr(RJ, "flow_features", lambda inst: {"flow_missing": True})
+    f = RJ.features("BTC-USDT-SWAP")
+    assert f["ma20_slope_pct"] is not None and f["ma20_slope_pct_prev5"] is not None
+    assert f["ma20_slope_pct_prev5"] < f["ma20_slope_pct"] < 0              # 5 日前更陡、当前收窄（走平中）
+    assert abs(f["ma20_slope_pct"]) <= 0.7 * abs(f["ma20_slope_pct_prev5"])  # 收窄 ≥30%：slope_flattening 可举证
+    assert f["ma50_slope_pct_prev5"] is not None
+    assert f["vol_z_last"] is not None and f["vol_z_last"] > 2.0           # 爆量 climax
+    assert f["vol_z_max5"] is not None and f["vol_z_max5"] >= f["vol_z_last"]
+    assert f["last_chg_atr"] is not None and -0.5 < f["last_chg_atr"] < 0  # 末日小跌（滞行侧）
+
+
+def test_features_volume_z_none_when_flat_volume(monkeypatch):
+    closes = [200.0 - 0.4 * i for i in range(260)]
+    monkeypatch.setattr(okx_data, "candles", lambda inst, bar="1Dutc", days=420: _df(closes))  # Volume 恒为 1.0
+    monkeypatch.setattr(RJ, "flow_features", lambda inst: {"flow_missing": True})
+    f = RJ.features("BTC-USDT-SWAP")
+    assert f["vol_z_last"] is None and f["vol_z_max5"] is None             # 基准窗口 std=0 → 不编造 z 值
+
+
+def _stub_flow(monkeypatch, funding=None, oi=None):
+    def _f(inst):
+        if isinstance(funding, Exception):
+            raise funding
+        return funding
+
+    def _o(inst):
+        if isinstance(oi, Exception):
+            raise oi
+        return oi
+    monkeypatch.setattr(RJ, "_fetch_funding", _f)
+    monkeypatch.setattr(RJ, "_fetch_oi", _o)
+    monkeypatch.setattr(RJ, "_fetch_liq", lambda inst: None)
+
+
+def test_flow_features_percentile_and_oi_change(monkeypatch):
+    hist = [0.0001] * 265 + [-0.001, -0.003, 0.0002, -0.0025, 0.0]         # 270 期，绝大多数高于当前费率
+    series = [100.0] * 175 + [100.0, 99.0, 97.0, 94.0, 92.0, 90.0]          # 5 日前 100 → 最新 90 = -10%
+    _stub_flow(monkeypatch, funding=(-0.002, hist), oi=(2.0e9, series))
+    f = RJ.flow_features("BTC-USDT-SWAP")
+    assert f["flow_missing"] is False
+    assert f["funding_now"] == -0.002 and f["funding_hist_n"] == 270
+    assert f["funding_pctile_90d"] is not None and f["funding_pctile_90d"] <= 10.0   # 第六项门槛 (a) 可达
+    assert f["oi_usd"] == 2.0e9 and f["oi_chg_5d_pct"] == -10.0                      # 第六项门槛 (b) 恰达
+
+
+def test_flow_features_failure_marks_missing(monkeypatch):
+    series = [100.0] * 175 + [100.0, 99.0, 97.0, 94.0, 92.0, 90.0]
+    _stub_flow(monkeypatch, funding=RuntimeError("okx 50011"), oi=(2.0e9, series))
+    f = RJ.flow_features("BTC-USDT-SWAP")
+    assert f["flow_missing"] is True                                       # 核心项失败 → missing
+    assert f["funding_now"] is None and f["funding_pctile_90d"] is None and f["funding_hist_n"] == 0
+    assert f["oi_usd"] == 2.0e9 and f["oi_chg_5d_pct"] == -10.0            # 已取到的部分保留渲染
+    _stub_flow(monkeypatch, funding=(-0.002, [0.0001] * 270), oi=RuntimeError("timeout"))
+    f2 = RJ.flow_features("BTC-USDT-SWAP")
+    assert f2["flow_missing"] is True and f2["oi_usd"] is None and f2["oi_chg_5d_pct"] is None
+    assert f2["funding_now"] == -0.002
+
+
+def test_features_flow_failure_does_not_break_features(monkeypatch):
+    closes = [200.0 - 0.4 * i for i in range(260)]
+    monkeypatch.setattr(okx_data, "candles", lambda inst, bar="1Dutc", days=420: _df(closes))
+    _stub_flow(monkeypatch, funding=RuntimeError("down"), oi=RuntimeError("down"))
+    f = RJ.features("BTC-USDT-SWAP")                                       # 不抛异常：判定照常进行
+    assert f["flow_missing"] is True and f["ma20"] is not None and f["rsi14"] == 0.0
+
+
+def test_flow_missing_derived_from_final_fields(monkeypatch):
+    """回归（2026-11-14 服务器实测：费率字段缺失但 flow_missing=False）：flow_missing 从终态推导——
+    费率/OI 任一核心字段最终缺失即 missing，哪怕抓取分支没有抛异常，也不许出现「字段 None 而
+    flow_missing=False」（代码门靠这个标记作废 forced_flow_exhaustion，标错=第六项被误放行）。"""
+    series = [100.0] * 175 + [100.0, 99.0, 97.0, 94.0, 92.0, 90.0]
+    # 费率分支不抛异常地返回现值 None → 终态必须兜住
+    _stub_flow(monkeypatch, funding=(None, [0.0001] * 270), oi=(2.0e9, series))
+    f = RJ.flow_features("BTC-USDT-SWAP")
+    assert f["funding_now"] is None and f["flow_missing"] is True
+    # 费率现值在、历史为空 → 分位 None → missing
+    _stub_flow(monkeypatch, funding=(0.0001, []), oi=(2.0e9, series))
+    f = RJ.flow_features("BTC-USDT-SWAP")
+    assert f["funding_now"] == 0.0001 and f["funding_pctile_90d"] is None and f["flow_missing"] is True
+    # OI 现值在、序列不足 6 根 → 5 日变化 None → missing
+    _stub_flow(monkeypatch, funding=(-0.002, [0.0001] * 270), oi=(2.0e9, [100.0] * 5))
+    f = RJ.flow_features("BTC-USDT-SWAP")
+    assert f["oi_usd"] == 2.0e9 and f["oi_chg_5d_pct"] is None and f["flow_missing"] is True
+
+
+def test_fetch_funding_rejects_nonfinite_rate(monkeypatch):
+    """回归：OKX 返回 "NaN" 字面量费率时 float() 会静默解析成 nan（旧行为：分位算出 0.0、
+    funding_now=nan、flow_missing=False，坏值冒充好数据进特征表）——必须响亮失败并标 missing。"""
+    from desk import flows as _flows
+
+    def fake_get(url, ttl=600):
+        if "funding-rate-history" in url:
+            return {"code": "0", "data": [{"fundingTime": str(1794700800000 - i * 28800000),
+                                           "fundingRate": "0.0001", "realizedRate": "0.0001"}
+                                          for i in range(100)]}
+        if "funding-rate?" in url:
+            return {"code": "0", "data": [{"fundingRate": "NaN"}]}
+        raise RuntimeError(f"unexpected url {url}")
+
+    monkeypatch.setattr(_flows, "_get", fake_get)
+    monkeypatch.setattr(RJ, "_fetch_oi", lambda inst: (2.0e9, [100.0] * 175 + [90.0] * 6))
+    monkeypatch.setattr(RJ, "_fetch_liq", lambda inst: None)
+    with pytest.raises(ValueError):
+        RJ._fetch_funding("BTC-USDT-SWAP")
+    f = RJ.flow_features("BTC-USDT-SWAP")
+    assert f["funding_now"] is None and f["funding_pctile_90d"] is None and f["flow_missing"] is True
+    assert f["oi_usd"] == 2.0e9 and f["oi_chg_5d_pct"] is not None   # OI 分支独立成功、数值保留
+
+
+FLOW_OK = {"flow_missing": False, "funding_now": -0.002, "funding_pctile_90d": 3.0,
+           "funding_hist_n": 270, "oi_usd": 2.0e9, "oi_chg_5d_pct": -12.5}
+FLOW_MISSING = {"flow_missing": True, "funding_now": None, "funding_pctile_90d": None,
+                "funding_hist_n": 0, "oi_usd": None, "oi_chg_5d_pct": None}
+
+
+def test_gate_strips_forced_flow_when_flow_missing():
+    r = RJ.build_regime(_cfg(), _judge(stage="late_exhaustion",
+                                       exhaustion_signals=["forced_flow_exhaustion"]), dict(FLOW_MISSING))
+    j = r["judge"]
+    assert j["stage"] == "mid" and j["stage_raw"] == "late_exhaustion" and j["stage_overridden"] is True
+    assert j["stage_override_reason"] == "late_exhaustion_only_forced_flow_but_flow_missing"
+    assert j["exhaustion_signals"] == [] and j["exhaustion_signals_dropped"] == ["forced_flow_exhaustion"]
+    assert j["exhaustion_signals_drop_reason"] == "flow_data_missing"
+    assert r["active"] and not r["downgrade"]
+
+
+def test_gate_keeps_forced_flow_late_with_flow_data():
+    r = RJ.build_regime(_cfg(), _judge(stage="late_exhaustion",
+                                       exhaustion_signals=["forced_flow_exhaustion"]), dict(FLOW_OK))
+    j = r["judge"]
+    assert j["stage"] == "late_exhaustion" and j["stage_overridden"] is False and r["downgrade"]
+    assert j["exhaustion_signals"] == ["forced_flow_exhaustion"] and "exhaustion_signals_dropped" not in j
+
+
+def test_gate_forced_flow_dropped_but_other_signal_keeps_late():
+    r = RJ.build_regime(_cfg(), _judge(stage="late_exhaustion",
+                                       exhaustion_signals=["forced_flow_exhaustion", "structure_break"]),
+                        dict(FLOW_MISSING))
+    j = r["judge"]
+    assert j["stage"] == "late_exhaustion" and j["stage_overridden"] is False and r["downgrade"]
+    assert j["exhaustion_signals"] == ["structure_break"]                  # 第六项被剔除，其余信号照常生效
+    assert j["exhaustion_signals_dropped"] == ["forced_flow_exhaustion"]
+
+
+def test_gate_forced_flow_kept_without_feat_info():
+    # feat 无 flow_missing 标记（旧口径/直构判定）→ 按资金面可用处理，行为与 v2 一致
+    j = RJ.apply_stage_gate(_judge(stage="late_exhaustion", exhaustion_signals=["forced_flow_exhaustion"]))
+    assert j["stage"] == "late_exhaustion" and "exhaustion_signals_dropped" not in j
+
+
+def test_prompt_dropped_note():
+    cfg = _cfg()
+    p = _prompt(_reg(judge=_judge(stage="late_exhaustion",
+                                  exhaustion_signals=["forced_flow_exhaustion", "structure_break"]),
+                     cfg=cfg, feat=dict(FLOW_MISSING)), cfg)
+    assert "该项证据已被代码校验剔除" in p and "降级生效" in p              # 剔除有注记，late 靠其余信号仍生效
+
+
+def test_judge_prompt_v3_wording():
+    p = RJ.judge_prompt("比特币", "BTC-USDT-SWAP", dict(FEAT), dict(MK), -0.5,
+                        {"valid": 11, "long": 1, "short": 8, "neutral": 2}, "")
+    assert "forced_flow_exhaustion" in p and "资金面衰竭" in p
+    assert "分位 ≤10%" in p and "分位 ≥90%" in p and "5 日变化 ≤−10%" in p  # 第六项双硬门槛
+    assert "收窄 ≥30%" in p and "5 日前同口径斜率" in p                     # slope_flattening 实测定义
+    assert "z 值 ≥2.0" in p and "0.3×ATR14" in p and "0.8×ATR14" in p       # volume_stall climax+推进双条件
+    assert "也会被代码剔除" in p                                            # 缺数据引用第六项的后果明示
+    assert "以单时点近似" not in p                                          # v2 单时点近似定义已删除
+
+
+def test_feature_block_v3_segments():
+    feat = dict(FEAT, ma20_slope_pct_prev5=-2.04, vol_z_last=2.6, vol_z_max5=3.1, last_chg_atr=-0.12,
+                **FLOW_OK)
+    s = RJ.feature_block(feat, dict(MK))
+    assert "5 日前同口径斜率 -2.04%" in s and "量能：最新日 z 值 2.6" in s
+    assert "资金费率（8h）-0.2000%" in s and "分位 3" in s and "持仓量 $2.00B" in s and "5 日变化 -12.50%" in s
+    s2 = RJ.feature_block(dict(FEAT), dict(MK))
+    assert "本场数据缺失（抓取失败）" in s2 and "forced_flow_exhaustion（资金面衰竭）本场不可引用" in s2
