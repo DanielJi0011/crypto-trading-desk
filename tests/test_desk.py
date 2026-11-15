@@ -260,6 +260,17 @@ def test_mock_full_dry_run(cfg, monkeypatch):
     monkeypatch.setattr(manager.okx_data, "last_price", lambda inst: 82000.0)
     from desk import stop_cooldown
     monkeypatch.setattr(stop_cooldown, "blocked", lambda *a, **k: None)   # 隔离其它用例遗留的止损冷却记录
+    # 周线过滤（决策 2）与 4H 入场结构（2026-11-15）都是由真实 K 线计算的代码门，与本用例要验的
+    # 全流程管线无关：两者都显式置缺失（fail-soft，不拦），否则真实行情算出的周线方向/4H 波段
+    # （真实价格尺度）会拦下脚本化的模拟开仓（同 test_tm_no_vote 的 desk_env 口径；两门的覆盖
+    # 分别在 test_weekly_filter.py / test_h4_entry_structure.py）。
+    from desk import regime_judge as _RJ
+    monkeypatch.setattr(_RJ, "weekly_features", lambda d: {
+        "weekly_direction": None, "weekly_missing": True, "weekly_weeks": 0, "weekly_close": None,
+        "weekly_ma10": None, "weekly_ma20": None, "weekly_ma20_slope_pct": None})
+    monkeypatch.setattr(_RJ, "h4_swing_features", lambda inst: {
+        "h4_swing_high": None, "h4_swing_high_time": None, "h4_swing_low": None,
+        "h4_swing_low_time": None, "h4_bars": 0, "h4_missing": True})
     rc = run_daily.main(["--mock", "--coins", "BTC", "--date", "2026-10-19"])
     assert rc == 0
     rep = (settings.REPORTS / "2026-10-19.md").read_text(encoding="utf-8")

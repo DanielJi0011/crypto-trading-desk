@@ -98,6 +98,19 @@ def desk_env(monkeypatch):
             return box["dec"]
     monkeypatch.setattr(dllm, "make_llm", lambda *a, **k: Fake())
     monkeypatch.setattr(roles, "PlaybookLLM", lambda m, role: m)
+    # 周线方向过滤（决策 2，2026-11-15）是纯代码门，不随行情判定桩（固定无趋势）关闭：本夹具的
+    # 场景与周线无关，显式把周线特征置缺失（fail-soft，不拦任何方向），否则真实行情算出的周线
+    # 方向会干扰下单工具场景。周线门自身的覆盖在 tests/test_weekly_filter.py。
+    from desk import regime_judge as _RJ
+    monkeypatch.setattr(_RJ, "weekly_features", lambda d: {
+        "weekly_direction": None, "weekly_missing": True, "weekly_weeks": 0, "weekly_close": None,
+        "weekly_ma10": None, "weekly_ma20": None, "weekly_ma20_slope_pct": None})
+    # 4H 入场结构（2026-11-15）同理是纯代码门：本夹具场景与 4H 波段无关，显式置缺失（fail-soft，
+    # 不拦任何下单），否则真实行情算出的波段高低点（真实价格尺度）会把夹具里的合成价位单全部拦下。
+    # 结构门自身的覆盖在 tests/test_h4_entry_structure.py。
+    monkeypatch.setattr(_RJ, "h4_swing_features", lambda inst: {
+        "h4_swing_high": None, "h4_swing_high_time": None, "h4_swing_low": None,
+        "h4_swing_low_time": None, "h4_bars": 0, "h4_missing": True})
     return manager, calls, box
 
 

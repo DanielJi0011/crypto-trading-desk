@@ -28,6 +28,26 @@ v1 存档记录无 judge_standard 字段，打分时按 v1 分段。
 引用。③ 代码门扩展：本场资金面特征缺失（flow_missing）时 forced_flow_exhaustion 视为无效信号被剔除
 （raw 保留审计），其余五项门逻辑不变。资金面抓取全程 fail-soft：失败只标 missing，判定照常进行。
 数据源只用 OKX 公共接口（经 desk.flows 的 URL 缓存抓取，与资金流分析师共用缓存，克制请求数）。
+
+周线方向过滤（决策 2，2026-11-15 用户批准）：周期框架定稿——日线波段为主框架；周线只作方向过滤，
+不作判定输入。代码按完整周收盘算周线方向（由特征表同一批已收盘日线按 ISO 周聚合，未走完的周不算；
+收盘 vs 周 MA20 位置与 MA20 五周斜率同向才算趋势），随特征表一并渲染进判定/TM 提示词。执行层硬规则
+= 禁止逆周线方向开新仓：validate §3.7 经 weekly_block_reason 裁定，作用域同 §3.5（open/pending/
+replace_pending；keep_pending 沿用原单、add 为已有持仓加仓腿，不在此列）。与 LLM 判定是否生效无关
+（周线是纯代码数据，判定失败但特征表在时过滤照常生效）；周线中性/数据缺失/开关关闭一律不拦
+（fail-soft）。周线方向与本场被拦方向随 regime_calls 存档（weekly_direction / weekly_blocked_side，
+stage_overridden 式记账）。开关 manager.weekly_filter.enabled（默认开）；整层仍受 trend_rule_enabled
+总开关约束（manager 只在总开关开时构建 regime，validate 也只从 regime 读周线状态）。
+
+4H 入场结构（2026-11-15 用户批准）：周期框架里 4H 只做入场触发微调——本改动给它一份窄的、代码化
+的活：入场触发价不得落进当前 4H 波段内部。代码按已收盘 4H K 线（与分析师参考文本同一缓存路径）
+算最近确认波段高/低点（左右各 2 根的严格枢轴，右侧未走完的枢轴不算确认），随特征表一并渲染进
+判定/TM 提示词；但判定本身仍只看日线，4H 与周线同为执行层数据、不进判定口径。执行层硬规则 =
+做空触发价须 ≥ 最近确认 4H 波段高点、做多触发价须 ≤ 最近确认 4H 波段低点（恰等于可过）：validate
+§3.8 经 h4_block_reason 裁定，作用域同 §3.7（open/pending/replace_pending；open 以现价为入场价比对；
+add 加仓腿、keep_pending 沿用原单不在此列）。与 LLM 判定是否生效无关；波段数据缺失/开关关闭一律
+不拦（fail-soft）。波段值与本场约束界随 regime_calls 存档（h4_swing_high/low、h4_short/long_bound）。
+开关 manager.h4_entry_structure.enabled（默认开）；整层仍受 trend_rule_enabled 总开关约束。
 """
 from __future__ import annotations
 
@@ -62,6 +82,20 @@ def trend_cfg(cfg) -> dict:
     return {"enabled": bool(M.get("trend_rule_enabled", True)),
             "near_atr": float(M.get("trend_near_atr", 0.3)),
             "oversold_risk_scale": float(M.get("trend_oversold_risk_scale", 0.5))}
+
+
+def weekly_cfg(cfg) -> dict:
+    """周线方向过滤配置（manager.weekly_filter 段）：enabled=false 时周线方向只进特征表展示、
+    不拦截任何下单。默认 True 与 trend_rule_enabled 同口径（显式配置见 config.yaml）。"""
+    W = ((cfg or {}).get("manager") or {}).get("weekly_filter") or {}
+    return {"enabled": bool(W.get("enabled", True))}
+
+
+def h4_cfg(cfg) -> dict:
+    """4H 入场结构配置（manager.h4_entry_structure 段）：enabled=false 时 4H 波段只进特征表展示、
+    不拦截任何下单。默认 True 与 weekly_filter 同口径（显式配置见 config.yaml）。"""
+    H = ((cfg or {}).get("manager") or {}).get("h4_entry_structure") or {}
+    return {"enabled": bool(H.get("enabled", True))}
 
 
 # ------------------------------------------------------------------ 趋势特征（只算数据，不下结论）
@@ -131,6 +165,132 @@ def _rsi14(close) -> float | None:
     if v == 0:
         return 100.0 if u > 0 else 50.0
     return round(100 - 100 / (1 + u / v), 2)
+
+
+# ------------------------------------------------------------------ 周线方向（决策 2，只算数据，fail-soft）
+WEEKLY_MIN_WEEKS = 25       # 周 MA20 + 其 5 周斜率需要 ≥25 个完整周（260 根日线 ≈ 36 个完整周，够用）
+
+
+def _weekly_closes(d) -> list:
+    """已收盘日线 → 完整周（ISO 周，周一起始，与 OKX 1Wutc 同界）的周收盘价序列（旧→新）。
+    只收满 7 根日线的周：数据起点的残周与当前未走完的周一律剔除——与日线「只用已收盘 K 线」同一
+    口径，未收盘的周不下方向结论；某周不足 7 根（数据缺口）同样剔除（fail-soft）。d 须按时间升序
+    （okx_data.candles 的返回即升序）。"""
+    if d is None or len(d) == 0:
+        return []
+    iso = d["Date"].dt.isocalendar()
+    keys = (iso["year"].astype("int64") * 100 + iso["week"].astype("int64")).tolist()
+    closes, cur_key, cur = [], None, []
+    for k, c in zip(keys, d["Close"]):
+        if k != cur_key:
+            if len(cur) == 7:
+                closes.append(float(cur[-1]))
+            cur_key, cur = k, []
+        cur.append(c)
+    if len(cur) == 7:
+        closes.append(float(cur[-1]))
+    return closes
+
+
+def weekly_features(d) -> dict:
+    """周线方向（代码结论，供执行层过滤，不进 LLM 判定口径）：完整周收盘与周 MA20 的位置、
+    周 MA20 的 5 周斜率，两者同向才算趋势——收盘在 MA20 上方且 MA20 上行 → long；收盘在下方
+    且 MA20 下行 → short；其余（贴均线、位置与斜率打架）→ none（中性，不拦截任何方向）。
+    完整周 <25（MA20/斜率算不出）→ weekly_direction=None、weekly_missing=True（缺失不拦截）。
+    本函数绝不抛异常。"""
+    out = {"weekly_direction": None, "weekly_missing": True, "weekly_weeks": 0,
+           "weekly_close": None, "weekly_ma10": None, "weekly_ma20": None,
+           "weekly_ma20_slope_pct": None}
+    try:
+        closes = _weekly_closes(d)
+        out["weekly_weeks"] = len(closes)
+        if not closes:
+            return out
+        out["weekly_close"] = round(closes[-1], 4)
+        if len(closes) >= 10:
+            out["weekly_ma10"] = round(sum(closes[-10:]) / 10, 4)
+        if len(closes) >= 20:
+            out["weekly_ma20"] = round(sum(closes[-20:]) / 20, 4)
+        if len(closes) >= WEEKLY_MIN_WEEKS and out["weekly_ma20"]:
+            prev20 = sum(closes[-25:-5]) / 20
+            if prev20:
+                slope = round((out["weekly_ma20"] / prev20 - 1) * 100, 3)
+                out["weekly_ma20_slope_pct"] = slope
+                last = closes[-1]
+                if last > out["weekly_ma20"] and slope > 0:
+                    out["weekly_direction"] = "long"
+                elif last < out["weekly_ma20"] and slope < 0:
+                    out["weekly_direction"] = "short"
+                else:
+                    out["weekly_direction"] = "none"
+                out["weekly_missing"] = False
+        return out
+    except Exception:
+        return out
+
+
+# ------------------------------------------------------------------ 4H 波段结构（只算数据，fail-soft）
+H4_BARS = 100               # 4H 取数与 intraday_text 的 max(42,100) 同窗口同缓存键：同场基本零新增请求
+H4_PIVOT_SIDE = 2           # 枢轴左右各看 2 根：波段高 = 高点严格大于左右各 2 根的高点（低点镜像）
+
+
+def _h4_time(v) -> str | None:
+    """4H K 线开盘时刻（naive UTC）→ 'YYYY-MM-DD HH:MM' 字符串；不可解析返回 None。"""
+    try:
+        import pandas as _pd
+        return _pd.Timestamp(v).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return None
+
+
+def swing_points(d) -> dict:
+    """已收盘 4H K 线 → 最近一个「已确认」波段高点与波段低点（值 + 该根 K 线开盘时刻 UTC）。
+    枢轴规则（确定性）：第 i 根为波段高 ⟺ High[i] 严格大于左右各 H4_PIVOT_SIDE 根的 High（波段低
+    镜像，严格小于）；右侧 H4_PIVOT_SIDE 根必须已存在才算确认——序列末尾未走完右侧的枢轴不算数，
+    与日线/周线「只用已收盘数据」同一口径。并列高/低（不严格）不构成枢轴。样本 <2×SIDE+1 或
+    无枢轴 → 对应值为 None。d 须按时间升序（okx_data.candles 的返回即升序，且只含已收盘 K 线）。
+    本函数绝不抛异常。"""
+    out = {"h4_swing_high": None, "h4_swing_high_time": None,
+           "h4_swing_low": None, "h4_swing_low_time": None, "h4_bars": 0}
+    try:
+        if d is None or len(d) == 0:
+            return out
+        out["h4_bars"] = int(len(d))
+        H = [float(x) for x in d.High]
+        L = [float(x) for x in d.Low]
+        times = d["Date"].tolist() if "Date" in d else [None] * len(d)
+        s = H4_PIVOT_SIDE
+        hi_i = lo_i = None
+        for i in range(s, len(H) - s):
+            if all(H[i] > H[j] for j in range(i - s, i + s + 1) if j != i):
+                hi_i = i
+            if all(L[i] < L[j] for j in range(i - s, i + s + 1) if j != i):
+                lo_i = i
+        if hi_i is not None:
+            out["h4_swing_high"] = round(H[hi_i], 4)
+            out["h4_swing_high_time"] = _h4_time(times[hi_i])
+        if lo_i is not None:
+            out["h4_swing_low"] = round(L[lo_i], 4)
+            out["h4_swing_low_time"] = _h4_time(times[lo_i])
+        return out
+    except Exception:
+        return {"h4_swing_high": None, "h4_swing_high_time": None,
+                "h4_swing_low": None, "h4_swing_low_time": None, "h4_bars": 0}
+
+
+def h4_swing_features(inst: str) -> dict:
+    """4H 波段特征（fail-soft，绝不抛异常）：经 okx_data.candles 现有缓存/节流路径取已收盘 4H K 线
+    （confirm=1 过滤在数据层已做），与分析师 4H 参考文本同一 (inst, '4H') 缓存键、同 100 根窗口，
+    同场内基本零新增请求。抓取/计算失败 → 波段值全 None、h4_missing=True（结构门本场不生效）。"""
+    out = {"h4_swing_high": None, "h4_swing_high_time": None, "h4_swing_low": None,
+           "h4_swing_low_time": None, "h4_bars": 0, "h4_missing": True}
+    try:
+        out.update(swing_points(okx_data.candles(inst, "4H", H4_BARS)))
+    except Exception as e:
+        log.warning("4H K 线抓取失败 %s：%s（本场 4H 波段标记缺失）", inst, type(e).__name__)
+        return out
+    out["h4_missing"] = out["h4_swing_high"] is None and out["h4_swing_low"] is None
+    return out
 
 
 # ------------------------------------------------------------------ 资金面特征（v3，只算数据，fail-soft）
@@ -253,6 +413,17 @@ def features(inst: str) -> dict:
     out["vol_z_last"], out["vol_z_max5"] = _vol_z(d.Volume)
     out["last_chg_atr"] = _last_chg_atr(d)
     try:
+        out.update(weekly_features(d))
+    except Exception:   # weekly_features 本应绝不抛异常，此处再兜一层：周线绝不拖垮特征表
+        out.update({"weekly_direction": None, "weekly_missing": True, "weekly_weeks": 0,
+                    "weekly_close": None, "weekly_ma10": None, "weekly_ma20": None,
+                    "weekly_ma20_slope_pct": None})
+    try:
+        out.update(h4_swing_features(inst))
+    except Exception:   # h4_swing_features 本应绝不抛异常，此处再兜一层：4H 绝不拖垮特征表
+        out.update({"h4_swing_high": None, "h4_swing_high_time": None, "h4_swing_low": None,
+                    "h4_swing_low_time": None, "h4_bars": 0, "h4_missing": True})
+    try:
         out.update(flow_features(inst))
     except Exception:   # flow_features 本应绝不抛异常，此处再兜一层：资金面绝不拖垮特征表
         out["flow_missing"] = True
@@ -289,6 +460,29 @@ def _flow_seg(f) -> str:
     return s
 
 
+_WEEKLY_CN = {"long": "多头", "short": "空头", "none": "中性（无明确方向）"}
+
+
+def _weekly_seg(f) -> str:
+    """周线方向渲染：缺失明示缺失（过滤本场不生效）；中性明示不拦截。"""
+    d = f.get("weekly_direction")
+    if d not in _WEEKLY_CN:
+        return "周线方向（代码按完整周收盘计算）：数据不足（周线方向过滤本场不生效）"
+    return (f"周线方向（代码按完整周收盘计算，共 {f.get('weekly_weeks', '?')} 个完整周）：{_WEEKLY_CN[d]}（{d}）；"
+            f"周收盘 {_num(f.get('weekly_close'))}；周 MA10 {_num(f.get('weekly_ma10'))}；"
+            f"周 MA20 {_num(f.get('weekly_ma20'))}（5 周斜率 {_pct(f.get('weekly_ma20_slope_pct'))}）")
+
+
+def _h4_seg(f) -> str:
+    """4H 波段结构渲染：两侧全缺失明示缺失（结构门本场不生效）；单侧缺失逐项「数据不足」。"""
+    hi, lo = f.get("h4_swing_high"), f.get("h4_swing_low")
+    if hi is None and lo is None:
+        return "4H 波段结构（代码按已收盘 4H K 线计算）：数据不足（4H 入场结构门本场不生效）"
+    hi_s = "数据不足" if hi is None else f"{_num(hi)}（{f.get('h4_swing_high_time') or '时刻未登记'} UTC）"
+    lo_s = "数据不足" if lo is None else f"{_num(lo)}（{f.get('h4_swing_low_time') or '时刻未登记'} UTC）"
+    return f"4H 波段结构（代码按已收盘 4H K 线计算）：最近确认波段高点 {hi_s}；最近确认波段低点 {lo_s}"
+
+
 def feature_block(feat, mk) -> str:
     """趋势特征渲染：判定提示词与交易经理提示词共用同一块，保证两边看到的数据完全一致。"""
     f = feat or {}
@@ -312,7 +506,7 @@ def feature_block(feat, mk) -> str:
             f"ATR14 {mkn('atr14')}（基于 {f.get('bars', '?')} 根已收盘日线）；"
             f"量能：最新日 z 值 {_num(f.get('vol_z_last'))}、近 5 日最大 z 值 {_num(f.get('vol_z_max5'))}"
             f"（相对此前 20 日均量/标准差），最新日收盘涨跌 {_num(f.get('last_chg_atr'))}×ATR14；"
-            + _flow_seg(f))
+            + _weekly_seg(f) + "；" + _h4_seg(f) + "；" + _flow_seg(f))
 
 
 # ------------------------------------------------------------------ LLM 行情判定
@@ -417,6 +611,10 @@ def judge_prompt(coin_name: str, inst: str, feat, mk, S: float, votes: dict, mar
               "  · 若拿不到任何一项衰竭证据，stage 不许给 late_exhaustion；系统有代码校验：返回 late_exhaustion 但 exhaustion_signals "
               "为空或含闭集外的值，生效 stage 会被强制降为 mid 并记入存档；引用 forced_flow_exhaustion 但本场资金面数据缺失的，"
               "该项会被剔除、按剩余信号裁定（无剩余信号同样降为 mid）。",
+              "- 特征表中的周线方向是代码计算的执行层过滤数据（逆周线方向开仓会被代码拦截），不是你的判定对象；"
+              "你的 direction/strength/stage 仍只按日线特征判定，不要因周线方向改判。",
+              "- 特征表中的 4H 波段高低点同样是代码计算的执行层入场结构数据（触发价落进 4H 波段内部会被代码拦截），"
+              "不是你的判定对象；判定仍只按日线特征，不要因 4H 波段改判。",
               "只输出结构化结果，不要输出其他文字。"]
     return "\n".join(lines)
 
@@ -490,11 +688,80 @@ def build_regime(cfg, judge, feat) -> dict:
     tc = trend_cfg(cfg)
     judge = apply_stage_gate(judge, feat)
     active = bool(judge and judge["direction"] in ("long", "short") and judge["strength"] in ("strong", "moderate"))
+    # 周线方向过滤状态（决策 2）：方向只认特征表里的代码计算值，非法/缺失一律按缺失处理（不拦）。
+    # blocked_side = 本场会被过滤拦下的开仓方向（周线方向的反面），随判定一并存档备查。
+    wd = (feat or {}).get("weekly_direction") if isinstance(feat, dict) else None
+    if wd not in ("long", "short", "none"):
+        wd = None
+    wc = weekly_cfg(cfg)
+    weekly = {"enabled": wc["enabled"], "direction": wd, "missing": wd is None,
+              "blocked_side": ({"long": "short", "short": "long"}.get(wd)
+                               if wc["enabled"] and wd in ("long", "short") else None)}
+    # 4H 入场结构状态（2026-11-15）：波段值只认特征表里的代码计算值，非法/非有限/非正一律按缺失
+    # 处理（不拦）。short_bound/long_bound = 本场该方向入场的约束界（做空触发价下限、做多触发价
+    # 上限），开关关闭时置 None，随判定一并存档备查（stage_overridden 式记账）。
+    h4c = h4_cfg(cfg)
+    fd = feat if isinstance(feat, dict) else {}
+
+    def _px(v):
+        return float(v) if isinstance(v, (int, float)) and math.isfinite(v) and v > 0 else None
+    sh, sl_ = _px(fd.get("h4_swing_high")), _px(fd.get("h4_swing_low"))
+    h4 = {"enabled": h4c["enabled"], "swing_high": sh, "swing_high_time": fd.get("h4_swing_high_time"),
+          "swing_low": sl_, "swing_low_time": fd.get("h4_swing_low_time"),
+          "missing": sh is None and sl_ is None,
+          "short_bound": sh if h4c["enabled"] else None,
+          "long_bound": sl_ if h4c["enabled"] else None}
     return {"enabled": tc["enabled"], "source": "llm", "failed": judge is None,
             "judge": judge, "features": feat, "cfg": tc, "active": active,
             "judge_standard": JUDGE_STANDARD,
             "side": judge["direction"] if active else None,
-            "downgrade": bool(active and judge["stage"] == "late_exhaustion")}
+            "downgrade": bool(active and judge["stage"] == "late_exhaustion"),
+            "weekly": weekly, "weekly_direction": wd, "h4": h4}
+
+
+def weekly_block_reason(regime, side) -> str | None:
+    """周线方向过滤的代码门（validate §3.7 调用）：过滤启用、周线方向明确（long/short）且下单方向
+    与周线方向相反 → 返回 [WEEKLY_DIR] 拦截说明；其余情况（同向/中性/缺失/关闭/regime 缺失）一律
+    返回 None 不拦截（fail-soft，与资金面缺失同口径）。"""
+    wk = (regime or {}).get("weekly") or {}
+    if not wk.get("enabled"):
+        return None
+    wd = wk.get("direction")
+    if wd not in ("long", "short") or side not in ("long", "short") or side == wd:
+        return None
+    return (f"[WEEKLY_DIR] 周线方向过滤（代码按完整周收盘计算）：本场周线方向为{_DIR_CN[wd]}（{wd}），"
+            f"禁止逆周线方向开新仓，本单 side={side} 被拦。请改 hold 并在 rationale 写明周线过滤，"
+            "或等周线方向转向后再议；不要改方向绕过（方向由共识决定，你无权翻转）。")
+
+
+def h4_block_reason(regime, side, trigger_px) -> str | None:
+    """4H 入场结构的代码门（validate §3.8 调用）：结构门启用且对应侧波段值存在时——做空入场价
+    （pending/replace_pending 看触发价，open 看现价）低于最近确认 4H 波段高点 → 返回 [H4_STRUCT]
+    拦截说明（含最低可接受触发价）；做多镜像（入场价高于最近确认 4H 波段低点 → 拦）。入场价恰
+    等于波段点位可过。其余情况（同侧无约束/波段缺失/开关关闭/regime 缺失/价格不可解析）一律
+    返回 None 不拦截（fail-soft，与周线过滤同口径）。"""
+    h4 = (regime or {}).get("h4") or {}
+    if not h4.get("enabled") or side not in ("long", "short"):
+        return None
+    try:
+        px = float(trigger_px)
+    except (TypeError, ValueError):
+        return None
+    if side == "short":
+        bound = h4.get("swing_high")
+        if bound is not None and px < float(bound):
+            return (f"[H4_STRUCT] 4H 入场结构（代码按已收盘 4H K 线计算）：做空入场价 {px:g} 低于最近确认的 "
+                    f"4H 波段高点 {float(bound):g}（{h4.get('swing_high_time') or '时刻未登记'} UTC），触发价落进了"
+                    f"当前 4H 上涨波段内部；做空触发价最低须 ≥ {float(bound):g}，请改高后重试，或改 hold 并在 "
+                    "rationale 写明 4H 结构约束。")
+    else:
+        bound = h4.get("swing_low")
+        if bound is not None and px > float(bound):
+            return (f"[H4_STRUCT] 4H 入场结构（代码按已收盘 4H K 线计算）：做多入场价 {px:g} 高于最近确认的 "
+                    f"4H 波段低点 {float(bound):g}（{h4.get('swing_low_time') or '时刻未登记'} UTC），触发价落进了"
+                    f"当前 4H 下跌波段内部；做多触发价最高须 ≤ {float(bound):g}，请改低后重试，或改 hold 并在 "
+                    "rationale 写明 4H 结构约束。")
+    return None
 
 
 _DIR_CN = {"short": "空头", "long": "多头", "none": "无趋势"}
@@ -502,12 +769,47 @@ _STR_CN = {"strong": "强", "moderate": "中等", "none": "无"}
 _STAGE_CN = {"early": "早期", "mid": "中段", "late_exhaustion": "末段衰竭"}
 
 
+def _weekly_line(regime) -> str:
+    """TM 提示词里的周线过滤说明行（决策 2）：过滤关闭时不出现；启用时按方向/中性/缺失三态
+    说明拦截口径。周线过滤独立于 LLM 判定——判定失败时本行照常出现（只要 regime 已构建）。"""
+    wk = (regime or {}).get("weekly") or {}
+    if not wk.get("enabled"):
+        return ""
+    wd = wk.get("direction")
+    if wd in ("long", "short"):
+        opp = "short" if wd == "long" else "long"
+        return (f"\n周线方向过滤（代码计算）：本场周线方向为{_DIR_CN[wd]}（{wd}），禁止逆周线方向开新仓——"
+                f"{opp} 方向的 open/pending/replace_pending 会被校验退回（[WEEKLY_DIR]）；"
+                "若共识方向恰与周线相反，本场只能 hold 并在 rationale 写明周线过滤，不要尝试下单。")
+    if wk.get("missing"):
+        return "\n周线方向过滤（代码计算）：本场周线数据缺失，过滤不生效，按常规规则决策。"
+    return "\n周线方向过滤（代码计算）：本场周线方向中性（无明确方向），过滤不拦截任何方向。"
+
+
+def _h4_line(regime) -> str:
+    """TM 提示词里的 4H 入场结构说明行（2026-11-15）：结构门关闭时不出现；启用时按波段值有无
+    说明约束界。结构门独立于 LLM 判定——判定失败时本行照常出现（只要 regime 已构建）。"""
+    h4 = (regime or {}).get("h4") or {}
+    if not h4.get("enabled"):
+        return ""
+    parts = []
+    if h4.get("swing_high") is not None:
+        parts.append(f"做空触发价须 ≥ 最近确认 4H 波段高点 {float(h4['swing_high']):g}")
+    if h4.get("swing_low") is not None:
+        parts.append(f"做多触发价须 ≤ 最近确认 4H 波段低点 {float(h4['swing_low']):g}")
+    if not parts:
+        return "\n4H 入场结构（代码计算）：本场 4H 波段数据缺失，结构门不生效，按常规规则决策。"
+    return ("\n4H 入场结构（代码按已收盘 4H K 线计算）：" + "；".join(parts) +
+            "——不满足的 open/pending/replace_pending 会被校验退回（[H4_STRUCT]）；触发价正好等于波段点位可以通过。")
+
+
 def regime_block(regime: dict, mk) -> str:
     """交易经理提示词里的「本场行情判定（LLM）」段：判定结果 + 依判定生效的执行规则。"""
     tc = regime["cfg"]
     if regime.get("failed") or not regime.get("judge"):
         return ("## 本场行情判定（LLM）\n"
-                "判定失败（regime_judge_failed）：本场趋势市执行规则不生效，按常规规则决策。")
+                "判定失败（regime_judge_failed）：本场趋势市执行规则不生效，按常规规则决策。"
+                + _weekly_line(regime) + _h4_line(regime))
     j = regime["judge"]
     head = (f"## 本场行情判定（LLM，与交易经理同一模型席位，决策前判定）\n"
             f"方向={_DIR_CN[j['direction']]}（{j['direction']}）；强度={_STR_CN[j['strength']]}（{j['strength']}）；"
@@ -525,7 +827,7 @@ def regime_block(regime: dict, mk) -> str:
         head += ("\n注：判定员引用了资金面衰竭（forced_flow_exhaustion），但本场资金面数据缺失，"
                  "该项证据已被代码校验剔除（原始引用保留在存档中）。")
     if not regime.get("active"):
-        return head + "\n本场趋势市执行规则不生效（判定无趋势或强度不足），按常规规则决策。"
+        return head + "\n本场趋势市执行规则不生效（判定无趋势或强度不足），按常规规则决策。" + _weekly_line(regime) + _h4_line(regime)
     cap = tc["near_atr"] * float((mk or {}).get("atr14") or 0)
     s = (head + f"\n趋势市执行规则（依本场判定生效，只改入场方式，不改否决门槛）：判定方向与下单方向一致时，"
          f"禁止把唯一入场押在远离现价的位置上——必须二选一：(a) 现价入场（open）；(b) 近价挂单（pending），"
@@ -536,15 +838,23 @@ def regime_block(regime: dict, mk) -> str:
               f"且 risk_scale≤{tc['oversold_risk_scale']:g}（[TREND_OVERSOLD] 硬校验）。")
     s += ("\n趋势市里仍可 hold，但 rationale 必须写明：判定证据里哪一条不成立，或哪条硬护栏不允许下单。"
           "只写「等反弹确认」「把握不足」视为未说明，会在日报中被标出。")
-    return s
+    return s + _weekly_line(regime) + _h4_line(regime)
 
 
 def log_call(*, date, session, source, inst, decision_id, regime) -> dict:
     """每次判定追加一行 state/ledger/regime_calls.jsonl（判定 + 特征快照），供日后对照实际走势打分。"""
+    wk = regime.get("weekly") or {}
+    h4 = regime.get("h4") or {}
     rec = {"time": settings.now_str(), "date": date, "session": session, "source": source,
            "inst_id": inst, "decision_id": decision_id, "judge_standard": JUDGE_STANDARD,
            "judge": regime.get("judge"), "failed": bool(regime.get("failed")),
            "active": bool(regime.get("active")), "downgrade": bool(regime.get("downgrade")),
+           "weekly_direction": wk.get("direction"), "weekly_missing": bool(wk.get("missing")),
+           "weekly_filter_enabled": bool(wk.get("enabled")), "weekly_blocked_side": wk.get("blocked_side"),
+           "h4_swing_high": h4.get("swing_high"), "h4_swing_high_time": h4.get("swing_high_time"),
+           "h4_swing_low": h4.get("swing_low"), "h4_swing_low_time": h4.get("swing_low_time"),
+           "h4_missing": bool(h4.get("missing")), "h4_filter_enabled": bool(h4.get("enabled")),
+           "h4_short_bound": h4.get("short_bound"), "h4_long_bound": h4.get("long_bound"),
            "features": regime.get("features")}
     settings.append_jsonl(REGIME_CALLS, rec)
     return rec

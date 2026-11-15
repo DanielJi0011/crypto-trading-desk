@@ -181,6 +181,27 @@ def validate(cfg, call: OrderToolCall, ctx: dict) -> list[str]:
                 and not tr.get("downgrade") and call.side and call.side == tr.get("side")
                 and _num(call.take_profit) and float(mk.get("atr14") or 0) > 0):
             ctx["_trailing_exit"] = {"plan_tp": float(call.take_profit), "atr14": float(mk["atr14"])}
+    # 3.7) 周线方向过滤（决策 2，2026-11-15 用户批准，desk/regime_judge.weekly_block_reason）：周线方向是
+    #      纯代码数据（完整周收盘 vs 周 MA20 位置 + 五周斜率），与 LLM 判定是否生效无关——判定失败但
+    #      特征表在，过滤照常生效。作用域同 §3.5：新入场 open/pending/replace_pending；keep_pending
+    #      沿用原单、add 是已有持仓的加仓腿，均不在此列。周线中性/缺失/过滤关闭 → 不拦（fail-soft）。
+    if a in ("open", "pending", "replace_pending"):
+        from desk import regime_judge as _RJ
+        _wb = _RJ.weekly_block_reason(ctx.get("trend"), call.side)
+        if _wb:
+            errs.append(_wb)
+            return errs
+    # 3.8) 4H 入场结构（2026-11-15 用户批准，desk/regime_judge.h4_block_reason）：4H 波段是纯代码数据
+    #      （已收盘 4H K 线的最近确认枢轴高/低点），与 LLM 判定是否生效无关——判定失败但特征表在，
+    #      结构门照常生效。作用域同 §3.7：新入场 open/pending/replace_pending（open 以现价为入场价
+    #      比对）；add 加仓腿、keep_pending 沿用原单不在此列。波段缺失/开关关闭 → 不拦（fail-soft）。
+    if a in ("open", "pending", "replace_pending"):
+        from desk import regime_judge as _RJ
+        _px = float(mk["last"]) if a == "open" else _num(call.trigger_px)
+        _hb = _RJ.h4_block_reason(ctx.get("trend"), call.side, _px)
+        if _hb:
+            errs.append(_hb)
+            return errs
     # 4) 点位硬护栏（止损侧向、距离≤stop_max_pct、止盈侧向、RR≥min_rr）
     if a in OPEN_ACTS or a == "keep_pending":
         px = float(mk["last"]) if a in ("open", "add") else float(call.trigger_px)
@@ -428,6 +449,22 @@ def instructions(ctx: dict, cfg=None) -> str:
                          f"近价触发允许范围 {_last - _cap:.6g}~{_last + _cap:.6g}。")
         elif tr.get("failed"):
             lines.append("本币本场行情判定失败：趋势市规则不生效，按常规规则下单。")
+        _wk = tr.get("weekly") or {}
+        if _wk.get("enabled") and _wk.get("direction") in ("long", "short"):
+            lines.append(f"周线方向过滤（代码按完整周收盘计算）：本场周线方向为{'多头' if _wk['direction'] == 'long' else '空头'}，"
+                         "逆周线方向的 open/pending/replace_pending 会被校验退回（[WEEKLY_DIR]）；"
+                         "共识方向与周线相反时直接 hold 并在 rationale 写明周线过滤，不要尝试下单。")
+        _h4 = tr.get("h4") or {}
+        if _h4.get("enabled"):
+            _parts = []
+            if _h4.get("swing_high") is not None:
+                _parts.append(f"做空触发价须 ≥ 最近确认 4H 波段高点 {float(_h4['swing_high']):g}")
+            if _h4.get("swing_low") is not None:
+                _parts.append(f"做多触发价须 ≤ 最近确认 4H 波段低点 {float(_h4['swing_low']):g}")
+            if _parts:
+                lines.append("4H 入场结构（代码按已收盘 4H K 线计算）：" + "；".join(_parts) +
+                             "，不满足的 open/pending/replace_pending 会被校验退回（[H4_STRUCT]）；"
+                             "触发价正好等于波段点位可以通过。现价 open 按现价比对同一约束。")
     if cfg is not None and tr.get("enabled"):
         try:
             from desk import demo_exec as _DX

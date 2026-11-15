@@ -35,6 +35,12 @@ execution:
     enabled: true                       # 开关：false=全部仓位固定止盈（改动前行为）
     activation_frac_of_tp: 0.5          # 激活线：价格向有利方向走出「计划止盈距离」的这一比例后，移动止损开始跟踪
     trail_atr_mult: 1.0                 # 跟踪距离 = 该倍数 × 开仓时 ATR14（日线口径，与止损标尺同源）
+  # 移动止损仓位持有期自动续期（desk/expiry.py trailing_extend_check；2026-11-15 用户批准，决策 4）：exit_mode=trailing
+  # 的持仓到期时，若该币最新存档行情判定（代码门后的生效阶段）仍为与持仓同向、强度 strong/moderate、非 late_exhaustion
+  # 的趋势，自动续一期（horizon_days），不触发到期复核；判定转弱/衰竭/反向/失败 → 走原到期路径。每次到期重新核对
+  # 最新判定；续期计入 expiry_extend.max_extensions 总上限（所有模式共享）；expiry_extend.enabled=false 时本项也不生效。
+  trailing_horizon_extend:
+    enabled: true                       # 开关：false=移动止损仓位到期照常走复核（改动前行为）
 llm:
   provider: deepseek                    # TradingAgents 内置 provider（OpenAI 兼容，含 DeepSeek 思考模式适配）
   base_url_env: TA_LLM_BASE_URL         # 未设置时用 default_base_url
@@ -218,6 +224,18 @@ manager:
   trend_rule_enabled: true              # 趋势市规则总开关：false 即整段回滚到 A+ 之前行为（不调判定、提示词段、距离护栏同时失效）
   trend_near_atr: 0.3                   # 趋势市近价：pending 触发价距现价 ≤ 0.3×ATR14，超出被 validate 退回
   trend_oversold_risk_scale: 0.5        # 末段衰竭（late_exhaustion）降级：禁用现价 open，只许近价 pending，且 risk_scale ≤ 0.5
+  # 周线方向过滤（决策 2，2026-11-15 用户批准，desk/regime_judge.py）：周期框架定稿的一环——代码按已收盘
+  # 完整周收盘计算周线方向（收盘 vs 周 MA20 位置 + MA20 五周斜率同向才算趋势），禁止逆周线方向开新仓
+  # （validate §3.7 [WEEKLY_DIR]，作用域 open/pending/replace_pending）；周线中性/数据缺失不拦。与 LLM
+  # 行情判定独立：判定失败但特征表在时过滤照常生效。整层仍受 trend_rule_enabled 总开关约束。
+  weekly_filter:
+    enabled: true                       # 开关：false=周线方向只进特征表展示，不拦截任何下单
+  # 4H 入场结构（2026-11-15 用户批准，desk/regime_judge.py）：周期框架定稿的一环——4H 只做入场触发
+  # 微调：代码按已收盘 4H K 线算最近确认波段高/低点，做空触发价不得低于波段高点、做多触发价不得
+  # 高于波段低点（validate §3.8 [H4_STRUCT]，作用域 open/pending/replace_pending；恰等于可过）；
+  # 波段数据缺失不拦。方向判定仍只用日线，4H 不进判定口径。整层仍受 trend_rule_enabled 总开关约束。
+  h4_entry_structure:
+    enabled: true                       # 开关：false=4H 波段只进特征表展示，不拦截任何下单
 
 # 止损止盈参考点位与同价位判定（desk/sizing.py）
 sizing:

@@ -45,8 +45,22 @@ def _parse(s):
 
 def _expiry(cfg, r, inst, m, pos, now):
     """2026-10-29 用户决定：到期（或到期前一个检查周期内）由交易经理判断延期或平仓；失败/达上限回退旧行为（到期平仓）。
-    结论与通知标记先写入登记再执行，重启后不重复判断、不重复通知。平仓后只通知，不触发再讨论。"""
+    结论与通知标记先写入登记再执行，重启后不重复判断、不重复通知。平仓后只通知，不触发再讨论。
+    决策 4（2026-11-15）：exit_mode=trailing 且最新存档判定仍为同向非衰竭趋势时，先自动续一期再谈复核
+    （desk/expiry.py trailing_extend_check）；HALT 在调用方已拦，本函数不判。"""
     r.setdefault("positions", {})[inst] = m   # r 可能已在本轮被重新读取，确保写回的是当前这条登记
+    ext = EXP.trailing_extend_check(cfg, inst, m, pos.get("side"))
+    if ext:
+        EXP.apply_extend(m, {"deadline": m["deadline"], "new_deadline": ext["new_deadline"], "days": ext["days"],
+                             "reason": ext["reason"], "time": settings.now_str()})
+        DX.save_reg(r)
+        X.log_event("horizon_extended_trailing", inst_id=inst, days=ext["days"], new_deadline=m["deadline"],
+                    orig_deadline=m.get("orig_deadline"), extensions=m["extensions"],
+                    verdict=ext["verdict"], reason=ext["reason"])
+        log(f"{inst} 移动止损仓位到期自动续期 {ext['days']:g} 天至 {m['deadline']}：{ext['reason']}")
+        _notify("position_extended", inst_id=inst,
+                message=f"{inst} 持有期到期：移动止损仓位自动续期 {ext['days']:g} 天（新到期 {m['deadline']}，止损止盈不变），原因：{ext['reason']}")
+        return r
     if EXP.mode(cfg) == "full_discussion":
         return _expiry_full(cfg, r, inst, m, pos, now)
     v = EXP.judge(cfg, inst, pos, m, now)
