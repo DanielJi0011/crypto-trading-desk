@@ -28,11 +28,25 @@ def prepare_env(cfg) -> bool:
     return bool(key)
 
 
+def checkpoint_enabled(cfg) -> bool:
+    """本进程的图运行是否启用 TradingAgents 存档点（席位级续跑，desk/resume.py）。
+
+    存档点会让图对象在每次 propagate 时重编译自身（begin/end_checkpoint），与三币
+    并行共用同一图实例互斥（run_daily 的并行守卫同理）。因此只在串行上下文启用：
+    config parallel.enabled=false 的部署，或本进程被续跑入口显式置 RESUME_MODE
+    （续跑入口强制串行，见 desk/run_daily.py --resume）。定时场次（并行）保持关闭、
+    行为与启用前完全一致。"""
+    if getattr(settings, "RESUME_MODE", False):
+        return True
+    return not bool((cfg.get("parallel") or {}).get("enabled", False))
+
+
 def ta_config(cfg) -> dict:
     from tradingagents.default_config import build_default_config
     c = build_default_config()
     L = cfg["llm"]
     c.update({
+        "checkpoint_enabled": checkpoint_enabled(cfg),   # 席位级续跑存档点（串行上下文才开，见上）
         "results_dir": str(settings.STATE / "ta_results"),
         "data_cache_dir": str(settings.STATE / "ta_cache"),
         "memory_log_path": str(settings.STATE / "ta_memory" / "trading_memory.md"),

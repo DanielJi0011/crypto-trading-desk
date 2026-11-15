@@ -106,6 +106,8 @@ def now_str() -> str:
 
 SESSION = "morning"   # 当前场次（run_daily --session 设置），见 desk/sessions.py
 
+RESUME_MODE = False   # 席位级续跑模式（run_daily --resume / rerun_coin --resume 设置）：本进程强制串行并启用图存档点，见 desk/resume.py
+
 
 def today() -> str:
     return now().strftime("%Y-%m-%d")

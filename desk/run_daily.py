@@ -18,8 +18,11 @@ def main(argv=None):
     ap.add_argument("--research", action="store_true", help="强制本次运行每周研究（默认只在周日）")
     ap.add_argument("--report-name", default="", help="日报文件名（不含 .md），如 2026-10-20-rerun；默认用日期")
     ap.add_argument("--session", default="morning", choices=["morning", "evening"], help="场次：morning 早场 / evening 晚场")
+    ap.add_argument("--resume", action="store_true", help="席位级续跑：强制串行 + 启用图存档点，逐币只补本场缺失环节（已有决策跳过 / 图产物在只补尾段 / 其余整币跑），见 desk/resume.py")
     a = ap.parse_args(argv)
     settings.SESSION = a.session
+    if a.resume:
+        settings.RESUME_MODE = True
     if a.mock:
         os.environ["TA_DESK_MOCK_LLM"] = "1"
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -79,11 +82,19 @@ def main(argv=None):
         errors.append(f"宏观数据失败：{type(e).__name__}")
     # 3) 分析 + 决策
     run_coins = [] if stop else coins
-    if parallel_enabled(cfg) and len(run_coins) > 1:
+    if parallel_enabled(cfg) and len(run_coins) > 1 and not a.resume:
         _run_coins_parallel(cfg, run_coins, date, tracker, errors, decisions)
     else:
-        for coin in run_coins:   # parallel.enabled=false：原串行流程（逐币 读账户→分析→立场→决策执行），行为不变
+        for coin in run_coins:   # parallel.enabled=false：原串行流程（逐币 读账户→分析→立场→决策执行），行为不变；--resume 亦走此路（存档点与并行互斥）
             try:
+                if a.resume:
+                    from desk import resume as _resume
+                    rec, how = _resume.resume_coin(cfg, coin, date, tracker)
+                    if how != "done":   # done 的立场已在原运行时落盘，重复落盘会让打分样本翻倍
+                        scoring.record_stances(cfg, rec)
+                    decisions.append(rec)
+                    print(f"[ta-desk] {coin['inst_id']}: 续跑[{how}] 共识={rec['consensus']:+.3f} → {rec['final_action']}", flush=True)
+                    continue
                 prices = {c["inst_id"]: okx_data.last_price(c["inst_id"]) for c in cfg["coins"]}
                 bk = demo_exec.book(cfg, prices) if demo_exec.is_demo(cfg) else ledger.book(cfg, prices)
                 ap = drift.stamp(coin["inst_id"])   # 分析开始时的参考价（漂移检查用）

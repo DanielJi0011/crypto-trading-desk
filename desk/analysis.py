@@ -210,7 +210,59 @@ def x_feed_missing_alert(trade_date: str, ccy: str) -> bool:
     return True
 
 
-def analyze(cfg, coin: dict, trade_date: str, book: dict, tracker, extra_brief: str = "") -> dict:
+def _run_signature(g, pf):
+    fn = getattr(g, "_run_signature", None)
+    return fn("crypto", pf) if fn else None
+
+
+def _prepare_checkpoint(g, coin: dict, trade_date: str, pf, resume: bool):
+    """席位级续跑的存档点准备（仅存档点启用时调用，语义见 desk/resume.py）。
+
+    返回 (本次 propagate 应传入的组合上下文, 是否将从存档点续跑)。
+    - resume 且本场次 run-ctx 旁车在、且该线程确有存档步数：喂回崩溃那次运行的
+      原始组合（签名含组合指纹，现读账本几乎必然对不上），vendor 在 propagate
+      里自动从最后完成节点续跑。
+    - 其余情况（fresh 语义：定时场次、整场重跑、续跑但无存档可复用）：先清掉本次
+      将用到的线程与旁车记录的上次线程，保证从干净状态开始，再写下本次 run-ctx。
+      图成功收尾时 vendor 会自行清存档点（_run_graph 的 clear_checkpoint_on_success）。
+    """
+    from desk import resume as _resume
+    from tradingagents.graph.checkpointer import checkpoint_step
+    ticker = coin["ticker"]
+    ctx = _resume.read_run_ctx(ticker, trade_date, settings.SESSION)
+    if resume and ctx and ctx.get("portfolio"):
+        try:
+            from tradingagents.portfolio import PortfolioContext
+            pf0 = PortfolioContext.model_validate(ctx["portfolio"])
+            step = checkpoint_step(g.config["data_cache_dir"], ticker, str(trade_date),
+                                   _run_signature(g, pf0) or "")
+        except Exception as e:
+            log.warning("席位级续跑预检失败（按整币新跑处理）：%s", e)
+            pf0, step = None, None
+        if pf0 is not None and step is not None:
+            log.info("席位级续跑：%s %s 从存档点第 %s 步续跑", ticker, trade_date, step)
+            return pf0, True
+        log.info("席位级续跑：%s %s 无可复用存档点，整币新跑", ticker, trade_date)
+    try:
+        g.clear_checkpoint_on_success(ticker, trade_date, "crypto", pf)
+    except Exception as e:
+        log.warning("清存档点失败（现读组合）：%s", e)
+    if ctx and ctx.get("portfolio"):
+        try:
+            from tradingagents.portfolio import PortfolioContext
+            pf_old = PortfolioContext.model_validate(ctx["portfolio"])
+            if pf_old.fingerprint() != pf.fingerprint():
+                g.clear_checkpoint_on_success(ticker, trade_date, "crypto", pf_old)
+        except Exception as e:
+            log.warning("清存档点失败（上次组合）：%s", e)
+    try:
+        _resume.write_run_ctx(ticker, trade_date, settings.SESSION, pf, _run_signature(g, pf))
+    except Exception as e:
+        log.warning("run-ctx 旁车写入失败：%s", e)
+    return pf, False
+
+
+def analyze(cfg, coin: dict, trade_date: str, book: dict, tracker, extra_brief: str = "", resume: bool = False) -> dict:
     g = build_graph(cfg, tracker)
     from desk import flows, tools, untrusted
     tools._AS_OF["date"] = trade_date
@@ -239,18 +291,28 @@ def analyze(cfg, coin: dict, trade_date: str, book: dict, tracker, extra_brief: 
         log.warning("宏观摘要失败：%s", e)
     briefs["*"] = shared   # B3 持仓 + 当前挂着的条件单 + 再讨论触发原因（止损/止盈），全体角色共享
     roles.set_briefs(briefs)
+    pf = portfolio_ctx(book)
+    resumed = False
+    if dllm.checkpoint_enabled(cfg):
+        pf, resumed = _prepare_checkpoint(g, coin, trade_date, pf, resume)
     tok = dllm.STAGE.set(f"{coin["inst_id"]}/分析图")
     try:
-        fs, signal = g.propagate(coin["ticker"], trade_date, asset_type="crypto", portfolio=portfolio_ctx(book))
+        fs, signal = g.propagate(coin["ticker"], trade_date, asset_type="crypto", portfolio=pf)
     finally:
         dllm.STAGE.reset(tok)
         roles.set_briefs({})
     fs["_flows_report"] = fl["report"]
     fs["_x_feed"] = bool(xf)
     fs["_flows_missing"] = bool(fl.get("data_missing"))
+    try:   # 尾段续跑旁车：图外字段随图结果一并落盘（无条件写，失败降级），见 desk/resume.py
+        from desk import resume as _resume
+        _resume.write_tail_sidecar(coin["ticker"], trade_date, settings.SESSION, fs, signal)
+    except Exception as e:
+        log.warning("尾段旁车写入失败：%s", e)
     try:
         path = g.save_reports(fs, coin["ticker"], html=False)
     except Exception as e:  # 报告树写入失败不影响交易流程
         log.warning("save_reports 失败：%s", e)
         path = None
-    return {"final_state": fs, "signal": signal, "report_dir": str(path) if path else None}
+    return {"final_state": fs, "signal": signal, "report_dir": str(path) if path else None,
+            "resumed_from_checkpoint": resumed}

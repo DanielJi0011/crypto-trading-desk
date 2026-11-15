@@ -11,6 +11,7 @@ for _v in $(compgen -e); do case "$_v" in OKX_DEMO_*) ;; OKX_*KEY*|OKX_*SECRET*|
 #   失败写 state/daily_failed/<日期>（内容为返回码）并发 webhook daily_failed。--mock 演练不读写完成/失败标记。
 #   O1 时间窗口：非 --mock 时只在 config sessions 窗口内运行（早场北京 07:55 到 12:00，晚场纽约 08:25 到 10:30），窗口外记 daily_duplicate_trigger(out_of_window) 后退出 0；
 #   需要窗口外补跑时显式设置 TA_DAILY_IGNORE_WINDOW=1。成功后记事件并发 daily_done 通知。
+#   --resume（席位级续跑，desk/resume.py）：运维显式补跑，跳过时间窗口与 daily_done 检查（本就是来补齐未完成场次的），仍受单实例锁约束；成功后照常写 daily_done 并清 daily_failed。
 set -uo pipefail
 cd "$(dirname "$0")"
 DATA="${TA_DESK_HOME:-$PWD}"                 # 数据目录（测试时指向临时目录）
@@ -20,9 +21,10 @@ RUNNER="${TA_DAILY_RUNNER:-$PY -m desk.run_daily}"   # 仅测试用：替换为�
 # 返回码：5 = 解释器缺失（本场跳过并告警）；6 = 窗口判断调用失败（不是“不在窗口”，本场跳过并告警）
 mkdir -p "$DATA/logs" "$DATA/state/locks" "$DATA/state/daily_done" "$DATA/state/daily_failed"
 DAY="$(TZ=Asia/Shanghai date +%F)"
-MOCK=0; prev=""; SESSION=morning
+MOCK=0; RESUME=0; prev=""; SESSION=morning
 for a in "$@"; do
   [ "$a" = "--mock" ] && MOCK=1
+  [ "$a" = "--resume" ] && RESUME=1
   [ "$prev" = "--date" ] && DAY="$a"
   [ "$prev" = "--session" ] && SESSION="$a"
   case "$a" in --session=*) SESSION="${a#--session=}" ;; esac
@@ -44,7 +46,7 @@ if ! flock -n 9; then
 fi
 NOW_HM="${TA_DAILY_NOW:-$(TZ=Asia/Shanghai date +%H:%M)}"   # TA_DAILY_NOW 仅测试用（北京 HH:MM）
 # 窗口按 config sessions.<场次> 用 zoneinfo 换算成北京时间（晚场按纽约时间，随夏令时切换）
-if [ "$MOCK" = "0" ] && [ "${TA_DAILY_IGNORE_WINDOW:-0}" != "1" ]; then
+if [ "$MOCK" = "0" ] && [ "$RESUME" = "0" ] && [ "${TA_DAILY_IGNORE_WINDOW:-0}" != "1" ]; then
   WIN=$(TA_DESK_HOME="$DATA" "$PY" -m desk.sessions window "$SESSION" "$DAY" "$NOW_HM"); wrc=$?
   if [ "$wrc" != "0" ] && ! { [ "$wrc" = "1" ] && [[ "$WIN" =~ ^[0-9]{2}:[0-9]{2}-[0-9]{2}:[0-9]{2}$ ]]; }; then
     ta_alert daily_skipped "run_daily $KEY（$SNAME）被跳过：时间窗口判断失败（desk.sessions window 返回码 $wrc，非正常“不在窗口”结果），未运行交易流程，详见日志" "$LOG"
@@ -57,7 +59,7 @@ if [ "$MOCK" = "0" ] && [ "${TA_DAILY_IGNORE_WINDOW:-0}" != "1" ]; then
     exit 0
   fi
 fi
-if [ "$MOCK" = "0" ] && [ -f "$DATA/state/daily_done/$KEY" ]; then
+if [ "$MOCK" = "0" ] && [ "$RESUME" = "0" ] && [ -f "$DATA/state/daily_done/$KEY" ]; then
   echo "[run_daily.sh] $KEY 已完成（$DATA/state/daily_done/$KEY），本次退出（daily_duplicate_trigger done）" | tee -a "$LOG"
   "$PY" -m desk.daily_gate duplicate "$KEY" done >>"$LOG" 2>&1
   exit 0
