@@ -25,7 +25,7 @@ def _ev(tmp):
     return [json.loads(l) for l in p.read_text().splitlines()] if p.exists() else []
 
 
-@pytest.mark.parametrize("now,enter", [("07:54", False), ("07:55", True), ("12:00", True), ("12:01", False), ("23:00", False)])
+@pytest.mark.parametrize("now,enter", [("07:29", False), ("07:30", True), ("12:00", True), ("12:01", False), ("23:00", False)])  # 早场窗口 2026-11-14 放宽至 07:30 起
 def test_window(tmp_path, now, enter):
     r = subprocess.run(["bash", str(ROOT / "run_daily.sh"), "--date", "2030-02-01"], env=_env(tmp_path, now),
                        capture_output=True, text=True, timeout=60)

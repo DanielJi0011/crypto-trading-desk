@@ -21,7 +21,7 @@ def _hm(t):
 def test_evening_dst_2026_10_23():
     cfg = settings.load_config()
     a, b = sessions.window_bj(cfg, "evening", "2026-10-23")
-    assert (_hm(a), _hm(b)) == ("20:25", "22:30")
+    assert (_hm(a), _hm(b)) == ("19:55", "22:30")  # 2026-11-14 窗口放宽：晚场纽约 07:55 起（夏令时 = 北京 19:55）
     assert _hm(sessions.start_bj(cfg, "evening", "2026-10-23")) == "20:30"
     assert _hm(sessions.missing_at(cfg, "evening", "2026-10-23")) == "21:30"
 
@@ -29,7 +29,7 @@ def test_evening_dst_2026_10_23():
 def test_evening_winter_2026_11_02():
     cfg = settings.load_config()
     a, b = sessions.window_bj(cfg, "evening", "2026-11-02")
-    assert (_hm(a), _hm(b)) == ("21:25", "23:30")
+    assert (_hm(a), _hm(b)) == ("20:55", "23:30")  # 2026-11-14 窗口放宽：晚场纽约 07:55 起（冬令时 = 北京 20:55）
     assert _hm(sessions.start_bj(cfg, "evening", "2026-11-02")) == "21:30"
     assert _hm(sessions.missing_at(cfg, "evening", "2026-11-02")) == "22:30"
 
@@ -37,7 +37,7 @@ def test_evening_winter_2026_11_02():
 def test_morning_unchanged_and_keys():
     cfg = settings.load_config()
     a, b = sessions.window_bj(cfg, "morning", "2026-11-02")
-    assert (_hm(a), _hm(b)) == ("07:55", "12:00")
+    assert (_hm(a), _hm(b)) == ("07:30", "12:00")  # 2026-11-14 窗口放宽：早场 07:30 起（定时器提前至 07:35）
     assert sessions.key("2026-10-23", "morning") == "2026-10-23"
     assert sessions.key("2026-10-23", "evening") == "2026-10-23-evening"
     assert sessions.did_prefix("2026-10-23", "evening") + "BTC" == "D-20261023-E-BTC"
@@ -51,7 +51,7 @@ def _env(tmp, now):
     return env
 
 
-@pytest.mark.parametrize("day,now,enter", [("2026-10-23", "20:24", False), ("2026-10-23", "20:30", True),
+@pytest.mark.parametrize("day,now,enter", [("2026-10-23", "19:54", False), ("2026-10-23", "20:30", True),
                                            ("2026-10-23", "22:31", False), ("2026-11-02", "20:30", False),
                                            ("2026-11-02", "23:30", True)])
 def test_run_daily_evening_window_and_marker(tmp_path, day, now, enter):

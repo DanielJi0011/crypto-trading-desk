@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+from datetime import datetime
 
 from desk import llm as dllm
 from desk import okx_data, roles, settings
@@ -32,6 +33,42 @@ def patch_ta_memory(cfg, cls):
     return cls._memory_step
 
 
+def _beijing_today() -> str:
+    """北京时间的今天（YYYY-MM-DD）。台子的交易日期一律是北京日期，
+    校验时钟必须与之同口径（服务器时钟是 UTC）。"""
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d")
+
+
+def _validate_trade_date_bj(trade_date) -> str:
+    """与 vendor _validate_trade_date 同口径，但“今天”按北京时间算。
+    服务器时钟是 UTC：07:35 北京场启动时是 23:35 UTC 前一日，按 UTC
+    算“今天”会把当日误判为未来日期（2026-11-15 早场实测：三币全在
+    propagate 里抛 ValueError: trade_date cannot be in the future）。
+    旧 08:05 北京场（= 00:05 UTC 当日）刚好跨过 UTC 午夜所以没事；
+    晚场 21:00 北京（= 13:00 UTC 当日）不受影响。"""
+    value = str(trade_date)
+    try:
+        canonical = datetime.strptime(value, "%Y-%m-%d").strftime("%Y-%m-%d") == value
+    except ValueError:
+        canonical = False
+    if not canonical:
+        raise ValueError(f"trade_date must be a date in YYYY-MM-DD format, got {trade_date!r}")
+    if value > _beijing_today():
+        raise ValueError(f"trade_date cannot be in the future: {value}")
+    return value
+
+
+def patch_trade_date(cfg, cls):
+    """把 TradingAgents 的 _validate_trade_date 换成北京时间口径。
+    不改 vendor 源码：只替换 trading_graph 模块属性（propagate 通过模块
+    全局名调用它），类实例化前打补丁，与 patch_ta_memory 同一位置。
+    补丁自带正确时区，不依赖 TZ 环境变量。"""
+    import tradingagents.graph.trading_graph as _tg
+    _tg._validate_trade_date = _validate_trade_date_bj
+    return _validate_trade_date_bj
+
+
 def build_graph(cfg, tracker):
     with _GRAPH_LOCK:
         return _build_graph(cfg, tracker)
@@ -50,6 +87,7 @@ def _build_graph(cfg, tracker):
         dllm.install_fake_into_tradingagents()
     from tradingagents.graph.trading_graph import TradingAgentsGraph
     patch_ta_memory(cfg, TradingAgentsGraph)
+    patch_trade_date(cfg, TradingAgentsGraph)
     tc = dllm.ta_config(cfg)
     for k in ("results_dir", "data_cache_dir"):
         os.makedirs(tc[k], exist_ok=True)
