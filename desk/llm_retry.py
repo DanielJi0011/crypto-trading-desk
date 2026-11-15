@@ -1,7 +1,14 @@
 """LLM 调用自动重试（2026-10-24）：503/502/500/504/429、超时、连接错误按指数退避重试，每次重试记日志。
-全部失败才抛出，并记入 FAILURES，日报列为"需报告用户"。只包裹 BaseChatModel.invoke，不改任何交易逻辑。"""
+全部失败才抛出，并记入 FAILURES，日报列为"需报告用户"。只包裹 BaseChatModel.invoke，不改任何交易逻辑。
+
+主备 key 自动切换（2026-11-15）：claude 渠道客户端在构造处（desk/providers.py）可登记一个
+同参数的备用 key 孪生客户端。主 key 的重试预算耗尽（可重试错误跑不通）后，同一次 invoke
+自动改用备用孪生重发（小重试预算）；备用更贵，因此绝不默认走它、每次新调用都重新从主 key
+开始（不做全局粘性切换），非可重试错误（如 400 请求错）不触发切换。每次切换记 SWITCHES 并
+在运行日志留一行；调用实际由哪把 key 服务经 KEY_LABEL 供用量账本标注（primary/backup）。"""
 from __future__ import annotations
 
+import contextvars
 import logging
 import time
 
@@ -13,6 +20,27 @@ DELAYS = list(DEFAULT_DELAYS)
 RETRIES: list[dict] = []    # 本进程每次重试的记录
 FAILURES: list[dict] = []   # 重试用尽仍失败的调用
 _installed = False
+
+# ------------------------------------------------------------------ 主备 key 切换
+KEY_LABEL = contextvars.ContextVar("llm_key_label", default="primary")   # 当前调用由哪把 key 服务（用量账本标注用）
+SWITCHES: list[dict] = []        # 本进程每次主→备切换的记录
+BACKUP_DELAYS = (5, 15)          # 备用 key 的重试预算（2 次重试；可被 config llm.backup_retry_delays 覆盖）
+_BACKUP_TWINS: dict[int, tuple] = {}   # id(主客户端) → (主客户端, 备用客户端)；强引用防 id 被回收复用
+
+
+def register_backup(primary, twin) -> None:
+    """登记主客户端的备用 key 孪生（构造处调用，见 desk/providers.py）。"""
+    _BACKUP_TWINS[id(primary)] = (primary, twin)
+
+
+def backup_twin(model):
+    """查某客户端登记的备用孪生；无登记（或备用 env 缺失时根本没建）返回 None。"""
+    t = _BACKUP_TWINS.get(id(model))
+    return t[1] if t and t[0] is model else None
+
+
+def clear_backups() -> None:
+    _BACKUP_TWINS.clear()
 
 
 def retryable(e: BaseException) -> bool:
@@ -157,9 +185,11 @@ def guard_input(inp, cap=None):
     return msgs, before - total
 
 
-def call(fn, *a, delays=None, any_error=False, **k):
+def call(fn, *a, delays=None, any_error=False, record_failure=True, **k):
     """按 DELAYS 退避重试 fn；不可重试的错误直接抛出。
-    delays：本次调用专用退避序列（缺省用全局 DELAYS）；any_error=True 时任何异常都重试（持有期到期判断用）。"""
+    delays：本次调用专用退避序列（缺省用全局 DELAYS）；any_error=True 时任何异常都重试（持有期到期判断用）。
+    record_failure=False：重试耗尽时不记 FAILURES（主备切换的主 key 尝试用——备用接手成功则不算失败，
+    备用也耗尽时由备用那次尝试按 True 记账）。"""
     ds = list(DELAYS if delays is None else delays)
     for i in range(len(ds) + 1):
         try:
@@ -169,7 +199,8 @@ def call(fn, *a, delays=None, any_error=False, **k):
                 raise
             msg = f"{type(e).__name__}: {str(e)[:200]}"
             if i >= len(ds):
-                FAILURES.append({"stage": _stage(), "attempts": i + 1, "error": msg})
+                if record_failure:
+                    FAILURES.append({"stage": _stage(), "attempts": i + 1, "error": msg})
                 log.error("LLM 调用重试 %d 次后仍失败（%s）：%s", i, _stage(), msg)
                 raise
             RETRIES.append({"stage": _stage(), "attempt": i + 1, "wait": ds[i], "error": msg})
@@ -179,11 +210,15 @@ def call(fn, *a, delays=None, any_error=False, **k):
 
 def install(cfg=None):
     """进程内安装一次：包裹 langchain BaseChatModel.invoke。delays 取 config llm.retry_delays，
-    提示词保险丝上限取 config llm.prompt_hard_cap_chars（缺省 PROMPT_CAP_CHARS）。"""
-    global _installed, DELAYS
+    提示词保险丝上限取 config llm.prompt_hard_cap_chars（缺省 PROMPT_CAP_CHARS），
+    备用 key 重试预算取 config llm.backup_retry_delays（缺省 BACKUP_DELAYS）。"""
+    global _installed, DELAYS, BACKUP_DELAYS
     d = ((cfg or {}).get("llm") or {}).get("retry_delays")
     if d is not None:
         DELAYS = [float(x) for x in d]
+    bd = ((cfg or {}).get("llm") or {}).get("backup_retry_delays")
+    if bd is not None:
+        BACKUP_DELAYS = tuple(float(x) for x in bd)
     pc = ((cfg or {}).get("llm") or {}).get("prompt_hard_cap_chars")
     if pc is not None:
         set_prompt_cap(pc)
@@ -204,7 +239,21 @@ def install(cfg=None):
                         a = (new0,) + tuple(a[1:])
                 except Exception:
                     pass   # 保险丝自身出错绝不阻断调用
-            return call(orig, self, *a, **k)
+            twin = backup_twin(self)
+            try:
+                # 有备用孪生时主 key 尝试先不记 FAILURES：备用接手成功不算失败，备用也失败由它记账
+                return call(orig, self, *a, record_failure=twin is None, **k)
+            except Exception as e:
+                if twin is None or not retryable(e):
+                    raise   # 无备用，或非可重试错误（400 等切了也没用，只烧钱）→ 按原行为抛出
+                msg = f"{type(e).__name__}: {str(e)[:200]}"
+                SWITCHES.append({"stage": _stage(), "error": msg})
+                log.warning("主 key 重试耗尽（%s），切换备用 key 重发本次调用：%s", _stage(), msg)
+                tok = KEY_LABEL.set("backup")
+                try:
+                    return call(orig, twin, *a, delays=list(BACKUP_DELAYS), **k)
+                finally:
+                    KEY_LABEL.reset(tok)
         finally:
             _tl.depth = 0
     BaseChatModel.invoke = invoke
@@ -227,6 +276,8 @@ def summary_line() -> str | None:
     if RETRIES:
         ok = len(RETRIES) - sum(f["attempts"] - 1 for f in FAILURES)
         parts.append(f"LLM 可重试错误共重试 {len(RETRIES)} 次（其中 {max(ok, 0)} 次后成功恢复），失败 {len(FAILURES)} 个调用")
+    if SWITCHES:
+        parts.append(f"主 key 故障自动切换备用 key {len(SWITCHES)} 次（备用单价更高，花销见用量小节）")
     if TRUNCATIONS:
         parts.append(f"提示词保险丝触发 {len(TRUNCATIONS)} 次（超体积输入已截断至上限内，详见日志）")
     return "；".join(parts) if parts else None

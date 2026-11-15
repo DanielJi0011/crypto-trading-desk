@@ -122,6 +122,15 @@ class UsageTracker(BaseCallbackHandler):
         top = (md.get("langgraph_checkpoint_ns") or "").split("|")[0].split(":")[0]
         return top or md.get("langgraph_node")
 
+    @staticmethod
+    def _key_label() -> str:
+        """本次调用由哪把 key 服务（primary/backup，主备切换见 desk/llm_retry.py）；只取标签，绝不接触 key 值。"""
+        try:
+            from desk import llm_retry
+            return llm_retry.KEY_LABEL.get()
+        except Exception:
+            return "primary"
+
     def on_chat_model_start(self, serialized, messages, *, run_id=None, metadata=None, **kw):
         with self._lock:
             self._node[run_id] = self._node_name(metadata)
@@ -146,7 +155,7 @@ class UsageTracker(BaseCallbackHandler):
                 model = rm.get("model_name") or (response.llm_output or {}).get("model_name") or "unknown"
                 from desk.providers import provider_of
                 rec = {"run_id": RUN_ID, "time": settings.now_str(), "stage": STAGE.get(), "node": node, "model": model,
-                       "provider": provider_of(model),
+                       "provider": provider_of(model), "key": self._key_label(),
                        "input": inp, "cached": cached, "output": out, "reasoning": reasoning,
                        "cost_usd": round(cost_usd(self.cfg, model, inp, cached, out), 6)}
                 with self._lock:
@@ -156,7 +165,7 @@ class UsageTracker(BaseCallbackHandler):
     def on_llm_error(self, error, *, run_id=None, **kw):
         with self._lock:
             rec = {"run_id": RUN_ID, "time": settings.now_str(), "stage": STAGE.get(),
-                   "node": self._node.pop(run_id, None), "error": type(error).__name__}
+                   "node": self._node.pop(run_id, None), "key": self._key_label(), "error": type(error).__name__}
             self.calls.append(rec)
             settings.append_jsonl(self.path, rec)
 
@@ -164,10 +173,10 @@ class UsageTracker(BaseCallbackHandler):
         with self._lock:
             calls = list(self.calls)
         ok = [c for c in calls if "error" not in c]
-        by_stage, by_model, by_node, by_provider = {}, {}, {}, {}
+        by_stage, by_model, by_node, by_provider, by_key = {}, {}, {}, {}, {}
         for c in ok:
             for d, k in ((by_stage, c["stage"]), (by_model, c["model"]), (by_node, c.get("node") or c["stage"].split("/")[-1]),
-                         (by_provider, c.get("provider", "?"))):
+                         (by_provider, c.get("provider", "?")), (by_key, c.get("key", "primary"))):
                 x = d.setdefault(k, {"calls": 0, "input": 0, "cached": 0, "output": 0, "cost_usd": 0.0})
                 x["calls"] += 1; x["input"] += c["input"]; x["cached"] += c["cached"]
                 x["output"] += c["output"]; x["cost_usd"] = round(x["cost_usd"] + c["cost_usd"], 6)
@@ -176,7 +185,8 @@ class UsageTracker(BaseCallbackHandler):
                 "input": sum(c["input"] for c in ok), "cached": sum(c["cached"] for c in ok),
                 "output": sum(c["output"] for c in ok), "cost_usd": round(sum(c["cost_usd"] for c in ok), 6),
                 "unpriced_calls": sum(1 for c in ok if not price_known(self.cfg, c["model"])),
-                "by_stage": by_stage, "by_model": by_model, "by_node": by_node, "by_provider": by_provider}
+                "by_stage": by_stage, "by_model": by_model, "by_node": by_node, "by_provider": by_provider,
+                "by_key": by_key}
 
 
 def make_llm(cfg, tier: str, tracker=None, role: str | None = None):

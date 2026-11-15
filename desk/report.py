@@ -142,6 +142,27 @@ def calls_text(u: dict) -> str:
     return f"共 {ok + bad} 次，成功 {ok} 次，失败 {bad} 次"
 
 
+def backup_key_line(date, usage) -> str | None:
+    """备用 key（claude 备用线）当日花销一行：汇总当日用量台账中 key=backup 的成功记录
+    （跨本日全部运行，含场次与重议；台账无此字段的旧记录按主 key 计）。当日无备用调用时
+    回落本次运行的 by_key 汇总，再无则不出行（保持日报干净）。只统计次数与 token，不涉 key 值。"""
+    calls = inp = 0
+    try:
+        for rec in settings.read_jsonl(settings.STATE / "usage" / f"{date}.jsonl"):
+            if rec.get("key") == "backup" and "error" not in rec:
+                calls += 1
+                inp += int(rec.get("input") or 0)
+    except Exception:
+        calls = inp = 0
+    if not calls:
+        bk = ((usage or {}).get("by_key") or {}).get("backup") or {}
+        calls, inp = int(bk.get("calls", 0)), int(bk.get("input", 0))
+    if not calls:
+        return None
+    return (f"备用 key（claude 备用线，主 key 故障时自动切换）当日调用 {calls} 次，输入 {inp:,} tokens"
+            f"（备用单价更高，仅故障时启用，花销在此单列）。")
+
+
 def _cost(v: dict) -> str:
     n = v.get("unpriced_calls", 0)
     if n and n >= v.get("calls", 0):
@@ -528,8 +549,11 @@ def write(cfg, date, decisions, closed, reviews, weight_changes, pb_events, usag
     L += ["", "## 八、LLM 用量与成本（本次运行）", "",
           f"{calls_text(usage)}；输入 {usage['input']:,} tokens（缓存命中 {usage['cached']:,}），"
           f"输出 {usage['output']:,} tokens；已知价格部分（DeepSeek）估算成本 **${usage['cost_usd']:.4f}**（约 ¥{usage['cost_usd'] * cfg['llm'].get('usd_cny', 7.2):.3f}）"
-          + (f"；另有 {usage['unpriced_calls']} 次中转（grok/gpt/claude）调用单价未知，token 已统计、成本未计入" if usage.get("unpriced_calls") else "") + "。", "",
-          "| 环节 | 调用 | 输入 | 缓存命中 | 输出 | 成本 USD |", "|---|---|---|---|---|---|"]
+          + (f"；另有 {usage['unpriced_calls']} 次中转（grok/gpt/claude）调用单价未知，token 已统计、成本未计入" if usage.get("unpriced_calls") else "") + "。", ""]
+    _bkl = backup_key_line(date, usage)
+    if _bkl:
+        L += [_bkl, ""]
+    L += ["| 环节 | 调用 | 输入 | 缓存命中 | 输出 | 成本 USD |", "|---|---|---|---|---|---|"]
     for k, v in usage["by_stage"].items():
         L.append(f"| {k} | {v['calls']} | {v['input']:,} | {v['cached']:,} | {v['output']:,} | {_cost(v)} |")
     L += ["", "| 厂商 | 调用 | 输入 | 缓存命中 | 输出 | 成本 USD |", "|---|---|---|---|---|---|"]
