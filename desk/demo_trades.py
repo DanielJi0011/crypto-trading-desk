@@ -4,7 +4,8 @@
   1) OKX 模拟盘 GET /api/v5/account/positions-history（经 desk.okx_demo，强制 x-simulated-trading: 1，只读）
      —— 开/平均价、张数、已实现盈亏（含手续费/资金费）、开平时间、平仓类型。
   2) 本地模拟盘记录关联 decision_id：state/ledger/demo_orders.json（registry）、demo_events.jsonl
-     （trigger_placed/trigger_filled/open_ok/eth_backfill_ok）、旧纸面账本 trades.csv（含归档，补单仓沿用其 signal_id）、
+     （trigger_placed/trigger_filled/open_ok/eth_backfill_ok）、state/ledger/entry_limit.json（条件单成交登记，
+     triggered_ms 为交易所时刻，平仓后仍保留）、旧纸面账本 trades.csv（含归档，补单仓沿用其 signal_id）、
      demo_ws_events.jsonl（止损/止盈触发）。
   3) 转换结果缓存到 state/ledger/demo_closed.json；API 不可用时用缓存（离线也能复盘已见过的平仓）。
 trade_id = DEMO-<posId>-<cTime>：OKX 会复用 posId（同一 posSide 多次开平），加开仓毫秒时间戳保证稳定唯一。
@@ -63,7 +64,7 @@ def _f(x, d=None):
         return d
 
 
-def link(row: dict, events: list[dict], reg: dict, papers: list[dict]) -> dict:
+def link(row: dict, events: list[dict], reg: dict, papers: list[dict], entries=()) -> dict:
     """为一条 positions-history 找本地决策 id / 止损止盈 / 入场理由。返回 {decision_id, sl, tp, reason, source, test}。"""
     inst, c = row["instId"], int(row["cTime"])
     side = "short" if row.get("posSide") == "short" or row.get("direction") == "short" else "long"
@@ -76,6 +77,25 @@ def link(row: dict, events: list[dict], reg: dict, papers: list[dict]) -> dict:
         tp = placed.get(str(p.get("from_algo")))
         if tp:
             r.update(sl=tp.get("stop_loss"), tp=tp.get("take_profit"), exit_mode=tp.get("exit_mode") or r["exit_mode"])
+    if not r["decision_id"]:
+        # entry_limit 登记（条件单成交的权威记录，平仓后仍保留）：triggered_ms 是交易所触发时刻，
+        # 与 positions-history 的 cTime 同源（实测差 <1s）。registry.opened 与 trigger_fired 事件用的
+        # 是 watch 5 分钟轮询的检测时刻，滞后可达 280s+，超过 WIN_MS 就会关联丢失（2026-11-13 SOL、
+        # 2026-11-15 ETH 两笔平仓记录因此空白）——故以 entry_limit 为条件单成交的首选回退来源。
+        best = None
+        for e in entries:
+            if e.get("inst") != inst or e.get("result") != "filled" or not e.get("decision_id"):
+                continue
+            if e.get("side") and e["side"] != side:
+                continue
+            tm = e.get("triggered_ms")
+            if tm is None or abs(int(tm) - c) > WIN_MS:
+                continue
+            if best is None or abs(int(tm) - c) < abs(int(best["triggered_ms"]) - c):
+                best = e
+        if best is not None:
+            r.update(decision_id=best["decision_id"], sl=best.get("stop_loss"), tp=best.get("take_profit"),
+                     exit_mode=best.get("exit_mode"), source=f"entry_limit({best.get('algoId')})")
     for e in events:
         if r["decision_id"] or e.get("inst_id") != inst or not _near(e.get("time"), c):
             continue
@@ -182,11 +202,13 @@ def closed_trades(rows: list[dict] | None = None, ct_vals: dict | None = None, u
             return sorted(drop_excluded(cache).values(), key=lambda t: t["exit_time"])
     events = settings.read_jsonl(X.EVENTS)
     ws = settings.read_jsonl(settings.STATE / "ledger" / "demo_ws_events.jsonl")
+    el = settings.read_json(settings.STATE / "ledger" / "entry_limit.json", {})
+    entries = list(((el or {}).get("entries") or {}).values())
     reg, papers, cts = demo_exec.reg(), paper_trades(), dict(ct_vals or {})
     for row in rows:
         if str(row.get("type")) in ("1", "4") or not row.get("uTime"):
             continue          # 部分平仓：等全部平掉后作为一笔复盘
-        info = link(row, events, reg, papers)
+        info = link(row, events, reg, papers, entries)
         if info["test"]:
             continue
         t = to_trade(row, info, _ct_val(row["instId"], cts), ws)

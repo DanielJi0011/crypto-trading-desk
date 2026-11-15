@@ -469,9 +469,10 @@ def instructions(ctx: dict, cfg=None) -> str:
         try:
             from desk import demo_exec as _DX
             if _DX.ecfg(cfg)["trailing_stop"].get("enabled"):
-                lines.append("退出方式（代码决定，不用你选）：本场行情判定生效且阶段不是末段衰竭时，你的新仓改用移动止损"
+                lines.append("退出方式（代码决定，不用你选）：本场行情判定生效且阶段不是末段衰竭时，你的新仓（指本币当前无持仓时的新开仓）改用移动止损"
                              "退出、不挂固定止盈单——你给的 take_profit 只用于盈亏比校验与移动止损激活线，请照常按 RR≥1.5 给点位；"
-                             "末段衰竭或无趋势时仍为固定止盈。")
+                             "末段衰竭或无趋势时仍为固定止盈。"
+                             "注意：本币已有持仓时挂的加仓条件单不适用移动止损，仍为固定止盈，take_profit 会真实挂到交易所——写理由时不要把加仓单说成移动止损。")
         except Exception:
             pass
     return "\n".join(lines)
