@@ -5,11 +5,14 @@
 
 超时语义由 execution.entry_limit.fallback_market 决定：
   false（默认，2026-11-11 用户决定「这个兜底就没有必要了，就等它触发」）：取消市价兜底。
-    超时撤子单后绝不市价追单——过护栏后看现价与触发价的相对位置：价格回到等待侧
-    （gte 单现价<触发价 / lte 单现价>触发价，即触发条件当前不成立）→ 以原触发价/止损止盈/
-    剩余张数重挂一张条件单（沿用原到期 expires 与原 decision 关联，可多轮重挂、始终受原到期约束）；
-    价格已穿过触发价且未回（条件当前成立）→ 本次入场作罢（entry_missed_no_chase），等下一场重新决策。
-    已成交部分照常重挂保护。市价兜底事故背景：2026-11-11 ETH 计划 2075、市价兜底成交 2055.74、RR 1.76→1.007。
+    超时撤子单后绝不市价追单——过护栏后，只要原到期未过，一律以原触发价/止损止盈/剩余张数
+    重挂一张条件单（沿用原到期 expires 与原 decision 关联，可多轮重挂、始终受原到期约束），
+    不论现价在触发价的哪一侧：回到等待侧（gte 单现价<触发价 / lte 单现价>触发价）重挂，已穿过
+    触发价同样重挂（2026-11-15 用户裁定「穿过也保留原单，等触发成交」——取代 2026-11-11 实现时
+    「价格穿过触发价且未回 → 本次入场作罢（entry_missed_no_chase）」的分支解释，用户从未下过
+    作罢的指令）。原到期已过、或触发条件/原到期无法确定（现价等数据取不到）→ 仍以
+    entry_missed_no_chase 收尾（fail-safe）。已成交部分照常重挂保护。
+    市价兜底事故背景：2026-11-11 ETH 计划 2075、市价兜底成交 2055.74、RR 1.76→1.007。
   true（旧行为，回滚用）：撤单后市价补剩余（filling/protecting 状态机），且补单发出前先过兜底前判定
     （desk/fallback_judge.py）：交易经理身份 + 快速模型判断当前价位入场是否仍合理，结论落
     entries[algoId].fallback_judge 后再执行；否决/判定失败 → result=abandoned，开关 fallback_judge_enabled。
@@ -279,9 +282,11 @@ def _resolve_condition_expires(aid, e):
 def _wait_or_end(cfg, aid, e, filled, remain) -> str:
     """fallback_market=false 的超时收尾：绝不市价追单。
     remain<=0 → nothing_left；护栏不过 → 与旧 blocked 相同收尾（已成交部分照常保护）；
-    价格已穿过触发价（条件当前成立）/ 原到期已过 / 条件或到期无法确定 → entry_missed_no_chase，本次入场作罢；
-    价格回到等待侧 → submit_trigger 以原触发价/止损止盈/剩余张数重挂（原到期、原 decision_id），
-    本条 done(result=rearmed, rearmed_to=新 algoId)，新单照常登记跟踪，可多轮重挂但始终受原到期约束。"""
+    原到期已过 / 条件或到期无法确定 / 现价读取失败 → entry_missed_no_chase 收尾（fail-safe 不变）；
+    其余一律 submit_trigger 以原触发价/止损止盈/剩余张数重挂（原到期、原 decision_id），不论现价
+    在等待侧还是已穿过触发价（2026-11-15 用户裁定「穿过也保留原单，等触发成交」，见模块头注），
+    本条 done(result=rearmed, rearmed_to=新 algoId)，新单照常登记跟踪，可多轮重挂但始终受原到期约束。
+    entry_rearmed 事件带 price_side（waiting/through）与 deviation，供事后区分穿过重挂与等待侧重挂。"""
     inst = e["inst"]
     if remain <= 0:
         _update(aid, status="done", result="nothing_left", accFillSz=X._dec(filled))
@@ -300,7 +305,7 @@ def _wait_or_end(cfg, aid, e, filled, remain) -> str:
         spot = float(X.get("/api/v5/market/ticker", instId=inst)["data"][0]["last"])
     except Exception as ex:
         X.log_event("entry_missed_no_chase", algoId=aid, inst_id=inst, trigger_px=trigger, spot=None,
-                    reason=f"现价读取失败（{type(ex).__name__}），无法确认等待侧，不重挂")
+                    reason=f"现价读取失败（{type(ex).__name__}），无法确认现价，不重挂")
         _update(aid, status="done", result="missed_no_chase", accFillSz=X._dec(filled))
         return "missed"
     cond, expires = _resolve_condition_expires(aid, e)
@@ -317,12 +322,8 @@ def _wait_or_end(cfg, aid, e, filled, remain) -> str:
                     condition=cond, expires=expires, reason=why)
         _update(aid, status="done", result="missed_no_chase", accFillSz=X._dec(filled))
         return "missed"
+    # 2026-11-15 用户裁定：穿过触发价也保留原单重挂——waiting 只作事件标记（price_side），不再决定去留
     waiting = (spot < trigger) if cond == "gte" else (spot > trigger)
-    if not waiting:
-        X.log_event("entry_missed_no_chase", algoId=aid, inst_id=inst, trigger_px=trigger, spot=spot,
-                    deviation=round(spot - trigger, 6), condition=cond)
-        _update(aid, status="done", result="missed_no_chase", accFillSz=X._dec(filled))
-        return "missed"
     from desk import demo_exec as DX
     n = int(e.get("rearms") or 0) + 1
     o = {"decision_id": e.get("decision_id"), "source": e.get("source"), "side": e["side"],
@@ -345,6 +346,7 @@ def _wait_or_end(cfg, aid, e, filled, remain) -> str:
     new_id = str(meta["algoId"])
     _update(new_id, rearms=n, rearm_of=str(aid))
     X.log_event("entry_rearmed", algoId=aid, new_algoId=new_id, inst_id=inst, trigger_px=trigger, spot=spot,
+                deviation=round(spot - trigger, 6), price_side="waiting" if waiting else "through",
                 remain=X._dec(remain), expires=expires, rearms=n, condition=cond)
     _update(aid, status="done", result="rearmed", rearmed_to=new_id, accFillSz=X._dec(filled))
     return "rearmed"

@@ -325,17 +325,23 @@ def test_rearm_when_price_back_on_waiting_side(rfake, tmp_path):
     assert m["decision_id"] == "d" and m["expires"] == EXP and m["rearm_of"] == "A1"
     ev = [x for x in _events(tmp_path) if x["event"] == "entry_rearmed"]
     assert len(ev) == 1 and ev[0]["new_algoId"] == new_id and ev[0]["algoId"] == "A1"
+    assert ev[0]["price_side"] == "waiting" and ev[0]["deviation"] == -1000.0
 
 
-def test_no_rearm_when_price_beyond_trigger(rfake, tmp_path):
-    f = rfake(spot="66000")   # gte 单触发后价格继续涨在触发价上方 = 条件仍成立，不重挂、不追
+def test_rearm_when_price_beyond_trigger_gte(rfake, tmp_path):
+    # 2026-11-15 用户裁定「穿过也保留原单」：gte 单触发后价格继续涨在触发价上方，同样重挂等触发（旧行为是作罢）
+    f = rfake(spot="66000")
     _reg2()
-    assert dict(EL.check_timeouts(_cfg(), now_ms=LATE))["A1"] == "missed"
-    assert f.triggers() == [] and f.paths("/api/v5/trade/order") == []
+    assert dict(EL.check_timeouts(_cfg(), now_ms=LATE))["A1"] == "rearmed"
+    assert f.paths("/api/v5/trade/order") == []                       # 绝不市价追单
+    trig = f.triggers()
+    assert len(trig) == 1 and trig[0]["triggerPx"] == "65000" and trig[0]["sz"] == "1"
     e = EL._load()["entries"]["A1"]
-    assert e["status"] == "done" and e["result"] == "missed_no_chase"
-    ev = [x for x in _events(tmp_path) if x["event"] == "entry_missed_no_chase"]
+    assert e["status"] == "done" and e["result"] == "rearmed"
+    ev = [x for x in _events(tmp_path) if x["event"] == "entry_rearmed"]
     assert len(ev) == 1 and ev[0]["spot"] == 66000.0 and ev[0]["deviation"] == 1000.0
+    assert ev[0]["price_side"] == "through"
+    assert [x for x in _events(tmp_path) if x["event"] == "entry_missed_no_chase"] == []
 
 
 def test_short_lte_rearm_when_price_back_above(rfake):
@@ -347,11 +353,33 @@ def test_short_lte_rearm_when_price_back_above(rfake):
     assert f.paths("/api/v5/trade/order") == []
 
 
-def test_short_lte_missed_when_price_stays_below(rfake):
-    f = rfake(spot="64000")   # 破位后价格留在触发价下方 = 行情已走，不追
+def test_short_lte_rearm_when_price_stays_below(rfake, tmp_path):
+    # 2026-11-15 用户裁定：破位后价格留在触发价下方，同样保留原单重挂等回抽触发（旧行为是作罢）
+    f = rfake(spot="64000")
     _reg2(side="short", cond="lte")
-    assert dict(EL.check_timeouts(_cfg(), now_ms=LATE))["A1"] == "missed"
-    assert f.triggers() == [] and f.paths("/api/v5/trade/order") == []
+    assert dict(EL.check_timeouts(_cfg(), now_ms=LATE))["A1"] == "rearmed"
+    trig = f.triggers()
+    assert len(trig) == 1 and trig[0]["triggerPx"] == "65000" and trig[0]["side"] == "sell"
+    assert f.paths("/api/v5/trade/order") == []
+    ev = [x for x in _events(tmp_path) if x["event"] == "entry_rearmed"]
+    assert len(ev) == 1 and ev[0]["price_side"] == "through" and ev[0]["deviation"] == -1000.0
+
+
+def test_sol_lte_through_rearm_20261115(rfake, tmp_path):
+    # 2026-11-15 晚场实况：SOL 跌破加仓单 lte 71.46 触发，子单 3 分钟零成交、现价 71.29 已穿过——
+    # 按用户当晚裁定应保留原单重挂，而不是 entry_missed_no_chase 作废
+    f = rfake(spot="71.29", sz="10")
+    EL.register("A1", inst="SOL-USDT-SWAP", side="short", pos_side="short", sz="10", order_px="71.53",
+                trigger_px=71.46, stop_loss=76.2, take_profit=63.8, attach_cl="taold", lever=1,
+                decision_id="d", condition="lte", expires=EXP)
+    assert dict(EL.check_timeouts(_cfg(), now_ms=LATE))["A1"] == "rearmed"
+    trig = f.triggers()
+    # Fake 工具 tickSz=0.1，触发价 71.46 按 tick 取整为 71.5（真实 SOL tick 更细，不影响语义）
+    assert len(trig) == 1 and trig[0]["triggerPx"] == "71.5" and trig[0]["sz"] == "10"
+    assert f.paths("/api/v5/trade/order") == []
+    ev = [x for x in _events(tmp_path) if x["event"] == "entry_rearmed"]
+    assert len(ev) == 1 and ev[0]["price_side"] == "through" and ev[0]["deviation"] == -0.17
+    assert [x for x in _events(tmp_path) if x["event"] == "entry_missed_no_chase"] == []
 
 
 def test_partial_fill_remainder_rearmed_and_protected(rfake):
@@ -366,6 +394,21 @@ def test_partial_fill_remainder_rearmed_and_protected(rfake):
     assert f.paths("/api/v5/trade/order") == []
 
 
+def test_partial_fill_remainder_rearmed_when_price_through(rfake, tmp_path):
+    # 部分成交 + 价格已穿过：已成交部分照常保护，未成交剩余按 2026-11-15 裁定同样重挂（旧行为是剩余作罢）
+    f = rfake(spot="66000", child_state="partially_filled", acc="0.4",
+              pos={"instId": INST, "posSide": "long", "pos": "0.4"})
+    _reg2()
+    assert dict(EL.check_timeouts(_cfg(), now_ms=LATE))["A1"] == "rearmed"
+    trig = f.triggers()
+    assert len(trig) == 1 and trig[0]["sz"] == "0.6"                  # 只重挂未成交的剩余
+    oco = f.ocos()
+    assert len(oco) == 1 and oco[0]["sz"] == "0.4"                    # 已成交部分照常挂保护
+    assert f.paths("/api/v5/trade/order") == []
+    ev = [x for x in _events(tmp_path) if x["event"] == "entry_rearmed"]
+    assert len(ev) == 1 and ev[0]["price_side"] == "through"
+
+
 def test_rearm_bounded_by_original_expiry(rfake, tmp_path):
     f = rfake(spot="64000")
     _reg2(expires="2000-01-01 00:00:00+0800")                          # 原到期已过：即使价格在等待侧也不重挂
@@ -375,17 +418,22 @@ def test_rearm_bounded_by_original_expiry(rfake, tmp_path):
     assert len(ev) == 1 and "有效期" in ev[0]["reason"]
 
 
-def test_second_cycle_rearm_then_missed(rfake):
+def test_second_cycle_rearm_then_rearm_again(rfake, tmp_path):
     f = rfake(spot="64000")
     _reg2()
     assert dict(EL.check_timeouts(_cfg(), now_ms=LATE))["A1"] == "rearmed"
     new_id = EL._load()["entries"]["A1"]["rearmed_to"]
-    # 模拟重挂单再次触发并超时（子单仍记为 C1），这次现价已穿过触发价
+    # 模拟重挂单再次触发并超时（子单仍记为 C1），这次现价已穿过触发价 → 2026-11-15 裁定后仍重挂
     s = EL._load(); s["entries"][new_id].update(status="triggered", ordId="C1", triggered_ms=T0); EL._save(s)
     f.spot = "66000"; f.child["state"] = "live"
     out = dict(EL.check_timeouts(_cfg(), now_ms=LATE + 10 * 60000))
-    assert out[new_id] == "missed"
-    assert len(f.triggers()) == 1                                     # 没有第二张重挂单
+    assert out[new_id] == "rearmed"
+    assert len(f.triggers()) == 2                                     # 第二张重挂单已挂出
+    s = EL._load()["entries"]
+    third_id = s[new_id]["rearmed_to"]
+    assert s[third_id]["status"] == "armed" and s[third_id]["rearms"] == 2 and s[third_id]["rearm_of"] == new_id
+    ev = [x for x in _events(tmp_path) if x["event"] == "entry_rearmed"]
+    assert [x["price_side"] for x in ev] == ["waiting", "through"] and ev[1]["rearms"] == 2
 
 
 def test_halt_blocks_rearm_but_protects(rfake, tmp_path, monkeypatch):
