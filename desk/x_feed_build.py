@@ -1,8 +1,8 @@
-"""X 讨论摘录生成器（只读公开内容）。
+"""Threads 讨论摘录生成器（只读公开内容）。
 
 根因：情绪分析师读 state/x_feed/<日期>/<币>.md，但盒子上没有 X 凭据（secrets.env 无 X 相关变量名），
 XAI_API_KEY 只能走中转、不能用于官方 x_search；而例行任务里的 X 搜索步骤标为“可选”，所以只在 10-20/10-21 手工生成过一次，之后一直空。
-现做法：例行任务（有只读 X 搜索工具的 agent）每日把三个币的搜索原始 JSON 存为
+现做法：例行任务（agent 用 Threads 公开搜索采集，整理成 X API 形状的原始 JSON）每日把三个币的搜索原始 JSON 存为
 state/x_feed/<日期>/raw_<币>.json，然后运行 python -m desk.x_feed_build <日期> 生成 md。
 本模块不联网、不发帖、不做任何互动，只做格式化。"""
 from __future__ import annotations
@@ -33,8 +33,12 @@ def score(p: dict) -> int:
 def render(coin: str, date: str, raw: dict, top: int = 20) -> str:
     users = {u.get("id"): u.get("username", "?") for u in (raw.get("includes") or {}).get("users", [])}
     posts = sorted(raw.get("data") or [], key=score, reverse=True)[:top]
-    out = [f"# {coin}：X 讨论摘录（{date}，过去约 24 小时）",
-           "说明：公开 X 英文搜索，按互动排序；原文摘录未翻译，仅作情绪参考。", ""]
+    if raw.get("source") == "threads":   # 来源标注按 raw 的 source 字段走；缺失或 "x" 用 X wording（兼容 2026-11-01 等真实 X 存量批次）
+        out = [f"# {coin}：Threads 讨论摘录（{date}，过去约 24 小时）",
+               "说明：公开 Threads 英文搜索，按互动排序；原文摘录未翻译，仅作情绪参考。", ""]
+    else:
+        out = [f"# {coin}：X 讨论摘录（{date}，过去约 24 小时）",
+               "说明：公开 X 英文搜索，按互动排序；原文摘录未翻译，仅作情绪参考。", ""]
     for i, p in enumerate(posts, 1):
         m = p.get("public_metrics") or {}
         text = " ".join((p.get("text") or "").split())[:280]
