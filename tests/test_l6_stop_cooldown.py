@@ -65,7 +65,7 @@ def test_prompt_discloses_stop_and_cadence():
     st = {r: {"direction": "hold"} for r in manager.ROLE_KEYS}
     texts = {"portfolio_manager": "", "trader": ""}
     p = manager._prompt(cfg, {"name": "ETH", "inst_id": "ETH-USDT-SWAP"}, mk, None, bk, st, {}, -0.3, texts)
-    assert "## 近期止损披露" in p and "止损后同向重开" in p
+    assert "## Recent stop-out disclosure" in p and "止损后同向重开" in p
     assert "## 决策节奏（固定时间决策）" in p and "不是连续盯盘" in p
 
 

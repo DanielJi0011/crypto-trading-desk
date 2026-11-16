@@ -54,20 +54,41 @@ def run_backtest(symbol: str, entry_expr: str, sl_pct: float = 5.0, tp_pct: floa
 # 这里在交易台的工具安装咽喉给每个分析师工具套上输出上限：只截字符串结果的尾部并注明，
 # 工具名/参数 schema/调用方式完全不变，分析师的决策语义不变（数据本来就是抽样看的）。
 TOOL_OUTPUT_CAP = 24_000   # 单个工具结果进入 LLM 上下文的字符上限（实测正常载荷 ≤ 约 1.1 万字符）
+# P1（2026-11-15 LLM 数据流审查）：按工具分化上限。K 线 CSV（get_stock_data）是循环里最大的
+# 单条结果，日线块本身就是载荷（4H/1H 参考块已从数据源头去掉，见 okx_data.okx_get_stock_data），
+# 上限收紧到 12K；其余工具维持 24K。
+TOOL_OUTPUT_CAPS = {"get_stock_data": 12_000}
+# 截断留痕（P1 硬约束：工具数据被上限裁掉绝不静默）：每次截断记一条（工具名/原长/上限/当前阶段），
+# analysis 把本币条目挂到 fs["_tool_truncations"]，stances.extract 再落到对应角色立场的 data_note，
+# 随决策记录进日报数据缺口口径；同时结果文本内联英文注记，分析师本人也看得见。
+TOOL_TRUNCATIONS: list[dict] = []
 
 
-def cap_tool_output(t, cap: int = TOOL_OUTPUT_CAP):
-    """给一个 langchain 工具套输出上限（幂等：已套过的原样返回）。非字符串结果不处理。"""
+def cap_for(tool_name: str) -> int:
+    return TOOL_OUTPUT_CAPS.get(tool_name, TOOL_OUTPUT_CAP)
+
+
+def cap_tool_output(t, cap: int | None = None):
+    """给一个 langchain 工具套输出上限（幂等：已套过的原样返回）。非字符串结果不处理。
+    cap 缺省按工具名查 TOOL_OUTPUT_CAPS（get_stock_data=12K，其余 24K）。"""
     if getattr(t, "_ta_desk_capped", False):
         return t
     from langchain_core.tools import StructuredTool
     orig = t
+    if cap is None:
+        cap = cap_for(orig.name)
 
     def _run(**kwargs):
         out = orig.func(**kwargs) if getattr(orig, "func", None) else orig.invoke(kwargs)
         if isinstance(out, str) and len(out) > cap:
-            return (out[:cap] + f"\n……（工具输出过长，代码已截断：原文共 {len(out)} 字符，"
-                    f"仅保留前 {cap} 字符；需要更细的数据请缩小查询范围）")
+            try:
+                from desk import llm as _dllm
+                stage = _dllm.STAGE.get()
+            except Exception:
+                stage = ""
+            TOOL_TRUNCATIONS.append({"tool": orig.name, "chars": len(out), "cap": cap, "stage": stage})
+            return (out[:cap] + f"\n... [tool output truncated by code: {len(out)} chars total, "
+                    f"first {cap} kept; narrow the query if you need finer data]")
         return out
 
     w = StructuredTool.from_function(func=_run, name=orig.name,
@@ -101,3 +122,28 @@ def install_market_tools():
         ma.TOOLS = tuple(ma.TOOLS) + (run_backtest,)
     install_tool_caps()
     ae.ANALYST_NODE_SPECS["market"] = dataclasses.replace(ae.ANALYST_NODE_SPECS["market"], tools=ma.TOOLS)
+
+
+_ANALYST_GRAPH_ORIG = None
+MARKET_TOOL_ROUNDS = 8   # 市场分析师的工具轮数例外（P1 审查口径：回测路径保留 5+ 次取数的空间）
+
+
+def install_tool_loop_discipline(cfg):
+    """P1：分析师工具循环纪律。vendor 的 max_tool_rounds 是全图单一值（台子配置已降到 4，
+    见 llm.ta_config 的代码默认值与 config llm.max_tool_rounds），但 run_backtest 只在市场
+    分析师手里、回测取数偶尔需要 5 轮以上——按审查的例外口径，只给市场分析师保留
+    llm.market_max_tool_rounds（默认 8）。实现是运行时包裹 vendor 的 _analyst_graph
+    （与 roles.install 的工厂包裹同一手法），不改 vendor 源码；幂等。"""
+    global _ANALYST_GRAPH_ORIG
+    if _ANALYST_GRAPH_ORIG is not None:
+        return
+    import tradingagents.graph.setup as gsetup
+    _ANALYST_GRAPH_ORIG = gsetup._analyst_graph
+    market_rounds = int(((cfg or {}).get("llm") or {}).get("market_max_tool_rounds", MARKET_TOOL_ROUNDS))
+
+    def _patched(spec, agent, max_tool_rounds):
+        if getattr(spec, "key", None) == "market":
+            max_tool_rounds = market_rounds
+        return _ANALYST_GRAPH_ORIG(spec, agent, max_tool_rounds)
+
+    gsetup._analyst_graph = _patched

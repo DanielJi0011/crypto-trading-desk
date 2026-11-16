@@ -183,7 +183,10 @@ def okx_get_stock_data(symbol: str, start_date: str, end_date: str) -> str:
     out["Date"] = out.Date.dt.strftime("%Y-%m-%d")
     header = (f"# Price data for {symbol} from OKX spot {inst}, daily bars closing 00:00 UTC (08:00 Asia/Shanghai)\n"
               f"# {start_date} to {end_date}; Total records: {len(out)}; Volume in base units, VolumeUSDT in quote\n\n")
-    return header + out.to_csv(index=False) + intraday_text(inst, end_date)
+    # P1（2026-11-15 LLM 数据流审查）：不再把 4H/1H 参考块拼进工具结果——它在分析师工具循环里被
+    # 逐轮重发（约 5.5K 字符/次），而 2026-11-14 周期审计已确认它不进入任何决策；4H 的决策用途
+    # （入场结构门）走 regime_judge 的代码特征路径（直接读 candles），与本函数无关。
+    return header + out.to_csv(index=False)
 
 
 INTRADAY = (("4H", 42), ("1H", 48))   # 2026-10-23 用户要求：两场都提供 4H（约 7 天）与 1H（约 2 天）已收盘K线

@@ -505,6 +505,8 @@ def write(cfg, date, decisions, closed, reviews, weight_changes, pb_events, usag
             for b in _h["degraded"]:
                 L.append(f"- ⚠️ 解析降级：{b['inst_id']} {CN.get(b['role'], b['role'])}"
                          f"（来源：{b['source']}{'，残缺立场' if b['partial'] else ''}）")
+            for c in _h.get("conflicts") or []:   # P3：立场行×结构化交叉校验冲突（意见未丢弃，取舍已注明）
+                L.append(f"- ⚠️ 立场交叉校验：{c['inst_id']} {CN.get(c['role'], c['role'])}：{c['cross_check']}")
             try:
                 from desk import manager as _mgr
                 _cur_ids = {d.get("decision_id") for d in decisions}

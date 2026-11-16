@@ -321,7 +321,7 @@ def test_role_briefs_isolated(cfg):
 def test_flows_and_backtest_tool():
     from desk import flows, tools
     b = flows.brief("BTC")
-    assert "资金费率" in b and "多空账户比" in b
+    assert "funding_now (8h)" in b and "long/short account ratio" in b
     tools._AS_OF["date"] = "2026-01-01"
     out = tools.run_backtest.invoke({"symbol": "BTC-USD", "entry_expr": "c > c.shift(1)", "sl_pct": 5, "max_bars": 3})
     j = json.loads(out)

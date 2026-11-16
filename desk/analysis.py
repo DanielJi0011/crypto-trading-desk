@@ -83,6 +83,7 @@ def _build_graph(cfg, tracker):
     roles.install(cfg, tracker)
     from desk import tools
     tools.install_market_tools()
+    tools.install_tool_loop_discipline(cfg)   # P1：工具循环轮数纪律（市场分析师例外保留）
     if os.environ.get("TA_DESK_MOCK_LLM") == "1":
         dllm.install_fake_into_tradingagents()
     from tradingagents.graph.trading_graph import TradingAgentsGraph
@@ -117,28 +118,30 @@ def portfolio_ctx(book: dict):
 
 
 def position_brief(book: dict, inst_id: str) -> str:
-    """B3：给每个角色的中文持仓说明（方向、张数带符号、均价、止损止盈、浮盈亏）。全员共享，含 upnl。"""
+    """B3：给每个角色的持仓说明（方向、张数带符号、均价、止损止盈、浮盈亏）。全员共享，含 upnl。
+    P4（2026-11-15）：渲染改紧凑英文（本说明只进机器人提示词，不进日报）。"""
     L = []
     for p in book.get("positions", []):
-        sd = "空" if signed_qty(p) < 0 else "多"
+        sd = "short" if signed_qty(p) < 0 else "long"
         ct = p.get("contracts")
-        sct = (-1 if sd == "空" else 1) * float(ct) if ct is not None else None
+        sct = (-1 if sd == "short" else 1) * float(ct) if ct is not None else None
         upnl = p.get("upnl")
-        upnl_s = f"，浮盈亏 {float(upnl):+.2f} USDT" if upnl is not None else ""
-        L.append(f"- {p.get('inst_id')}：{sd}单（posSide={p.get('pos_side') or p.get('side')}），"
-                 f"数量 {signed_qty(p):+g}" + (f"，张数 {sct:+g}" if sct is not None else "")
-                 + f"，均价 {p.get('avg_px')}，止损 {p.get('sl_px') or p.get('stop_loss') or '无'}，止盈 {p.get('tp_px') or p.get('take_profit') or '无'}"
+        upnl_s = f", uPnL {float(upnl):+.2f} USDT" if upnl is not None else ""
+        L.append(f"- {p.get('inst_id')}: {sd} (posSide={p.get('pos_side') or p.get('side')}), "
+                 f"qty {signed_qty(p):+g}" + (f", contracts {sct:+g}" if sct is not None else "")
+                 + f", avg {p.get('avg_px')}, stop {p.get('sl_px') or p.get('stop_loss') or 'none'}, take-profit {p.get('tp_px') or p.get('take_profit') or 'none'}"
                  + upnl_s
-                 + ("（本币）" if p.get("inst_id") == inst_id else ""))
-    head = "## 当前模拟盘持仓（数量为负表示空单；空单价格下跌才盈利）\n"
-    return head + ("\n".join(L) if L else "- 无持仓")
+                 + (" (this coin)" if p.get("inst_id") == inst_id else ""))
+    head = "## Current demo positions (negative qty = short; a short profits when price falls)\n"
+    return head + ("\n".join(L) if L else "- no positions")
 
 
-PENDING_HEAD = "## 当前挂着的条件单"
-PENDING_NOTE = ("（以下是已挂出、尚未成交的条件入场单。正文不要重复论证相同价位，但如果你的方向与挂单同向，"
-                "【立场】行必须写「对现有挂单=保留/改价/撤销/改现价」：保留=支持按该挂单价位入场（可照抄其触发价作入场价）；"
-                "改价=按你写的入场价和入场条件改挂；撤销=不支持该挂单；改现价=改为现价开仓。"
-                "没写入场价也没写该字段的同向角色，程序按「保留」处理。）")
+PENDING_HEAD = "## Pending conditional orders"
+PENDING_NOTE = ("(Conditional entry orders already placed and unfilled. Do not re-argue the same levels in your text, "
+                "but if your direction matches an order's direction, your stance line must carry pending=keep|reprice|cancel|now: "
+                "keep = support entering at that order's trigger (you may copy its trigger as your entry); "
+                "reprice = re-hang at your entry price and condition; cancel = you oppose that order; now = open at market instead. "
+                "A same-direction role that gives neither an entry nor this field is treated by the code as keep.)")
 
 
 def _fmt_trigger(t: dict, meta: dict) -> str:
@@ -147,7 +150,7 @@ def _fmt_trigger(t: dict, meta: dict) -> str:
     if side in ("buy", "sell"):
         ps = t.get("posSide")
         side = ps if ps in ("long", "short") else ("long" if side == "buy" else "short")
-    sd = {"long": "做多", "short": "做空"}.get(side, str(side or "?"))
+    sd = {"long": "long", "short": "short"}.get(side, str(side or "?"))
     px = t.get("triggerPx") or t.get("trigger_px") or meta.get("trigger_px")
     sz = t.get("sz") or meta.get("sz") or t.get("contracts")
     sl = tp = None
@@ -156,8 +159,8 @@ def _fmt_trigger(t: dict, meta: dict) -> str:
     sl = sl or t.get("slTriggerPx") or t.get("stop_loss") or meta.get("stop_loss")
     tp = tp or t.get("tpTriggerPx") or t.get("take_profit") or meta.get("take_profit")
     exp = t.get("expires") or meta.get("expires")
-    return (f"- {inst}：{sd}，触发价 {px}" + (f"，张数 {sz}" if sz not in (None, "") else "")
-            + f"，止损 {sl or '无'}，止盈 {tp or '无'}，到期 {exp or '未知'}")
+    return (f"- {inst}: {sd}, trigger {px}" + (f", {sz} contracts" if sz not in (None, "") else "")
+            + f", stop {sl or 'none'}, take-profit {tp or 'none'}, expires {exp or 'unknown'}")
 
 
 def pending_brief(book: dict) -> str:
@@ -177,14 +180,14 @@ def pending_brief(book: dict) -> str:
             items = [({**o, "inst_id": o.get("inst_id") or k}, {}) for k, o in (pending.load() or {}).items()
                      if isinstance(o, dict) and o.get("status", "pending") == "pending"]
         L = [_fmt_trigger(t, m) for t, m in items]
-        return PENDING_HEAD + PENDING_NOTE + "\n" + ("\n".join(L) if L else "- 无")
+        return PENDING_HEAD + PENDING_NOTE + "\n" + ("\n".join(L) if L else "- none")
     except Exception as e:
         log.warning("读取挂单失败：%s", type(e).__name__)
-        return PENDING_HEAD + "\n- 挂单信息不可用"
+        return PENDING_HEAD + "\n- pending order info unavailable"
 
 
 def x_feed(ccy: str, trade_date: str) -> str:
-    """X（推特）讨论：盒子上没有用户凭据无法直接搜索 X；由 Grok Bot 例行任务预先写入
+    """Threads 讨论摘录：由例行任务（agent 用 Threads 公开搜索采集）预先写入
     state/x_feed/<日期>/<币>.md（可选）。没有则返回空，情绪分析师仍有 Reddit/StockTwits。"""
     from desk import sessions
     p = settings.STATE / "x_feed" / sessions.key(trade_date, settings.SESSION) / f"{ccy}.md"   # 晚场读 <日期>-evening
@@ -192,7 +195,7 @@ def x_feed(ccy: str, trade_date: str) -> str:
 
 
 def x_feed_missing_alert(trade_date: str, ccy: str) -> bool:
-    """L4：X 讨论摘录缺失时每天只告警一次（kind=x_feed_missing），标记文件 state/alerts/x_feed_missing_<日期>。"""
+    """L4：Threads 讨论摘录缺失时每天只告警一次（kind=x_feed_missing），标记文件 state/alerts/x_feed_missing_<日期>。"""
     from desk import sessions
     mark = settings.STATE / "alerts" / f"x_feed_missing_{sessions.key(trade_date, settings.SESSION)}"   # 每场一次
     with _XFEED_LOCK:
@@ -279,10 +282,13 @@ def analyze(cfg, coin: dict, trade_date: str, book: dict, tracker, extra_brief: 
     xf = x_feed(ccy, trade_date)
     if not xf:
         x_feed_missing_alert(trade_date, ccy)
-    briefs = {r: "## 资金流/衍生品分析师报告\n" + fl["report"] for r in roles.FLOWS_READERS if fl["report"]}
-    briefs["sentiment"] = ("## X（推特）上的讨论摘录（由例行任务采集）\n" + untrusted.wrap("X 摘录", xf)) if xf else ""
-    briefs["market"] = ("你额外拥有 run_backtest 工具：可以在 OKX 历史K线上回测你想到的做多条件（含样本外统计；做空可用反向条件理解），"
-                        "用来检验你的技术判断是否有历史证据；样本少于 30 笔的结果不要当作证据。")
+    briefs = {r: "## Flows analyst report\n" + fl["report"] for r in roles.FLOWS_READERS if fl["report"]}
+    briefs["flows_data"] = fl["data"]   # P2：资金面原始数据只供风险三人组摘要构建（PlaybookLLM 不注入此键）
+    _feed_src = "Threads" if "Threads 讨论摘录" in xf[:64] else "X"   # 简报抬头的平台跟摘录文件自己的标题走（builder 按 raw 的 source 字段渲染）
+    briefs["sentiment"] = (f"## Discussion excerpts from {_feed_src} (collected by a routine task)\n" + untrusted.wrap(f"{_feed_src} 摘录", xf)) if xf else ""
+    briefs["market"] = ("You also have the run_backtest tool: backtest long conditions you devise on OKX historical candles "
+                        "(with out-of-sample statistics; read short setups via the mirrored condition) to check whether your "
+                        "technical view has historical evidence; results with fewer than 30 trades are not evidence.")
     try:   # FRED 宏观摘要只注入新闻分析师（按日缓存；失败降级为"不可用"，不影响分析）
         from desk import macro
         if macro.enabled(cfg):
@@ -296,6 +302,7 @@ def analyze(cfg, coin: dict, trade_date: str, book: dict, tracker, extra_brief: 
     if dllm.checkpoint_enabled(cfg):
         pf, resumed = _prepare_checkpoint(g, coin, trade_date, pf, resume)
     tok = dllm.STAGE.set(f"{coin["inst_id"]}/分析图")
+    _trunc_mark = len(tools.TOOL_TRUNCATIONS)   # P1：本币图运行期间的工具截断留痕快照点
     try:
         fs, signal = g.propagate(coin["ticker"], trade_date, asset_type="crypto", portfolio=pf)
     finally:
@@ -304,6 +311,8 @@ def analyze(cfg, coin: dict, trade_date: str, book: dict, tracker, extra_brief: 
     fs["_flows_report"] = fl["report"]
     fs["_x_feed"] = bool(xf)
     fs["_flows_missing"] = bool(fl.get("data_missing"))
+    fs["_tool_truncations"] = [t for t in tools.TOOL_TRUNCATIONS[_trunc_mark:]
+                               if t.get("stage") == f"{coin['inst_id']}/分析图"]
     try:   # 尾段续跑旁车：图外字段随图结果一并落盘（无条件写，失败降级），见 desk/resume.py
         from desk import resume as _resume
         _resume.write_tail_sidecar(coin["ticker"], trade_date, settings.SESSION, fs, signal)

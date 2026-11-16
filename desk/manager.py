@@ -203,36 +203,42 @@ def _prompt(cfg, coin, mk, pos, bk, st, w, S, texts, preview=None, regime=None):
     g = cfg["guardrails"]
     _tc = regime_judge.trend_cfg(cfg)
     _stop_cap = min(float(g['max_stop_loss_pct']), float((cfg.get('risk') or {}).get('stop_max_pct', 0.08)) * 100)
-    lines = [f"你是加密货币交易台的交易经理，负责对 {coin['name']}（OKX 永续 {coin['inst_id']}）做今日最终执行决策。",
-             f"标的是 OKX USDT 永续合约（OKX 模拟盘 Demo Trading 执行，逐仓），可以做多也可以做空，新开仓杠杆上限 {__import__('desk.config_safety', fromlist=['x']).max_open_leverage(cfg):g} 倍（代码强制）。",
-             f"硬性规则（代码会强制，违反会被拒单）：单笔保证金≤权益 {g['max_position_pct']}%，总名义≤权益 {g.get('max_total_notional_pct') or g['max_total_exposure_pct'] * ledger.swap_cfg(cfg)['leverage_max']:g}%，"
-             f"开仓必须带止损（做多在下方、做空在上方）且止损距离≤{_stop_cap:g}%，止损必须先于强平价触发，止损只能收紧，" + ("每币一仓；同向加仓允许（加仓视为新订单，加仓腿独立止盈止损，原仓不动；" + ("是否加仓由你权衡决定：加仓风险预算只作参考数据不否决，加仓只受硬护栏约束（合并后单笔保证金、总名义、总在途风险、止损、当日亏损、紧急停止）" if add_position.tm_decides(cfg) else "已有风险+加仓风险≤单笔上限，不足按剩余削减") + "；反向不反手须先平仓）。" if add_position.enabled(cfg) else "每币一仓不加仓。"),
-             "", "## 行情（OKX，已收盘日线）",
-             f"最新价 {mk['last']:.6g}；最近日线 {mk['bar_date']} 收 {mk['close']:.6g}；5日 {mk['ret_5d']:+.2f}%；20日 {mk['ret_20d']:+.2f}%；"
-             f"ATR14 {mk['atr14']:.6g}（{mk['atr14'] / mk['last'] * 100:.2f}%）；20日高 {mk['hi_20']:.6g} 低 {mk['lo_20']:.6g}",
-             "", "## 账户（OKX 模拟盘）" if "live_equity" in bk else "## 账户（纸面）",
-             f"权益基准 {bk['equity']:.2f} USDT（仓位%与护栏均按此计算"
-             + (f"，基准={bk.get('equity_basis')}；模拟盘实时权益 {bk['live_equity']:.2f}" if "live_equity" in bk else "")
-             + f"），现金 {bk['cash']:.2f}，当前敞口 {bk['exposure']:.2f}（{bk['exposure'] / bk['equity'] * 100:.1f}%）",
-             f"按此基准：单笔保证金上限 {bk['equity'] * g['max_position_pct'] / 100:,.0f} USDT，总名义上限 "
-             f"{bk['equity'] * (g.get('max_total_notional_pct') or g['max_total_exposure_pct'] * ledger.swap_cfg(cfg)['leverage_max']) / 100:,.0f} USDT，"
-             f"当日亏损达 {bk['equity'] * g['max_daily_loss_pct'] / 100:,.0f} USDT 停止开仓；最多 {g.get('max_open_positions', 3)} 个仓、每币一仓。"]
+    _feat_on = bool(_tc["enabled"] and regime and regime.get("features"))
+    lines = [f"You are the trade manager of a crypto trading desk, making today's final execution decision for {coin['name']} (OKX perpetual {coin['inst_id']}).",
+             f"Instrument: OKX USDT perpetual (executed on OKX Demo Trading, isolated margin); long and short both possible; new-open leverage cap {__import__('desk.config_safety', fromlist=['x']).max_open_leverage(cfg):g}x (code-enforced).",
+             f"Hard rules (code-enforced; violations rejected): per-trade margin <= {g['max_position_pct']}% of equity; total notional <= {g.get('max_total_notional_pct') or g['max_total_exposure_pct'] * ledger.swap_cfg(cfg)['leverage_max']:g}% of equity; "
+             f"every open must carry a stop (below entry for longs, above for shorts), stop distance <= {_stop_cap:g}%; the stop must trigger before the liquidation price; stops only tighten; " + ("one position per coin; same-direction adds allowed (an add is a new order, own SL/TP, original position untouched; " + ("whether to add is your call: the add risk budget is reference data, not a veto; adds are bound only by the hard guardrails (combined per-trade margin, total notional, total in-flight risk, stop, daily loss, kill switch)" if add_position.tm_decides(cfg) else "existing risk + add risk <= the per-trade cap; shortfalls clipped to the remainder") + "; no flipping: close first to reverse)." if add_position.enabled(cfg) else "one position per coin, no adds."),
+             "", "## Market (OKX, closed daily bars)",
+             # P5：趋势特征块在场时，last/ret/ATR 绝对值/20 日高低已在特征块逐字给出，这里只留
+             # 特征块没有的两项：最近日线日期与收盘、ATR 占现价百分比；特征块不在场时给全量行。
+             (f"latest daily bar {mk['bar_date']} closed {mk['close']:.6g}; ATR14 = {mk['atr14'] / mk['last'] * 100:.2f}% of spot "
+              "(last price, returns, ATR level and 20d high/low are in the trend-features block below)"
+              if _feat_on else
+              f"last {mk['last']:.6g}; latest daily bar {mk['bar_date']} closed {mk['close']:.6g}; 5d {mk['ret_5d']:+.2f}%; 20d {mk['ret_20d']:+.2f}%; "
+              f"ATR14 {mk['atr14']:.6g} ({mk['atr14'] / mk['last'] * 100:.2f}% of spot); 20d high {mk['hi_20']:.6g} low {mk['lo_20']:.6g}"),
+             "", "## Account (OKX demo)" if "live_equity" in bk else "## Account (paper)",
+             f"equity base {bk['equity']:.2f} USDT (all position % and guardrails use this base"
+             + (f"; basis={bk.get('equity_basis')}; live demo equity {bk['live_equity']:.2f}" if "live_equity" in bk else "")
+             + f"); cash {bk['cash']:.2f}; current exposure {bk['exposure']:.2f} ({bk['exposure'] / bk['equity'] * 100:.1f}%)",
+             f"on this base: per-trade margin cap {bk['equity'] * g['max_position_pct'] / 100:,.0f} USDT; total notional cap "
+             f"{bk['equity'] * (g.get('max_total_notional_pct') or g['max_total_exposure_pct'] * ledger.swap_cfg(cfg)['leverage_max']) / 100:,.0f} USDT; "
+             f"daily loss of {bk['equity'] * g['max_daily_loss_pct'] / 100:,.0f} USDT halts new opens; max {g.get('max_open_positions', 3)} positions, one per coin."]
     if pos:
-        lines.append(f"本币持仓：{'空' if pos['side'] == 'short' else '多'}单（posSide={pos.get('pos_side') or pos['side']}）{pos['leverage']:g}x，{(-1 if pos['side'] == 'short' else 1) * abs(pos['qty']):+.8g} 枚（负数=空），强平价 {pos['liq_px']}，均价 {pos['avg_px']:.6g}，止损 {pos['sl_px']}，止盈 {pos['tp_px']}，"
-                     f"浮盈亏 {pos['upnl']:+.2f} USDT，到期 {pos['deadline']}")
+        lines.append(f"position in this coin: {'short' if pos['side'] == 'short' else 'long'} (posSide={pos.get('pos_side') or pos['side']}) {pos['leverage']:g}x, {(-1 if pos['side'] == 'short' else 1) * abs(pos['qty']):+.8g} contracts (negative = short), liq price {pos['liq_px']}, avg entry {pos['avg_px']:.6g}, stop {pos['sl_px']}, take-profit {pos['tp_px']}, "
+                     f"unrealized PnL {pos['upnl']:+.2f} USDT, expires {pos['deadline']}")
     else:
-        lines.append("本币无持仓。")
+        lines.append("No position in this coin.")
     if _tc["enabled"] and regime and regime.get("features"):
         lines += ["", regime_judge.feature_block(regime["features"], mk)]
     if pos and add_position.enabled(cfg):
-        lines += ["", "## 加仓预览（代码按加仓规则预算，只是信息）",
-                  describe_add_preview(preview) if preview else "加仓预览：未能计算（无数据），不影响决策流程。",
-                  "判断是否加仓时，不要拿原仓止损止盈或原仓均价去类比（例如「离原仓止损仅 N 点」不是否决加仓的理由）："
-                  "加仓是新订单，该腿按加仓入场价独立设止损止盈、只覆盖加仓张数，原仓点位不动；请看上面加仓预览里该腿自己的止损距离、RR、预算参考与硬护栏可加张数。"
-                  + "最终是否加仓仍由你决定（不加仓用 action=hold）。"]
+        lines += ["", "## Add preview (code-computed per the add rules; information only)",
+                  describe_add_preview(preview) if preview else "Add preview: could not be computed (no data); does not affect the decision flow.",
+                  "When judging an add, do not argue from the original position's SL/TP or average price (e.g. 'only N points from the original stop' is no reason to veto an add): "
+                  "an add is a new order; its leg sets its own SL/TP from the add entry price, covers only the added contracts, and the original levels do not move. Judge the leg by its own stop distance, RR, budget reference and guardrail headroom in the preview above. "
+                  + "The final call is yours (use action=hold to skip the add)."]
     from desk import analysis as _an
     _pb = _an.pending_brief(bk)
-    lines += ["", _pb.replace(_an.PENDING_NOTE, "（以下是已挂出、尚未成交的条件入场单；如何处理见文末下单工具说明）")]
+    lines += ["", _pb.replace(_an.PENDING_NOTE, "(Conditional entry orders already placed and unfilled; how to handle them is in the order-tool instructions at the end)")]
     from desk import sessions as _sess
     lines += ["", _sess.CADENCE_NOTE]
     try:   # 近期止损披露（2026-11-05 用户决定：取消硬冷却改披露制，是否重开由交易经理知情后自行决定）；读取失败不阻断
@@ -240,32 +246,32 @@ def _prompt(cfg, coin, mk, pos, bk, st, w, S, texts, preview=None, regime=None):
         _cside = "long" if S > 0 else ("short" if S < 0 else None)
         _desc = _sc.describe(coin["inst_id"], _cside)
         if _desc:
-            lines += ["", "## 近期止损披露", _desc]
+            lines += ["", "## Recent stop-out disclosure", _desc]
     except Exception:
         pass
-    lines += ["", f"## 各角色观点（权重为历史表现给出；加权共识 S={S:+.3f}，范围 -1~+1）",
-                  f"你的角色：你不投票，权重不计。S={S:+.3f} 是全部投票角色按权重×置信度汇总的加权共识，方向由它决定，你不能翻转多空。"
-                  "你是最终定点位和张数的人：综合下面所有角色意见和行情账户数据，用文末的下单工具给出这一单（或 hold/cancel_pending 否决）。"
-                  "各角色给的入场价只作参考，以你的工具参数为准；参数不完整或违反硬护栏会被退回让你改，代码不会替你补点位。这一单的盈亏记在你名下。"]
+    lines += ["", f"## Role views (weights from track record; weighted consensus S={S:+.3f}, range -1..+1)",
+                  f"Your role: you do not vote and carry no weight. S={S:+.3f} is the weighted consensus of all voting roles (weight x confidence); it sets the direction and you cannot flip long/short. "
+                  "You are the one who finally sets levels and size: weigh every role view below plus the market and account data, then place this trade (or veto with hold/cancel_pending) via the order tool at the end. "
+                  "Role entry prices are references only; your tool parameters govern; incomplete or guardrail-violating parameters are returned for you to fix; the code never fills levels for you. This trade's PnL is booked to you."]
     for r in ROLE_KEYS:
         s = st[r]
-        wl = "只执行不投票" if r not in w else f"权重 {w[r]:.2f}"
-        lines.append(f"- {ROLE_CN[r]}（{wl}）：{s['direction']} 置信 {s.get('confidence')} 目标 {s.get('target')} "
-                     f"止损 {s.get('stop')} 周期 {s.get('horizon_days')}天 —— {s.get('reason', '')[:80]}")
-    lines += ["", "## 投资组合经理最终意见（TradingAgents）", texts["portfolio_manager"][-3000:],
-              "", "## 交易员方案", texts["trader"][-2000:]]
+        wl = "execution only, no vote" if r not in w else f"weight {w[r]:.2f}"
+        lines.append(f"- {r} ({ROLE_CN[r]}, {wl}): {s['direction']} conf {s.get('confidence')} tgt {s.get('target')} "
+                     f"stop {s.get('stop')} hz {s.get('horizon_days')}d -- {s.get('reason', '')[:80]}")
+    lines += ["", "## Portfolio manager final view (TradingAgents)", texts["portfolio_manager"][-3000:],
+              "", "## Trader proposal", texts["trader"][-2000:]]
     R = cfg.get("risk") or {}
     if _tc["enabled"]:
         if regime is not None:
             lines += ["", regime_judge.regime_block(regime, mk)]
         else:
-            lines += ["", "## 本场行情判定（LLM）\n（本场未取得判定结果，趋势市执行规则不生效，按常规规则决策。）"]
-    lines += ["", "## 硬护栏（代码强制，违反会被退回）",
-              f"止损距入场≤{_stop_cap:g}%（做多在下方、做空在上方）；盈亏比 RR=止盈距/止损距≥{float(R.get('min_rr_after_adjust', 1.5)):g}；"
-              "已有持仓止损只能收紧；new_tp 须在现价盈利一侧且距现价至少 "
-              f"{float((cfg.get('manager') or dict()).get('tp_min_gap_pct', 0.3)):g}%；组合层保证金、总名义、在途风险、当日亏损上限见上方账户段。"]
-    lines += ["点位必须是具体数字，不得写区间或「沿用/附近」。没有足够把握就 hold"
-              + ("（本场判定为趋势市时按上方判定段的执行规则）" if _tc["enabled"] else "") + "。止损请依据结构位/ATR。理由用中文。"]
+            lines += ["", "## Regime judgment (LLM)\n(no judgment obtained this session; trend execution rules NOT active — use the regular rules.)"]
+    lines += ["", "## Hard guardrails (code-enforced; violations are returned)",
+              f"stop distance from entry <= {_stop_cap:g}% (below entry for longs, above for shorts); RR = TP distance / stop distance >= {float(R.get('min_rr_after_adjust', 1.5)):g}; "
+              "an existing position's stop only tightens; new_tp must sit on the profit side of spot and at least "
+              f"{float((cfg.get('manager') or dict()).get('tp_min_gap_pct', 0.3)):g}% away from spot; portfolio margin, total notional, in-flight risk and daily-loss caps are in the account section above."]
+    lines += ["Levels must be exact numbers — no ranges, no 'reuse/nearby'. If not confident enough, hold"
+              + (" (in a trend session, follow the execution rules in the regime section above)" if _tc["enabled"] else "") + ". Set the stop from structure/ATR. Write the rationale in Chinese."]
     return "\n".join(lines)
 
 

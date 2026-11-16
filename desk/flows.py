@@ -61,36 +61,38 @@ def fetch(ccy: str) -> dict:
 
 
 def brief(ccy: str, data: dict | None = None) -> str:
+    """资金面数据文本（只进机器人提示词与摘要构建，不进日报）。P4（2026-11-15）：紧凑英文
+    + 稳定键名（funding_now (8h): / oi_usd):），供 desk/digest 的完整性校验正则定位。"""
     d = data or fetch(ccy)
-    L = [f"## {ccy} 衍生品与资金流数据（OKX 公共接口 + DefiLlama，截至最近已收盘）"]
+    L = [f"## {ccy} derivatives & flows data (OKX public API + DefiLlama, as of latest close)"]
     if "funding_now" in d:
-        L.append(f"- 当前永续资金费率（8h）：{d['funding_now'] * 100:.4f}%（年化约 {d['funding_now'] * 3 * 365 * 100:.1f}%）")
+        L.append(f"- funding_now (8h): {d['funding_now'] * 100:+.4f}% (annualized approx {d['funding_now'] * 3 * 365 * 100:.1f}%)")
     if d.get("funding_hist"):
         fh = [r for _, r in d["funding_hist"]]
-        L.append(f"- 近 {len(fh)} 期资金费率：均值 {sum(fh) / len(fh) * 100:.4f}%，最近 9 期均值 {sum(fh[-9:]) / len(fh[-9:]) * 100:.4f}%，"
-                 f"最高 {max(fh) * 100:.4f}%，最低 {min(fh) * 100:.4f}%，负费率期数 {sum(1 for x in fh if x < 0)}")
+        L.append(f"- funding history, last {len(fh)} periods: mean {sum(fh) / len(fh) * 100:.4f}%, last-9 mean {sum(fh[-9:]) / len(fh[-9:]) * 100:.4f}%, "
+                 f"max {max(fh) * 100:.4f}%, min {min(fh) * 100:.4f}%, negative periods {sum(1 for x in fh if x < 0)}")
     if "oi_usd" in d:
-        L.append(f"- OKX 永续持仓量：{d['oi_usd'] / 1e9:.3f} 十亿美元")
+        L.append(f"- OKX perpetual open interest (oi_usd): {d['oi_usd'] / 1e9:.3f} billion USD")
     if d.get("oi_vol"):
         rows = d["oi_vol"][-10:]
-        L.append("- 全合约持仓量/成交额（十亿美元，近10日）：" + "，".join(f"{_d(t)} {oi / 1e9:.2f}/{v / 1e9:.2f}" for t, oi, v in rows))
+        L.append("- open interest / volume, all contracts (billion USD, last 10d): " + ", ".join(f"{_d(t)} {oi / 1e9:.2f}/{v / 1e9:.2f}" for t, oi, v in rows))
     if d.get("ls_ratio"):
-        L.append("- 多空账户比（近10日）：" + "，".join(f"{_d(t)} {r:.2f}" for t, r in d["ls_ratio"][-10:]))
+        L.append("- long/short account ratio (last 10d): " + ", ".join(f"{_d(t)} {r:.2f}" for t, r in d["ls_ratio"][-10:]))
     if d.get("taker"):
-        L.append("- 主动卖/买成交（十亿美元，近7日；>1 表示卖方主动）：" + "，".join(
+        L.append("- taker sell/buy volume (billion USD, last 7d; >1 = sellers aggressive): " + ", ".join(
             f"{_d(t)} {s / b:.2f}" for t, s, b in d["taker"][-7:] if b))
     if d.get("stables"):
         s = d["stables"]
-        L.append(f"- 稳定币总流通：{s[-1][1] / 1e9:.1f} 十亿美元，7日变化 {(s[-1][1] / s[-8][1] - 1) * 100:+.2f}%，30日 {(s[-1][1] / s[-31][1] - 1) * 100:+.2f}%")
-    L.append("- 未接入：ETF 资金流、交易所链上净流入（无免费稳定来源）")
+        L.append(f"- total stablecoin circulation: {s[-1][1] / 1e9:.1f} billion USD, 7d change {(s[-1][1] / s[-8][1] - 1) * 100:+.2f}%, 30d {(s[-1][1] / s[-31][1] - 1) * 100:+.2f}%")
+    L.append("- not connected: ETF flows, exchange on-chain net flows (no free stable source)")
     if d.get("errors"):
-        L.append("- 获取失败：" + "；".join(d["errors"]))
+        L.append("- fetch failures: " + "; ".join(d["errors"]))
     return "\n".join(L)
 
 
-PROMPT = """你是加密货币交易台的【资金流/衍生品分析师】。只依据下面的数据（资金费率、持仓量、多空比、主动买卖、稳定币流通）判断 {ccy} 未来几天的拥挤度与资金面方向。
-不要分析 K 线形态和新闻（其他分析师负责）。说明：哪些指标显示杠杆拥挤/去杠杆、空头或多头挤压风险、资金流入流出。数据缺失要说明。
-用中文写 300~600 字报告，最后给出手册要求的【立场】行。
+PROMPT = """You are the flows/derivatives analyst of a crypto trading desk. Using ONLY the data below (funding rate, open interest, long/short ratio, taker buy/sell, stablecoin circulation), judge {ccy}'s crowding and flows direction over the next few days.
+Do not analyze candle patterns or news (other analysts cover those). Cover: which indicators show leverage crowding / deleveraging, short- or long-squeeze risk, capital inflows/outflows. State plainly what data is missing.
+Write the report in Chinese, 300-600 characters, and finish with the stance line your playbook requires.
 
 {data}
 """
@@ -105,10 +107,10 @@ def analyze(cfg, ccy: str, tracker=None) -> dict:
     msgs = roles.PlaybookLLM(dllm.make_llm(cfg, "quick", tracker, role="flows"), "flows")
     tok = dllm.STAGE.set(f"{ccy}-USDT/资金流分析师")
     try:
-        res = msgs.invoke([("system", "你是严谨的加密衍生品数据分析师。"), ("human", PROMPT.format(ccy=ccy, data=data_txt))])
+        res = msgs.invoke([("system", "You are a rigorous crypto derivatives data analyst."), ("human", PROMPT.format(ccy=ccy, data=data_txt))])
         report = res.content if isinstance(res.content, str) else str(res.content)
     except Exception as e:
-        report = f"资金流分析失败（{type(e).__name__}）。\n\n{data_txt}"
+        report = f"Flows analysis failed ({type(e).__name__}).\n\n{data_txt}"
     finally:
         dllm.STAGE.reset(tok)
     return {"data": data_txt, "report": report, "data_missing": missing, "fetch_errors": n_err}

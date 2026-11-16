@@ -175,9 +175,9 @@ def test_instructions_mention_trailing_exit(vctx):
     ctx = {"inst": INST, "mk": dict(MK), "bk": dict(BK), "pos": None, "existing": None,
            "S": -0.5, "consensus_side": "short", "trend": _reg(cfg=cfg)}
     s = T.instructions(ctx, cfg)
-    assert "改用移动止损" in s and "只用于盈亏比校验与移动止损激活线" in s
+    assert "exits by trailing stop" in s and "serves only the RR check and the trailing activation line" in s
     s2 = T.instructions(ctx, _cfg_trail(False))
-    assert "改用移动止损" not in s2
+    assert "exits by trailing stop" not in s2
 
 
 # ---------------- demo_watch 棘轮执行（trailing_stop.check） ----------------

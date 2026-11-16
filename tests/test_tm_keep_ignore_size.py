@@ -36,6 +36,6 @@ def test_prompt_and_schema_say_keep_size_fields_useless(env):
     m, calls, box = env
     _go(m, box, [OTC(**PEND)])
     p = calls["prompts"][0]
-    assert "keep_pending（保留挂单）沿用原挂单张数：risk_scale、margin_pct 等张数字段不起作用，不要填" in p
+    assert "keep_pending keeps the original size: size fields (risk_scale, margin_pct) have no effect; do not fill them" in p
     f = T.OrderToolCall.model_fields
     assert "不起作用" in f["risk_scale"].description and "不起作用" in f["margin_pct"].description

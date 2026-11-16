@@ -33,11 +33,26 @@ ROLE_KEYS = [r[0] for r in ROLES]
 ROLE_CN = {r[0]: r[1] for r in ROLES}
 INIT_WEIGHT = {r[0]: r[3] for r in ROLES}
 
-STANCE_SPEC = ("在你的输出最后单独写一行（这一行必须保留，程序会读取）：\n"
-               "【立场】方向=看多/看空/中性；目标价=数字或无；止损价=数字或无；置信度=0到1之间的小数；周期=N天；入场价=数字或无；入场条件=涨到/跌到/现价；对现有挂单=保留/改价/撤销/改现价\n"
-               "（标的是 OKX USDT 永续合约，可做多也可做空：看多=建议做多，看空=建议做空，中性=不交易。入场价=你建议的开仓触发价位；涨到=价格≥该价时开仓（做多突破/做空反弹），跌到=价格≤该价时开仓（做多回踩/做空破位），现价=立即开仓；不建议交易就写无。止损价：做多在入场价下方，做空在上方。对现有挂单：只在提示里列出了本币同向的现有条件挂单时填写；保留=支持按现有挂单价位入场（可不写入场价），改价=按你写的入场价改挂，撤销=不支持该挂单，改现价=改为现价开仓；没有现有挂单就省略）\n"
-               "例：【立场】方向=看多；目标价=92000；止损价=78500；置信度=0.6；周期=5天；入场价=80500；入场条件=跌到\n"
-              "例（已有同向挂单、同意保留）：【立场】方向=看空；目标价=76400；止损价=81950；置信度=0.6；周期=5天；入场价=79900；入场条件=涨到；对现有挂单=保留")
+# P4（2026-11-15 LLM 数据流审查）+ 用户 P3 修订口径：立场行说明改紧凑英文，且写成
+# 「讲清下游用途与缺失后果」的指引而非格式命令——你先把分析写透，最后用一行把结论
+# 交给程序抽取；抽不到时你的票按中性 0 置信计、价位丢失，如此而已，不拦你的输出。
+# 解析端（desk/stances.py）中英双语容错，旧中文行格式继续可解析（存档/手册旧版本）。
+STANCE_SPEC = ("Finish with one stance line on its own line. The desk's program extracts your vote "
+               "from it; if the line is missing or unreadable, your vote is counted as neutral with "
+               "confidence 0 and your levels are dropped — so it is worth writing carefully:\n"
+               "[STANCE] dir=long|short|neutral; tgt=<USDT price|none>; stop=<price|none>; conf=<0..1>; "
+               "hz=<days>; entry=<price|none>; cond=gte|lte|now; pending=keep|reprice|cancel|now\n"
+               "The instrument is an OKX USDT perpetual (long and short both possible): dir=long advises "
+               "opening long, short opening short, neutral no trade. entry = the trigger price you advise; "
+               "cond: gte = fill when price rises to entry (long breakout / short bounce), lte = falls to "
+               "entry (long pullback / short breakdown), now = open at market. stop sits below entry for "
+               "longs, above for shorts. pending: only when the brief lists an existing same-direction "
+               "pending order for this coin — keep = support entering at that order's trigger, reprice = "
+               "re-hang at your entry, cancel = you oppose that order, now = open at market instead; "
+               "omit the field when there is no such order.\n"
+               "Example: [STANCE] dir=short; tgt=60000; stop=72000; conf=0.6; hz=5; entry=69000; cond=gte\n"
+               "Example (existing same-direction pending order, keep it): [STANCE] dir=short; tgt=76400; "
+               "stop=81950; conf=0.6; hz=5; entry=79900; cond=gte; pending=keep")
 
 
 def refresh_fixed(text: str) -> str:
@@ -49,8 +64,8 @@ def refresh_fixed(text: str) -> str:
 
 FIXED_HEADER = """## 输出要求（固定，不参与学习修订）
 - {spec}
-- 价格一律写 USDT 绝对价位，不写百分比。
-- 只用提示中提供的数据和工具结果，不编造数字；数据缺失就明确说缺失。
+- Prices: absolute USDT levels, never percentages.
+- Use only the data given in the prompt and tool results; never invent numbers — state plainly what is missing.
 """
 
 INIT_LEARNED = "（暂无经验规则。规则只会在本角色累计至少 20 条已打分决策后，由交易经理依据复盘数据添加，每次最多 1～2 处改动。）"
@@ -172,6 +187,31 @@ def set_briefs(briefs: dict):
     _BRIEFS_VAR.set({k: v for k, v in briefs.items() if v})
 
 
+def _dedupe_last_argument(text: str) -> str:
+    """P2(A)：vendor 多空研究员提示词把最后一轮论点发了两遍（辩论 history 的尾巴与
+    「Last ... argument」段逐字相同）。只改本次调用看到的提示词文本，不动图状态里的
+    history 本体：两者逐字相同时把 Last 段换成一行指引；对不上就原样返回。"""
+    for side in ("bull", "bear"):
+        marker = f"\nLast {side} argument: "
+        i = text.find(marker)
+        if i < 0:
+            continue
+        j = text.find("\nUse this information", i)
+        if j < 0:
+            return text
+        arg = text[i + len(marker):j]
+        hmark = "Conversation history of the debate: "
+        h = text.find(hmark)
+        if h < 0:
+            return text
+        history = text[h + len(hmark):i]
+        if arg.strip() and history.rstrip().endswith(arg.rstrip()):
+            return (text[:i] + f"\nLast {side} argument: (identical to the last entry in the "
+                    f"conversation history above — see there)" + text[j:])
+        return text
+    return text
+
+
 class PlaybookLLM(Runnable):
     """包装一个聊天模型：每次调用前把角色手册追加到系统提示。"""
 
@@ -180,14 +220,17 @@ class PlaybookLLM(Runnable):
 
     def _inject(self, inp):
         msgs = list(_to_messages(inp))
+        if self.role in ("bull", "bear"):   # P2(A)：研究员提示词去掉重复的最后一轮论点
+            msgs = [m.model_copy(update={"content": _dedupe_last_argument(m.content)})
+                    if isinstance(m.content, str) else m for m in msgs]
         pb = refresh_fixed(current_text(self.role))
         block = ""
         if pb:
-            block += f"\n\n---\n[交易台给你（{ROLE_CN.get(self.role, self.role)}）的角色手册，请遵守]\n{pb}"
+            block += f"\n\n---\n[Playbook for {self.role} — follow it]\n{pb}"
         if BRIEFS.get(self.role):   # 专属数据不再依赖手册是否存在
-            block += f"\n\n---\n[只提供给你（{ROLE_CN.get(self.role, self.role)}）的专属数据]\n{BRIEFS[self.role]}"
+            block += f"\n\n---\n[Data brief for {self.role} only]\n{BRIEFS[self.role]}"
         if BRIEFS.get("*"):         # B3：全体角色共用（带方向的持仓）
-            block += f"\n\n---\n[交易台共享信息]\n{BRIEFS['*']}"
+            block += f"\n\n---\n[Shared desk info]\n{BRIEFS['*']}"
         if not block:
             return msgs
         if msgs and isinstance(msgs[0], SystemMessage) and isinstance(msgs[0].content, str):
@@ -226,6 +269,13 @@ def install(cfg=None, tracker=None):
                 if cfg is not None and r in cfg.get("role_models", {}):
                     from desk import providers
                     llm = providers.build(cfg, r, tracker)
-                return o(PlaybookLLM(llm, r))
+                node = o(PlaybookLLM(llm, r))
+                if r in ("aggressive", "conservative", "neutral"):
+                    # P2：风控三人组先试代码摘要（desk/digest），完整性不过关自动回退报告原文。
+                    # 延迟导入：digest → stances → roles，模块级导入会成环。
+                    from desk import digest
+                    inner = node
+                    node = lambda state, _n=inner: digest.run_with_digest(_n, state)
+                return node
             return factory
         setattr(setup, fname, make(orig, key))

@@ -431,82 +431,83 @@ def features(inst: str) -> dict:
 
 
 def _num(v) -> str:
-    return "数据不足" if v is None else f"{v:.6g}"
+    return "n/a" if v is None else f"{v:.6g}"
 
 
 def _pct(v) -> str:
-    return "数据不足" if v is None else f"{v:+.2f}%"
+    return "n/a" if v is None else f"{v:+.2f}%"
 
 
 def _flow_seg(f) -> str:
-    """资金面渲染（v3）：核心字段全缺失 → 明示缺失且第六项不可引用；部分缺失 → 逐项「数据不足」
-    并在 flow_missing 时附注第六项不可引用。"""
+    """资金面渲染（v3）：核心字段全缺失 → 明示缺失且第六项不可引用；部分缺失 → 逐项 n/a
+    并在 flow_missing 时附注第六项不可引用。P4：渲染改紧凑英文（判定与 TM 共用）。"""
     if f.get("funding_now") is None and f.get("oi_usd") is None and f.get("oi_chg_5d_pct") is None:
-        return ("资金面（OKX 公共接口）：本场数据缺失（抓取失败），"
-                "forced_flow_exhaustion（资金面衰竭）本场不可引用")
+        return ("flows (OKX public): MISSING this run (fetch failed); "
+                "forced_flow_exhaustion NOT citable this run")
     fr = f.get("funding_now")
-    fr_s = ("数据不足" if fr is None else
-            f"{fr * 100:+.4f}%（近约 90 日分位 {_num(f.get('funding_pctile_90d'))}%，"
-            f"样本 {f.get('funding_hist_n', 0)} 期）")
+    fr_s = ("n/a" if fr is None else
+            f"{fr * 100:+.4f}% (~90d pctile {_num(f.get('funding_pctile_90d'))}, "
+            f"n={f.get('funding_hist_n', 0)})")
     oi = f.get("oi_usd")
-    oi_s = "数据不足" if oi is None else f"${oi / 1e9:.2f}B"
-    s = f"资金面（OKX 公共接口）：资金费率（8h）{fr_s}；持仓量 {oi_s}，5 日变化 {_pct(f.get('oi_chg_5d_pct'))}"
+    oi_s = "n/a" if oi is None else f"${oi / 1e9:.2f}B"
+    s = f"flows (OKX public): funding 8h {fr_s}; OI {oi_s}, 5d chg {_pct(f.get('oi_chg_5d_pct'))}"
     if f.get("liq_n"):
-        s += (f"；最近约 {f['liq_span_h']:g} 小时强平样本 {f['liq_n']} 笔：多头被强平 "
-              f"≈${f['liq_long_usd'] / 1e6:.1f}M、空头被强平 ≈${f['liq_short_usd'] / 1e6:.1f}M"
-              "（覆盖窗口短，仅作当下强平压力参考）")
+        s += (f"; liquidations last ~{f['liq_span_h']:g}h, {f['liq_n']} prints: longs "
+              f"≈${f['liq_long_usd'] / 1e6:.1f}M, shorts ≈${f['liq_short_usd'] / 1e6:.1f}M "
+              "(short window, liquidation-pressure context only)")
     if f.get("flow_missing"):
-        s += "（注：资金面数据不完整，forced_flow_exhaustion 本场不可引用）"
+        s += " (note: flows data incomplete; forced_flow_exhaustion NOT citable this run)"
     return s
 
 
-_WEEKLY_CN = {"long": "多头", "short": "空头", "none": "中性（无明确方向）"}
+_WEEKLY_CN = {"long": "long", "short": "short", "none": "neutral"}
 
 
 def _weekly_seg(f) -> str:
-    """周线方向渲染：缺失明示缺失（过滤本场不生效）；中性明示不拦截。"""
+    """周线方向渲染：缺失明示缺失（过滤本场不生效）；中性明示不拦截。P4：紧凑英文。"""
     d = f.get("weekly_direction")
     if d not in _WEEKLY_CN:
-        return "周线方向（代码按完整周收盘计算）：数据不足（周线方向过滤本场不生效）"
-    return (f"周线方向（代码按完整周收盘计算，共 {f.get('weekly_weeks', '?')} 个完整周）：{_WEEKLY_CN[d]}（{d}）；"
-            f"周收盘 {_num(f.get('weekly_close'))}；周 MA10 {_num(f.get('weekly_ma10'))}；"
-            f"周 MA20 {_num(f.get('weekly_ma20'))}（5 周斜率 {_pct(f.get('weekly_ma20_slope_pct'))}）")
+        return "weekly direction (code, from completed weekly closes): n/a (weekly filter inactive this run)"
+    return (f"weekly direction (code, {f.get('weekly_weeks', '?')} completed weeks): {d}; "
+            f"weekly close {_num(f.get('weekly_close'))}; weekly MA10 {_num(f.get('weekly_ma10'))}; "
+            f"weekly MA20 {_num(f.get('weekly_ma20'))} (5w slope {_pct(f.get('weekly_ma20_slope_pct'))})")
 
 
 def _h4_seg(f) -> str:
-    """4H 波段结构渲染：两侧全缺失明示缺失（结构门本场不生效）；单侧缺失逐项「数据不足」。"""
+    """4H 波段结构渲染：两侧全缺失明示缺失（结构门本场不生效）；单侧缺失逐项 n/a。P4：紧凑英文。"""
     hi, lo = f.get("h4_swing_high"), f.get("h4_swing_low")
     if hi is None and lo is None:
-        return "4H 波段结构（代码按已收盘 4H K 线计算）：数据不足（4H 入场结构门本场不生效）"
-    hi_s = "数据不足" if hi is None else f"{_num(hi)}（{f.get('h4_swing_high_time') or '时刻未登记'} UTC）"
-    lo_s = "数据不足" if lo is None else f"{_num(lo)}（{f.get('h4_swing_low_time') or '时刻未登记'} UTC）"
-    return f"4H 波段结构（代码按已收盘 4H K 线计算）：最近确认波段高点 {hi_s}；最近确认波段低点 {lo_s}"
+        return "4H swing structure (code, closed 4H bars): n/a (4H entry-structure gate inactive this run)"
+    hi_s = "n/a" if hi is None else f"{_num(hi)} ({f.get('h4_swing_high_time') or 'time n/a'} UTC)"
+    lo_s = "n/a" if lo is None else f"{_num(lo)} ({f.get('h4_swing_low_time') or 'time n/a'} UTC)"
+    return f"4H swing structure (code, closed 4H bars): latest confirmed swing high {hi_s}; swing low {lo_s}"
 
 
 def feature_block(feat, mk) -> str:
-    """趋势特征渲染：判定提示词与交易经理提示词共用同一块，保证两边看到的数据完全一致。"""
+    """趋势特征渲染：判定提示词与交易经理提示词共用同一块，保证两边看到的数据完全一致。
+    P4（2026-11-15）：标签改紧凑英文（值与口径不变）。"""
     f = feat or {}
 
     def ma_seg(label: str, key: str) -> str:
-        s = (f"{label} {_num(f.get(key))}（5 日斜率 {_pct(f.get(key + '_slope_pct'))}")
+        s = (f"{label} {_num(f.get(key))} (5d slope {_pct(f.get(key + '_slope_pct'))}")
         pv = f.get(key + "_slope_pct_prev5")
         if pv is not None:
-            s += f"，5 日前同口径斜率 {_pct(pv)}"
-        return s + f"，现价偏离 {_pct(f.get('dev_' + key + '_pct'))}）"
+            s += f", slope 5d ago {_pct(pv)}"
+        return s + f", dev {_pct(f.get('dev_' + key + '_pct'))})"
     pos = f.get("pos_in_range")
-    pos_s = "数据不足" if pos is None else f"{pos * 100:.0f}%"
+    pos_s = "n/a" if pos is None else f"{pos * 100:.0f}%"
 
-    def mkn(key, pct=False):   # mk 字段缺失（旧记录/测试桩）时渲染为「数据不足」，不抛错
+    def mkn(key, pct=False):   # mk 字段缺失（旧记录/测试桩）时渲染为 n/a，不抛错
         v = (mk or {}).get(key)
-        return "数据不足" if v is None else (f"{float(v):+.2f}%" if pct else f"{float(v):.6g}")
-    return ("## 趋势特征（代码计算，仅数据，不含结论）\n"
-            f"现价 {mkn('last')}；{ma_seg('MA20', 'ma20')}；{ma_seg('MA50', 'ma50')}；{ma_seg('MA200', 'ma200')}；"
-            f"RSI14 {_num(f.get('rsi14'))}；20 日区间位置 {pos_s}（高 {mkn('hi_20')} / 低 {mkn('lo_20')}）；"
-            f"5 日 {mkn('ret_5d', pct=True)}、20 日 {mkn('ret_20d', pct=True)}；"
-            f"ATR14 {mkn('atr14')}（基于 {f.get('bars', '?')} 根已收盘日线）；"
-            f"量能：最新日 z 值 {_num(f.get('vol_z_last'))}、近 5 日最大 z 值 {_num(f.get('vol_z_max5'))}"
-            f"（相对此前 20 日均量/标准差），最新日收盘涨跌 {_num(f.get('last_chg_atr'))}×ATR14；"
-            + _weekly_seg(f) + "；" + _h4_seg(f) + "；" + _flow_seg(f))
+        return "n/a" if v is None else (f"{float(v):+.2f}%" if pct else f"{float(v):.6g}")
+    return ("## Trend features (code-computed, data only)\n"
+            f"last {mkn('last')}; {ma_seg('MA20', 'ma20')}; {ma_seg('MA50', 'ma50')}; {ma_seg('MA200', 'ma200')}; "
+            f"RSI14 {_num(f.get('rsi14'))}; 20d range pos {pos_s} (high {mkn('hi_20')} / low {mkn('lo_20')}); "
+            f"5d {mkn('ret_5d', pct=True)}, 20d {mkn('ret_20d', pct=True)}; "
+            f"ATR14 {mkn('atr14')} ({f.get('bars', '?')} closed daily bars); "
+            f"volume: latest-day z {_num(f.get('vol_z_last'))}, 5d max z {_num(f.get('vol_z_max5'))} "
+            f"(vs prior-20d mean/std), last close move {_num(f.get('last_chg_atr'))}xATR14; "
+            + _weekly_seg(f) + "; " + _h4_seg(f) + "; " + _flow_seg(f))
 
 
 # ------------------------------------------------------------------ LLM 行情判定
@@ -771,73 +772,78 @@ _STAGE_CN = {"early": "早期", "mid": "中段", "late_exhaustion": "末段衰�
 
 def _weekly_line(regime) -> str:
     """TM 提示词里的周线过滤说明行（决策 2）：过滤关闭时不出现；启用时按方向/中性/缺失三态
-    说明拦截口径。周线过滤独立于 LLM 判定——判定失败时本行照常出现（只要 regime 已构建）。"""
+    说明拦截口径。周线过滤独立于 LLM 判定——判定失败时本行照常出现（只要 regime 已构建）。
+    P4：紧凑英文渲染（拦截口径不变）。"""
     wk = (regime or {}).get("weekly") or {}
     if not wk.get("enabled"):
         return ""
     wd = wk.get("direction")
     if wd in ("long", "short"):
         opp = "short" if wd == "long" else "long"
-        return (f"\n周线方向过滤（代码计算）：本场周线方向为{_DIR_CN[wd]}（{wd}），禁止逆周线方向开新仓——"
-                f"{opp} 方向的 open/pending/replace_pending 会被校验退回（[WEEKLY_DIR]）；"
-                "若共识方向恰与周线相反，本场只能 hold 并在 rationale 写明周线过滤，不要尝试下单。")
+        return (f"\nWeekly direction filter (code-computed): weekly direction this run is {wd}; "
+                f"no new opens against it — {opp} open/pending/replace_pending will be rejected ([WEEKLY_DIR]); "
+                "if consensus is opposite to the weekly direction, hold and say so in the rationale; do not try to order.")
     if wk.get("missing"):
-        return "\n周线方向过滤（代码计算）：本场周线数据缺失，过滤不生效，按常规规则决策。"
-    return "\n周线方向过滤（代码计算）：本场周线方向中性（无明确方向），过滤不拦截任何方向。"
+        return "\nWeekly direction filter (code-computed): weekly data missing this run; filter inactive; use the regular rules."
+    return "\nWeekly direction filter (code-computed): weekly direction neutral this run; the filter blocks nothing."
 
 
 def _h4_line(regime) -> str:
     """TM 提示词里的 4H 入场结构说明行（2026-11-15）：结构门关闭时不出现；启用时按波段值有无
-    说明约束界。结构门独立于 LLM 判定——判定失败时本行照常出现（只要 regime 已构建）。"""
+    说明约束界。结构门独立于 LLM 判定——判定失败时本行照常出现（只要 regime 已构建）。
+    P4：紧凑英文渲染（约束界不变）。"""
     h4 = (regime or {}).get("h4") or {}
     if not h4.get("enabled"):
         return ""
     parts = []
     if h4.get("swing_high") is not None:
-        parts.append(f"做空触发价须 ≥ 最近确认 4H 波段高点 {float(h4['swing_high']):g}")
+        parts.append(f"short triggers must be >= latest confirmed 4H swing high {float(h4['swing_high']):g}")
     if h4.get("swing_low") is not None:
-        parts.append(f"做多触发价须 ≤ 最近确认 4H 波段低点 {float(h4['swing_low']):g}")
+        parts.append(f"long triggers must be <= latest confirmed 4H swing low {float(h4['swing_low']):g}")
     if not parts:
-        return "\n4H 入场结构（代码计算）：本场 4H 波段数据缺失，结构门不生效，按常规规则决策。"
-    return ("\n4H 入场结构（代码按已收盘 4H K 线计算）：" + "；".join(parts) +
-            "——不满足的 open/pending/replace_pending 会被校验退回（[H4_STRUCT]）；触发价正好等于波段点位可以通过。")
+        return "\n4H entry structure (code-computed): 4H swing data missing this run; gate inactive; use the regular rules."
+    return ("\n4H entry structure (code, closed 4H bars): " + "; ".join(parts) +
+            " — non-conforming open/pending/replace_pending will be rejected ([H4_STRUCT]); a trigger exactly at the swing level passes.")
 
 
 def regime_block(regime: dict, mk) -> str:
-    """交易经理提示词里的「本场行情判定（LLM）」段：判定结果 + 依判定生效的执行规则。"""
+    """交易经理提示词里的行情判定段：判定结果 + 依判定生效的执行规则。
+    P4：代码侧框架文字改紧凑英文；判定员自己的 summary/evidence 原文（中文）原样嵌入。"""
     tc = regime["cfg"]
     if regime.get("failed") or not regime.get("judge"):
-        return ("## 本场行情判定（LLM）\n"
-                "判定失败（regime_judge_failed）：本场趋势市执行规则不生效，按常规规则决策。"
+        return ("## Regime judgment (LLM)\n"
+                "Judgment failed (regime_judge_failed): trend execution rules NOT active this session; use the regular rules."
                 + _weekly_line(regime) + _h4_line(regime))
     j = regime["judge"]
-    head = (f"## 本场行情判定（LLM，与交易经理同一模型席位，决策前判定）\n"
-            f"方向={_DIR_CN[j['direction']]}（{j['direction']}）；强度={_STR_CN[j['strength']]}（{j['strength']}）；"
-            f"阶段={_STAGE_CN[j['stage']]}（{j['stage']}）；置信 {j['confidence']:.2f}。\n"
-            f"结论：{j['summary']}\n"
-            "证据：" + ("；".join(j["evidence"]) if j["evidence"] else "（无）"))
+    head = (f"## Regime judgment (LLM, same model seat as the trade manager, judged before this decision)\n"
+            f"direction={j['direction']} ({_DIR_CN[j['direction']]} trend); strength={j['strength']}; "
+            f"stage={j['stage']}; confidence {j['confidence']:.2f}.\n"
+            f"Conclusion: {j['summary']}\n"
+            "Evidence: " + ("; ".join(j["evidence"]) if j["evidence"] else "(none)"))
     if j.get("stage_overridden"):
-        head += ("\n注：判定员原始阶段为末段衰竭（late_exhaustion），但未给出任何有效正面衰竭证据"
-                 "（exhaustion_signals 为空，或所引资金面衰竭因本场资金面数据缺失被剔除），"
-                 "已按判定标准 v3 代码校验强制降为中段（mid）生效，末段衰竭降级不触发。")
+        head += ("\nNote: the judge's raw stage was late_exhaustion but it cited no valid affirmative exhaustion "
+                 "evidence (signals empty, or forced-flow dropped with flows data missing); per judge standard v3 "
+                 "the code forced the effective stage to mid; the late-exhaustion downgrade does NOT trigger.")
     elif j["stage"] == "late_exhaustion" and j.get("exhaustion_signals"):
-        head += ("\n衰竭证据（正面信号）：" + "；".join(
-            f"{_EXHAUSTION_CN.get(s, s)}（{s}）" for s in j["exhaustion_signals"]))
+        head += ("\nExhaustion evidence (affirmative signals): " + "; ".join(
+            f"{_EXHAUSTION_CN.get(s, s)} ({s})" for s in j["exhaustion_signals"]))
     if j.get("exhaustion_signals_dropped"):
-        head += ("\n注：判定员引用了资金面衰竭（forced_flow_exhaustion），但本场资金面数据缺失，"
-                 "该项证据已被代码校验剔除（原始引用保留在存档中）。")
+        head += ("\nNote: the judge cited forced_flow_exhaustion, but flows data was missing this run; "
+                 "that evidence was dropped by code validation (the original citation stays in the archive).")
     if not regime.get("active"):
-        return head + "\n本场趋势市执行规则不生效（判定无趋势或强度不足），按常规规则决策。" + _weekly_line(regime) + _h4_line(regime)
+        return head + "\nTrend execution rules NOT active this session (judgment: no trend or weak strength); use the regular rules." + _weekly_line(regime) + _h4_line(regime)
     cap = tc["near_atr"] * float((mk or {}).get("atr14") or 0)
-    s = (head + f"\n趋势市执行规则（依本场判定生效，只改入场方式，不改否决门槛）：判定方向与下单方向一致时，"
-         f"禁止把唯一入场押在远离现价的位置上——必须二选一：(a) 现价入场（open）；(b) 近价挂单（pending），"
-         f"触发价距现价≤{tc['near_atr']:g}×ATR14={cap:.6g}（做空：gte 小反弹触发或 lte 跌破触发均可），"
-         "超出会被校验退回（[TREND_DIST]）。现价单若因价格漂移被拦，改走 (b)，不许因此改为 hold 或远位单。")
+    s = (head + f"\nTrend execution rules (active per this judgment; they change only HOW you enter, not the veto bar): "
+         f"when your order direction matches the judged direction, never rest the only entry far from spot: "
+         f"(a) open at market, or (b) near-price pending, trigger within <={tc['near_atr']:g}xATR14={cap:.6g} of spot "
+         f"(shorts: gte bounce or lte breakdown both qualify); beyond that is rejected "
+         "([TREND_DIST]). If a market open is blocked by price drift, switch to (b); never fall back to hold or a far order.")
     if regime.get("downgrade"):
-        s += (f"\n本场判定阶段为末段衰竭（late_exhaustion），降级生效：禁用现价 open，只许近价 pending，"
-              f"且 risk_scale≤{tc['oversold_risk_scale']:g}（[TREND_OVERSOLD] 硬校验）。")
-    s += ("\n趋势市里仍可 hold，但 rationale 必须写明：判定证据里哪一条不成立，或哪条硬护栏不允许下单。"
-          "只写「等反弹确认」「把握不足」视为未说明，会在日报中被标出。")
+        s += (f"\nStage is late_exhaustion this session; downgrade active: market open DISABLED, near-price pending only, "
+              f"risk_scale<={tc['oversold_risk_scale']:g} ([TREND_OVERSOLD] hard check).")
+    s += ("\nHolding in a trend session is allowed only if the rationale names which piece of the judgment's evidence "
+          "fails, or which hard guardrail blocks the order; 'waiting for a bounce' / 'not confident enough' alone counts "
+          "as unexplained and is flagged in the daily report.")
     return s + _weekly_line(regime) + _h4_line(regime)
 
 

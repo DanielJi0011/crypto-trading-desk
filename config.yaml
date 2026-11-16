@@ -23,10 +23,6 @@ execution:
     offset_pct: 0.1                     # 限价偏移（百分比，0.1 即 0.1%）：做多限价=触发价×(1-偏移)，做空限价=触发价×(1+偏移)，按合约 tickSz 四舍五入取整
     timeout_minutes: 3                  # 从触发时刻起超过这么多分钟限价子单仍未完全成交 → 撤掉子单（demo_watch 每轮检查）
     ws_check_secs: 20                   # R6b：demo_ws 常驻进程每隔这么多秒检查一次限价入场超时（只在有已触发未完结的限价单时调用，与 demo_watch 共用每币执行锁）；0=关闭，只靠 demo_watch 轮询；改动需重启 demo_ws 生效
-    fallback_market: false              # 市价兜底开关（2026-11-11 用户决定关闭：「这个兜底就没有必要了，就等它触发」）。false=超时撤子单后绝不市价追单：以原触发价/止损止盈/剩余张数重挂条件单等触发（沿用原到期，可多轮重挂），价格回到等待侧与已穿过触发价同样重挂（2026-11-15 用户裁定「穿过也保留原单，等触发成交」）；只有原到期已过或条件/到期无法确定才收尾；已成交部分照常挂保护。true=旧行为：市价补剩余（补单前过护栏与兜底前判定）
-    fallback_judge_enabled: true        # 兜底前判定（2026-11-11 用户指令，desk/fallback_judge.py）：市价补单发出前，由交易经理身份 + 快速模型判断当前价位入场是否仍合理；否决/判定失败=放弃本次入场（fallback_abandoned）；false=恢复原无条件兜底
-    fallback_judge_model: deepseek-flash   # 判定模型：快速档（与 llm.quick_model 同档），不用交易经理席位的 opus 推理档（巡检周期内要快）
-    fallback_judge_provider: deepseek      # 判定模型 provider（与 llm.provider 同名时走 make_llm 的 quick 通道）
 
   # 移动止损替代固定止盈（desk/trailing_stop.py；2026-11-14 用户批准）：本场 LLM 行情判定生效（方向与订单一致、
   # 强度 strong/moderate）且阶段非 late_exhaustion 时，新开仓位不挂固定止盈单，改用移动止损退出；TM 的计划止盈
@@ -53,7 +49,8 @@ llm:
   output_language: Chinese
   max_debate_rounds: 1
   max_risk_discuss_rounds: 1
-  max_tool_rounds: 8
+  max_tool_rounds: 4
+  market_max_tool_rounds: 8
   temperature: null
   max_retries: 3
   # LLM 可重试错误（503/502/500/504/429、超时、连接错误）的退避间隔（秒），依次重试；全部失败才算该角色失败并在日报标出
@@ -126,20 +123,15 @@ macro:
     - {id: CPIAUCSL, name: CPI, unit: "", yoy: true}   # 月度，给同比
     - {id: VIXCLS, name: VIX, unit: ""}
 
-schedule:
-  run_time: "08:00"                     # 未使用：代码不读取；实际由例行任务 08:05 触发 run_daily.sh，运行窗口 07:55~12:00 写在 run_daily.sh
-  timezone: Asia/Shanghai
 
 data:
   okx_base_url: https://www.okx.com
   daily_bar: 1Dutc                      # UTC 日线（北京时间 08:00 收盘）
   history_days: 420                     # 指标（200 日均线等）需要的历史长度
-  intraday_bar: 1H                      # 未使用：代码不读取（旧纸面盯市实际用 1H 写死在代码里）
   yahoo_fallback: true                  # OKX 失败时回退到 TradingAgents 默认的 Yahoo（BTC-USD 等）
 
 paper:
   initial_equity_usdt: 1000             # 仅旧纸面账本（BTC/ETH 两个旧仓）；新流程仓位基准见 execution.equity_basis
-  fee_rate: 0.001                       # 未使用：代码不读取，纸面账本与对照组用 swap.fee_rate
   slippage_bp: 5                        # 每边 5bp
 
 # 永续合约纸面模拟（逐仓，多空双向；不含实盘下单代码）
@@ -198,10 +190,6 @@ add_position:
 
 # 条件入场单参数（venue=okx_demo 时条件单挂在模拟盘；demo_watch 用 rediscuss_* 与有效期；desk.monitor 只管旧纸面仓）
 pending:
-  mode: auto                            # 仅旧纸面盯盘有效，模拟盘无效；auto=触发即纸面成交；confirm=触发/接近时再问交易经理确认
-  bar: 1m                               # 检查触发用的 OKX K线周期
-  mark_bar: 5m                          # 盘中止损/止盈/强平盯市用的 K线周期
-  near_pct: 0.3                         # confirm 模式：价格进入触发价 0.3% 以内即请求确认
   default_expire_hours: 24
   immediate_band_pct: 0.3               # 聚合入场价距现价 ≤0.3% 视为现价成交
   rediscuss_after_stop: true            # 监控中止损后，后台对该币跑一次全角色讨论设定下次入场
@@ -291,7 +279,6 @@ data_quality:
 scoring:
   horizon_days: 5                       # 每条角色观点在 N 天后打分（与 TradingAgents holding_period_days 一致）
   neutral_band_pct: 2.0                 # |收益| < 2% 记为"震荡"，观望类观点判为命中
-  regime_lookback_days: 20
   regime_threshold_pct: 5.0             # 20 日涨跌 > +5% 上升 / < −5% 下降 / 其余震荡
   # 第三批 L2：打分 v2（每条观点按自己的周期 1~30 天；中性带宽 0.5×ATR14%×√周期，ATR 不可得时用 neutral_band_pct）
   n0: 30                                # 收缩权重的先验样本数：w = w0·clip(exp(k·Σskill/(n+n0)), 0.5, 2)，n 按"角色×交易日"计
@@ -302,9 +289,6 @@ learning:                               # 防过拟合规则
   max_changes_per_edit: 2               # 每次修订最多 1～2 处改动
   eval_window_after_edit: 20            # 修订后观察 20 条
   rollback_if_worse_pp: 5.0             # 修订后命中率比修订前低 5 个百分点以上 → 自动回滚
-  weight_window: 40                     # 权重按最近 40 条已打分决策计算
-  weight_min_scored: 20
-  weight_eta: 4.0                       # w ∝ exp(eta·(命中率−0.5))
   weight_clip: [0.5, 2.0]
   # 学习冻结（整改任务书 L1 开关部分，2026-10-22 用户决定）：恢复条件见任务书 Q8，未经用户确认不得改为 true
   apply_weights: false                  # false=update_weights 只写 state/weights_shadow.json（影子权重），决策用初始权重
@@ -341,10 +325,7 @@ expiry_extend:                          # 2026-10-30 用户决定：持有期到
   mode: full_discussion                 # full_discussion（默认，全员讨论）| simple（62648d3 交易经理简化问答，desk/expiry.py）| off（到期直接平仓）
   max_extensions: 2                     # 总延期次数上限（所有模式）；达到后到期不再讨论，直接平仓
   discussion_timeout_minutes: 45        # full_discussion：后台讨论超过此时长仍无结果 → 视为失败，回退到期平仓
-  max_extend_days: 3                    # 仅 simple 模式：累计延期天数上限（full_discussion 延期天数取本次决策 horizon_days，缺省 5）
   pre_window_minutes: 5                 # 到期前一个检查周期（demo_watch 5 分钟一轮）内即可开始讨论/判断；判平仓的等真正到期再平
-  retry_delays: [2, 5, 10]              # 仅 simple 模式：交易经理调用失败重试 3 次的退避秒数（full_discussion 沿用 llm_retry.install 全局重试）
-  max_round_attempts: 3                 # 仅 simple 模式： 跨轮尝试上限（轮次超时打断也计数）；超过回退到期平仓
 
 ledger:
   tm_attribution: true                  # 2026-10-30 方案一：决策记 decided_by=trade_manager 与单子类型；平仓写 state/ledger/tm_ledger.jsonl（幂等）；日报加「交易经理战绩」；复盘以交易经理为主线；false=旧行为

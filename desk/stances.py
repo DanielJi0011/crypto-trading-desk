@@ -22,7 +22,8 @@ def role_texts(fs: dict) -> dict:
 
 
 DIR_MAP = {"看多": "bullish", "看空": "bearish", "中性": "neutral", "偏多": "bullish", "偏空": "bearish",
-           "bullish": "bullish", "bearish": "bearish", "neutral": "neutral"}
+           "bullish": "bullish", "bearish": "bearish", "neutral": "neutral",
+           "long": "bullish", "short": "bearish"}
 _NUM = r"([0-9][0-9,]*\.?[0-9]*|无|N/?A|none)"
 STANCE_RE = re.compile(r"【立场】\s*方向\s*[=:：]\s*(看多|看空|中性|偏多|偏空)\s*[；;,，]\s*目标价\s*[=:：]\s*" + _NUM +
                        r"\s*[；;,，]\s*止损价\s*[=:：]\s*" + _NUM + r"\s*[；;,，]\s*置信度\s*[=:：]\s*([0-9.]+)\s*[；;,，]\s*周期\s*[=:：]\s*([0-9]+)",
@@ -33,11 +34,15 @@ STANCE_RE = re.compile(r"【立场】\s*方向\s*[=:：]\s*(看多|看空|中性
 # 置信度可写百分比（如 65%），周期可带单位（5天/5日/5 days）。语义与 v1 一致的部分：
 # 取最后一个“完整”立场（方向+置信度+周期齐全者优先，靠前的完整立场胜过靠后的残缺立场）；
 # 只有残缺立场时取最后一个带方向的，置信度缺失按 0.5 计并打 partial 标记（日报解析健康可见）。
-_DIR_RE = re.compile(r"方向\s*[=:：]\s*(看多|看空|中性|偏多|偏空|bullish|bearish|neutral)", re.I)
-_TGT_RE = re.compile(r"目标价\s*[=:：]\s*" + _NUM, re.I)
-_SL_RE = re.compile(r"止损价\s*[=:：]\s*" + _NUM, re.I)
-_CONF_RE = re.compile(r"置信度\s*[=:：]\s*([0-9][0-9.]*)\s*(%|％)?", re.I)
-_HZ_RE = re.compile(r"周期\s*[=:：]\s*([0-9]+)\s*(?:天|日|days?)?", re.I)
+# 解析 v3（2026-11-15，P3/P4）：中英双语标签与标记（【立场】/[STANCE]、方向/dir、目标价/tgt、
+# 止损价/stop、置信度/conf、周期/hz、入场价/entry、入场条件/cond、对现有挂单/pending），
+# 取值同样双语（看多/long/bullish 等）。口径（用户 P3 修订）：抽取端容错——LLM 自由表达、
+# 措辞可变，代码负责多模式识别，绝不因格式偏差拒绝一个角色的输出。
+_DIR_RE = re.compile(r"(?:方向|dir|direction)\s*[=:：]\s*(看多|看空|中性|偏多|偏空|bullish|bearish|neutral|long|short)", re.I)
+_TGT_RE = re.compile(r"(?:目标价|tgt|target(?:\s*price)?)\s*[=:：]\s*" + _NUM, re.I)
+_SL_RE = re.compile(r"(?:止损价|stop(?:\s*loss)?|sl)\s*[=:：]\s*" + _NUM, re.I)
+_CONF_RE = re.compile(r"(?:置信度|conf|confidence)\s*[=:：]\s*([0-9][0-9.]*)\s*(%|％)?", re.I)
+_HZ_RE = re.compile(r"(?:周期|hz|horizon)\s*[=:：]\s*([0-9]+)\s*(?:天|日|days?|d)?", re.I)
 
 
 def _num(s):
@@ -47,11 +52,14 @@ def _num(s):
         return None
 
 
-ENTRY_RE = re.compile(r"入场价\s*[=:：]\s*" + _NUM + r"(?:\s*[；;,，]\s*入场条件\s*[=:：]\s*(突破|回踩|涨到|跌到|现价))?", re.I)
-COND_MAP = {"突破": "gte", "涨到": "gte", "回踩": "lte", "跌到": "lte", "现价": "now"}
+ENTRY_RE = re.compile(r"(?:入场价|entry(?:\s*price)?)\s*[=:：]\s*" + _NUM, re.I)
+COND_RE = re.compile(r"(?:入场条件|cond)\s*[=:：]\s*(gte|lte|now|突破|回踩|涨到|跌到|现价)", re.I)
+COND_MAP = {"突破": "gte", "涨到": "gte", "回踩": "lte", "跌到": "lte", "现价": "now",
+            "gte": "gte", "lte": "lte", "now": "now"}
 # 2026-10-30：立场行可选字段「对现有挂单=保留/改价/撤销/改现价」→ pending_action（只影响入场方案分组，不影响打分）
-PEND_RE = re.compile(r"对现有挂单\s*[=:：]\s*(保留|改价|撤销|撤单|改现价|现价)")
-PEND_MAP = {"保留": "keep", "改价": "reprice", "撤销": "cancel", "撤单": "cancel", "改现价": "now", "现价": "now"}
+PEND_RE = re.compile(r"(?:对现有挂单|pending)\s*[=:：]\s*(保留|改价|撤销|撤单|改现价|现价|keep|reprice|cancel|now)", re.I)
+PEND_MAP = {"保留": "keep", "改价": "reprice", "撤销": "cancel", "撤单": "cancel", "改现价": "now", "现价": "now",
+            "keep": "keep", "reprice": "reprice", "cancel": "cancel", "now": "now"}
 
 
 def _conf_value(m) -> float:
@@ -75,20 +83,24 @@ def _stance_fields(seg: str):
     out["confidence"] = _conf_value(c) if c else None
     h = _HZ_RE.search(seg)
     out["horizon_days"] = int(h.group(1)) if h else None
-    em = ENTRY_RE.search(seg)             # 可选：建议入场价位与条件
+    em = ENTRY_RE.search(seg)             # 可选：建议入场价位与条件（v3 起条件是独立字段 cond=）
     if em:
         out["entry_px"] = _num(em.group(1))
-        out["entry_condition"] = COND_MAP.get(em.group(2) or "", None)
+    cm = COND_RE.search(seg)
+    if cm:
+        g = cm.group(1)
+        out["entry_condition"] = COND_MAP.get(g) or COND_MAP.get(g.lower())
     pm = PEND_RE.search(seg)
     if pm:
-        out["pending_action"] = PEND_MAP[pm.group(1)]
+        g = pm.group(1)
+        out["pending_action"] = PEND_MAP.get(g) or PEND_MAP.get(g.lower())
     out["_complete"] = c is not None and h is not None
     return out
 
 
 def parse_stance(text: str):
     text = text or ""
-    idxs = [m.start() for m in re.finditer("【立场】", text)]
+    idxs = [m.start() for m in re.finditer(r"【立场】|\[STANCE\]", text, re.I)]
     if not idxs:
         return None
     partial = None
@@ -155,17 +167,17 @@ def parse_structured(role: str, text: str):
 
 
 class RoleStance(BaseModel):
-    role: str = Field(description="角色键名，取值见提示")
-    direction: Literal["bullish", "bearish", "neutral"] = Field(description="对未来价格方向的观点（bullish=建议做多，bearish=建议做空，neutral=不交易）")
-    target: float | None = Field(default=None, description="目标价（USDT 绝对价位），没有就省略")
-    stop: float | None = Field(default=None, description="止损价/失效价位，没有就省略")
-    confidence: float = Field(description="0~1")
-    horizon_days: int = Field(default=5, description="观点周期（天）")
-    entry_px: float | None = Field(default=None, description="建议的开仓触发价位（USDT），原文没写就省略")
-    entry_condition: Literal["gte", "lte", "now"] | None = Field(default=None, description="gte=价格涨到≥该价时开仓，lte=跌到≤该价时开仓，now=现价开仓")
+    role: str = Field(description="role key, exactly as given in the prompt")
+    direction: Literal["bullish", "bearish", "neutral"] = Field(description="view on future price: bullish = advise long, bearish = advise short, neutral = no trade")
+    target: float | None = Field(default=None, description="target price (absolute USDT level); omit if none")
+    stop: float | None = Field(default=None, description="stop-loss / invalidation level; omit if none")
+    confidence: float = Field(description="0..1")
+    horizon_days: int = Field(default=5, description="view horizon in days")
+    entry_px: float | None = Field(default=None, description="suggested entry trigger price (USDT); omit if not stated")
+    entry_condition: Literal["gte", "lte", "now"] | None = Field(default=None, description="gte = open when price rises to >= entry, lte = falls to <= entry, now = open at market")
     pending_action: Literal["keep", "reprice", "cancel", "now"] | None = Field(
-        default=None, description="对现有同向条件挂单的态度：keep=保留，reprice=改价（以 entry_px 为准），cancel=撤销，now=改现价；原文没提就省略")
-    reason: str = Field(description="一句话中文理由（≤40字）")
+        default=None, description="attitude to an existing same-direction pending order: keep / reprice at entry_px / cancel / open now at market; omit if not mentioned")
+    reason: str = Field(description="one-line reason in Chinese (<=40 chars)")
 
 
 class StanceList(BaseModel):
@@ -213,24 +225,69 @@ def normalize(s: dict) -> dict:
     return s
 
 
+def cross_check(role: str, prose: dict | None, structured: dict | None) -> dict | None:
+    """P3（2026-11-15 用户修订口径）：自由文本立场是主源，vendor 结构化输出只做交叉校验。
+    LLM 自由表达、代码负责抽取与核对；任何情况都不拒绝、不重问，只把冲突落成标记
+    （cross_check 字段，随决策记录进日报「立场解析健康」）：
+    - 只有结构化（立场行抽不出）：用结构化，记 prose_missing——意见不丢。
+    - 两者都有且方向/价位冲突：立场行完整（非 partial）时以立场行为准（那是分析文本
+      自己的结论）；立场行残缺（抽取含糊）时以结构化为准并补齐缺失价位字段。
+    - 置信度差异过大只记不改（结构化侧是评级映射的粗粒度值）。一致则静默。"""
+    if structured is None:
+        return prose
+    if prose is None:
+        out = dict(structured)
+        out["cross_check"] = "prose_missing: structured output used"
+        return out
+    s = dict(prose)
+    notes = []
+    ambiguous = bool(s.get("partial"))
+    if structured.get("direction") and structured["direction"] != s.get("direction"):
+        if ambiguous:
+            notes.append(f"direction: prose {s.get('direction')} (partial) vs structured "
+                         f"{structured['direction']} -> structured")
+            s["direction"] = structured["direction"]
+        else:
+            notes.append(f"direction: prose {s.get('direction')} vs structured "
+                         f"{structured['direction']} -> prose")
+    for key in ("target", "stop", "entry_px", "entry"):
+        pv, sv = s.get(key), structured.get(key)
+        if pv is not None and sv is not None:
+            if pv and abs(float(sv) - float(pv)) / max(abs(float(pv)), 1e-9) > 0.005:
+                if ambiguous:
+                    notes.append(f"{key}: prose {pv} (partial) vs structured {sv} -> structured")
+                    s[key] = sv
+                else:
+                    notes.append(f"{key}: prose {pv} vs structured {sv} -> prose")
+        elif pv is None and sv is not None and ambiguous:
+            s[key] = sv
+            notes.append(f"{key}: filled from structured (prose partial)")
+    if (structured.get("confidence") is not None and s.get("confidence") is not None
+            and abs(float(structured["confidence"]) - float(s["confidence"])) > 0.35):
+        notes.append(f"confidence: prose {s['confidence']} vs structured "
+                     f"{structured['confidence']} (kept prose)")
+    if notes:
+        s["cross_check"] = "; ".join(notes)
+        if any("-> structured" in n or "filled from structured" in n for n in notes):
+            s["source"] = "结构化+立场行"
+    return s
+
+
 def extract(fs: dict, cfg, tracker=None) -> dict:
     texts = role_texts(fs)
     out = {}
     for r in ROLE_KEYS:
-        s = parse_stance(texts[r])
-        st = parse_structured(r, texts[r])
-        if st and s:   # 结构化方向为准，立场行补充价位
-            s = {**s, **{k: v for k, v in st.items() if v is not None and k in ("direction",)}, "source": "结构化+立场行"}
-        s = s or st
+        s = cross_check(r, parse_stance(texts[r]), parse_structured(r, texts[r]))
         if s:
             out[r] = s
     missing = [r for r in ROLE_KEYS if r not in out and texts[r].strip()]
     if missing:
         model = dllm.make_llm(cfg, "quick", tracker, role="extractor").with_structured_output(StanceList)
-        body = "\n\n".join(f"### 角色键名={r}（{ROLE_CN[r]}）\n{texts[r][-6000:]}" for r in missing)
-        prompt = ("下面是一个加密货币交易团队中各角色关于 " + fs.get("company_of_interest", "") + " 的发言。"
-                  "请逐个角色提取其观点（方向、目标价、止损价、置信度、周期、建议入场价与条件、对现有挂单的态度、一句话理由）。"
-                  "只根据原文，不要推测；原文没写价位就省略该字段。只输出这些角色：" + ", ".join(missing) + "\n\n" + body)
+        body = "\n\n".join(f"### role={r} ({ROLE_CN[r]})\n{texts[r][-6000:]}" for r in missing)
+        prompt = ("Below are statements by roles of a crypto trading desk about " + fs.get("company_of_interest", "") + ". "
+                  "Extract each role's view (direction, target, stop, confidence, horizon, suggested entry + condition, "
+                  "attitude to existing pending orders, one-line reason). Use only the text; do not guess; omit fields the "
+                  "text does not state. Output only these roles: " + ", ".join(missing) + "\n\n" + body)
         try:
             res = model.invoke(prompt)
             for s in res.stances:
@@ -249,9 +306,23 @@ def extract(fs: dict, cfg, tracker=None) -> dict:
     # L4：输入数据缺失的角色记 data_missing（不进共识、不打分）；fs 里没有标记（旧路径）时不动
     dq = (cfg.get("data_quality") or {}) if isinstance(cfg, dict) else {}
     if dq.get("sentiment_requires_x_feed", True) and fs.get("_x_feed") is False:
-        out["sentiment"]["status"] = "data_missing"; out["sentiment"]["data_note"] = "X 讨论摘录缺失"
+        out["sentiment"]["status"] = "data_missing"; out["sentiment"]["data_note"] = "Threads 讨论摘录缺失"
     if fs.get("_flows_missing"):
         out["flows"]["status"] = "data_missing"; out["flows"]["data_note"] = "资金流数据过半获取失败"
+    # P1：分析师工具结果被上限截断 → 落到对应角色的 data_note（不改状态：截断≠数据缺失，
+    # 分析师在结果里也看得到英文内联注记；这里保证它进决策记录的数据缺口口径，绝不静默）。
+    truncs = fs.get("_tool_truncations") or []
+    if truncs:
+        tool_role = {"get_stock_data": "market", "get_indicators": "market", "run_backtest": "market",
+                     "get_verified_market_snapshot": "market", "get_news": "news",
+                     "get_prediction_markets": "news", "get_macro_indicators": "news"}
+        by_role: dict[str, list] = {}
+        for t in truncs:
+            by_role.setdefault(tool_role.get(t.get("tool"), "market"), []).append(t)
+        for r, ts in by_role.items():
+            note = "; ".join(f"tool output truncated: {t.get('tool')} {t.get('chars')}->{t.get('cap')} chars"
+                             for t in ts)
+            out[r]["data_note"] = ((out[r].get("data_note") + "; ") if out[r].get("data_note") else "") + note
         out[r]["horizon_days"] = out[r].get("horizon_days") or cfg["scoring"]["horizon_days"]
         if not out[r].get("reason"):
             fld = None
@@ -298,6 +369,7 @@ def health(decisions, weights) -> dict:
     """统计一组决策记录里加权角色（不含交易经理：执行角色，缺席另有 tm_absent_reason）的解析途径与降级清单。"""
     tiers = {"parsed": 0, "structured": 0, "extracted": 0, "failed": 0, "other": 0}
     bad = []
+    conflicts = []
     roles = [r for r in (weights or {}) if r != "trade_manager"]
     for d in decisions or []:
         st = d.get("stances") or {}
@@ -312,4 +384,6 @@ def health(decisions, weights) -> dict:
             if degraded(s):
                 bad.append({"inst_id": d.get("inst_id"), "role": r, "source": s.get("source"),
                             "status": s.get("status"), "partial": bool(s.get("partial"))})
-    return {"tiers": tiers, "degraded": bad, "total": sum(tiers.values())}
+            if s.get("cross_check"):   # P3：立场行×结构化交叉校验的冲突/补位（日报可见）
+                conflicts.append({"inst_id": d.get("inst_id"), "role": r, "cross_check": s["cross_check"]})
+    return {"tiers": tiers, "degraded": bad, "conflicts": conflicts, "total": sum(tiers.values())}

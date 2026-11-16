@@ -57,7 +57,7 @@ def ta_config(cfg) -> dict:
         "output_language": L.get("output_language", "Chinese"),
         "max_debate_rounds": L.get("max_debate_rounds", 1),
         "max_risk_discuss_rounds": L.get("max_risk_discuss_rounds", 1),
-        "max_tool_rounds": L.get("max_tool_rounds", 8),
+        "max_tool_rounds": L.get("max_tool_rounds", 4),   # P1（2026-11-15 LLM 数据流审查）：分析师工具循环 8→4；市场分析师例外见 tools.install_tool_loop_discipline
         "temperature": L.get("temperature"),
         "llm_max_retries": L.get("max_retries"),
         "holding_period_days": cfg["scoring"]["horizon_days"],

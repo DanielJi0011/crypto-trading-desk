@@ -412,67 +412,69 @@ def to_decision(call: OrderToolCall, ctx: dict):
 
 def instructions(ctx: dict, cfg=None) -> str:
     ex, pos = ctx.get("existing"), ctx.get("pos")
-    lines = ["", "## 下单工具（本次以工具参数为准，代码不再解析你的理由文字）",
-             "讨论汇总之后，请按 OrderToolCall 的固定参数调用一次下单工具。代码只校验必填项与硬护栏，"
-             "不会改你的点位、张数、保留/重挂决定；不通过会把原因与允许范围返回给你，请当场改参数重新调用"
-             f"（最多 {TOOL_MAX_ATTEMPTS} 次，仍不通过按无结论不开仓）。",
-             f"当前加权共识方向：{ctx.get('consensus_side') or '无方向'}（你不能翻转，只能按此方向下单或否决）。",
-             "必填：open/add → side、entry、stop_loss、take_profit；pending/replace_pending → side、trigger_px、condition、stop_loss、"
-             "take_profit、expire_hours；keep_pending → side、trigger_px（现有挂单触发价）、stop_loss、take_profit、expire_hours；"
-             "reduce → reduce_fraction；所有动作都要 invalidation 与 rationale。",
-             "margin_pct 可选：给了就按它定张数（只受硬护栏封顶，超出会拒绝并告诉你上限）；不给按单笔风险×risk_scale 定仓。",
-             "有效期 expire_hours 从挂单时刻起算：pending/replace_pending 从本次新挂单时刻起算；keep_pending 从现有挂单的原挂单时刻起算（不是从现在起算）。"
-             "想沿用现有挂单原到期时刻，就在 keep_pending/replace_pending 设 keep_expiry=true，此时忽略 expire_hours。",
-             "keep_pending（保留挂单）沿用原挂单张数：risk_scale、margin_pct 等张数字段不起作用，不要填（填了会被忽略并在回执中注明）。",
-             "reason/rationale 里的任何操作意图都不会被执行，要动作必须通过 action 字段（例如 reduce 或改 new_tp）；"
-             "不要在理由里写“部分止盈（另行处理）”“回头再调”之类的待办，系统没有后续执行机制。",
-             "预检通过就直接执行，不会再回给你确认；被拒绝时会把本次张数、名义、保证金、止损亏损金额与占权益%一并返回。"]
+    lines = ["", "## Order tool (the tool parameters govern; the code does not parse your rationale text)",
+             "After the discussion, call the order tool once with the fixed OrderToolCall parameters. The code checks only required fields and hard guardrails; "
+             "it never changes your levels, size, or keep/re-hang decision. On failure it returns reasons and allowed ranges: fix and call again on the spot "
+             f"(max {TOOL_MAX_ATTEMPTS} attempts; still failing = no conclusion, no order).",
+             f"Weighted-consensus direction: {ctx.get('consensus_side') or 'none'} (you cannot flip it; order in this direction or veto).",
+             "Required: open/add -> side, entry, stop_loss, take_profit; pending/replace_pending -> side, trigger_px, condition, stop_loss, "
+             "take_profit, expire_hours; keep_pending -> side, trigger_px (the existing order's trigger), stop_loss, take_profit, expire_hours; "
+             "reduce -> reduce_fraction; every action needs invalidation and rationale.",
+             "margin_pct optional: if given, size follows it (hard-guardrail caps only; excess rejected with the cap stated); if omitted, size = per-trade risk x risk_scale.",
+             "expire_hours counts from placement: pending/replace_pending from this new placement; keep_pending from the existing order's ORIGINAL placement time (not from now). "
+             "To keep the original expiry, set keep_expiry=true on keep_pending/replace_pending (expire_hours then ignored).",
+             "keep_pending keeps the original size: size fields (risk_scale, margin_pct) have no effect; do not fill them (filled values are ignored and noted in the receipt).",
+             "Intent written in reason/rationale is never executed; actions must go through the action field (e.g. reduce, or changing new_tp). "
+             "No to-dos like 'partial take-profit (handle separately)' or 'adjust later' in the rationale: there is no follow-up execution mechanism.",
+             "A passed pre-check executes immediately, no confirmation back to you; a rejection returns this call's contracts, notional, margin, stop-loss amount and % of equity with the reasons."]
     lines += baseline_lines(cfg, ctx)
     if ex:
-        lines.append(f"本币现有条件挂单：{ex.get('algoId')} {ex.get('side')} 触发价 {ex.get('trigger_px')} 止损 {ex.get('stop_loss')} "
-                     f"止盈 {ex.get('take_profit')} {ex.get('sz')} 张，原挂单时刻 {ex.get('created') or '未登记'}，到期 {ex.get('expires')}"
-                     f"（keep_pending 的 expire_hours 从原挂单时刻起算）。必须明确 keep_pending / replace_pending / cancel_pending（或 close/reduce）。")
+        lines.append(f"Existing conditional order for this coin: {ex.get('algoId')} {ex.get('side')} trigger {ex.get('trigger_px')} stop {ex.get('stop_loss')} "
+                     f"take-profit {ex.get('take_profit')} {ex.get('sz')} contracts, placed {ex.get('created') or 'n/a'}, expires {ex.get('expires')} "
+                     f"(keep_pending's expire_hours counts from the original placement). You must explicitly choose keep_pending / replace_pending / cancel_pending (or close/reduce).")
     if pos:
-        lines.append(f"本币现有持仓：{pos.get('side')} 均价 {pos.get('avg_px')} 止损 {pos.get('sl_px')} 止盈 {pos.get('tp_px')}；"
-                     "止损只能收紧；同向加仓用 add（现价）或 pending（条件加仓）。")
+        lines.append(f"Existing position in this coin: {pos.get('side')} avg {pos.get('avg_px')} stop {pos.get('sl_px')} take-profit {pos.get('tp_px')}; "
+                     "the stop only tightens; same-direction adds use add (market) or pending (conditional add).")
     tr = ctx.get("trend") or {}
     if tr.get("enabled"):
         _na = float((tr.get("cfg") or {}).get("near_atr", 0.3))
-        lines.append(f"趋势市（以提示词中「本场行情判定（LLM）」为准）时请按趋势市执行规则选 open 或近价 pending；近价指触发价距现价≤{_na:g}×ATR14。")
-        lines.append(f"趋势市里 pending 触发价距现价超过 {_na:g}×ATR14 会被校验退回并注明允许范围，请改近后重试，不要改成 hold 绕过。")
+        lines.append(f"In a trend session (per the 'Regime judgment (LLM)' section), follow the trend execution rules: open or a near-price pending; near-price means trigger within <={_na:g}xATR14 of spot.")
+        lines.append(f"In a trend session, a pending trigger farther than {_na:g}xATR14 from spot will be rejected with the allowed range: move it closer and retry; do not switch to hold to bypass.")
         if tr.get("active"):
             _j = tr.get("judge") or {}
             _atr, _last = float(ctx["mk"].get("atr14") or 0), float(ctx["mk"]["last"])
             _cap = _na * _atr
-            lines.append(f"本币本场行情判定（LLM）：{'空头' if tr.get('side') == 'short' else '多头'}趋势生效"
-                         f"（强度 {_j.get('strength')}，阶段 {_j.get('stage')}），末段衰竭降级={'是' if tr.get('downgrade') else '否'}；现价 {_last:g}，"
-                         f"近价触发允许范围 {_last - _cap:.6g}~{_last + _cap:.6g}。")
+            lines.append(f"Regime judgment for this coin (LLM): {'short' if tr.get('side') == 'short' else 'long'} trend active "
+                         f"(strength {_j.get('strength')}, stage {_j.get('stage')}), late-exhaustion downgrade={'yes' if tr.get('downgrade') else 'no'}; spot {_last:g}, "
+                         f"allowed near-price trigger range {_last - _cap:.6g}~{_last + _cap:.6g}.")
         elif tr.get("failed"):
-            lines.append("本币本场行情判定失败：趋势市规则不生效，按常规规则下单。")
+            lines.append("Regime judgment failed for this coin: trend rules NOT active; use the regular rules.")
         _wk = tr.get("weekly") or {}
         if _wk.get("enabled") and _wk.get("direction") in ("long", "short"):
-            lines.append(f"周线方向过滤（代码按完整周收盘计算）：本场周线方向为{'多头' if _wk['direction'] == 'long' else '空头'}，"
-                         "逆周线方向的 open/pending/replace_pending 会被校验退回（[WEEKLY_DIR]）；"
-                         "共识方向与周线相反时直接 hold 并在 rationale 写明周线过滤，不要尝试下单。")
+            lines.append(f"Weekly direction filter (code, from completed weekly closes): weekly direction is {_wk['direction']}; "
+                         "open/pending/replace_pending against it will be rejected ([WEEKLY_DIR]); "
+                         "if consensus opposes the weekly direction, hold and say 'weekly filter' in the rationale; do not try to order.")
         _h4 = tr.get("h4") or {}
         if _h4.get("enabled"):
             _parts = []
             if _h4.get("swing_high") is not None:
-                _parts.append(f"做空触发价须 ≥ 最近确认 4H 波段高点 {float(_h4['swing_high']):g}")
+                _parts.append(f"short triggers must be >= latest confirmed 4H swing high {float(_h4['swing_high']):g}")
             if _h4.get("swing_low") is not None:
-                _parts.append(f"做多触发价须 ≤ 最近确认 4H 波段低点 {float(_h4['swing_low']):g}")
+                _parts.append(f"long triggers must be <= latest confirmed 4H swing low {float(_h4['swing_low']):g}")
             if _parts:
-                lines.append("4H 入场结构（代码按已收盘 4H K 线计算）：" + "；".join(_parts) +
-                             "，不满足的 open/pending/replace_pending 会被校验退回（[H4_STRUCT]）；"
-                             "触发价正好等于波段点位可以通过。现价 open 按现价比对同一约束。")
+                lines.append("4H entry structure (code, closed 4H bars): " + "; ".join(_parts) +
+                             "; non-conforming open/pending/replace_pending will be rejected ([H4_STRUCT]); "
+                             "a trigger exactly at the swing level passes. Market opens are checked against the same constraint at spot.")
     if cfg is not None and tr.get("enabled"):
         try:
             from desk import demo_exec as _DX
             if _DX.ecfg(cfg)["trailing_stop"].get("enabled"):
-                lines.append("退出方式（代码决定，不用你选）：本场行情判定生效且阶段不是末段衰竭时，你的新仓（指本币当前无持仓时的新开仓）改用移动止损"
-                             "退出、不挂固定止盈单——你给的 take_profit 只用于盈亏比校验与移动止损激活线，请照常按 RR≥1.5 给点位；"
-                             "末段衰竭或无趋势时仍为固定止盈。"
-                             "注意：本币已有持仓时挂的加仓条件单不适用移动止损，仍为固定止盈，take_profit 会真实挂到交易所——写理由时不要把加仓单说成移动止损。")
+                lines.append("Exit mode (code-decided, not yours to choose): when this session's regime judgment is active and the stage is not late_exhaustion, "
+                             "your NEW position (a fresh open while this coin has NO position) exits by trailing stop, no fixed take-profit order; "
+                             "your take_profit serves only the RR check and the trailing activation line, so still give levels at RR>=1.5 as usual; "
+                             "late_exhaustion or no trend keeps the fixed take-profit. "
+                             "Conditional ADD orders placed while this coin has a position do NOT use the trailing stop: fixed take-profit, really on the exchange; "
+                             "never describe an add-on order as trailing-stop in your rationale.")
         except Exception:
             pass
     return "\n".join(lines)
@@ -480,8 +482,8 @@ def instructions(ctx: dict, cfg=None) -> str:
 
 def baseline_lines(cfg, ctx) -> list[str]:
     """按风险定仓的心算口径 + 本币当前基准张数示例（risk_scale=1/0.5，止损距离 2%/4%，含硬上限削减）。取不到数据只给公式。"""
-    out = ["定仓口径：risk_scale 乘以单笔风险 1.5% 的基准得到张数，请按此心算。基准风险金额 = 权益 × 1.5% × 共识强度缩放 × 回撤缩放；"
-           "名义 = 风险金额 × risk_scale ÷ (止损距离% + 0.2% 成本缓冲)；张数 = 名义 ÷ 入场价 ÷ 每张面值；再受单笔保证金、在途风险等硬上限削减。"]
+    out = ["Sizing basis: contracts come from risk_scale x the 1.5% per-trade risk base — do the mental math on this. Base risk amount = equity x 1.5% x consensus-strength scaling x drawdown scaling; "
+           "notional = risk amount x risk_scale / (stop distance % + 0.2% cost buffer); contracts = notional / entry price / contract face value; then clipped by hard caps (per-trade margin, in-flight risk, etc.)."]
     if not cfg:
         return out
     try:
@@ -499,12 +501,12 @@ def baseline_lines(cfg, ctx) -> list[str]:
                 if not r.get("ok"):
                     continue
                 n = float(r["notional"])
-                q = f"{X.contracts(inst, n / px)} 张" if demo else f"{n / px:.6g} 币"
-                ex.append(f"止损距离 {d:.0%}、risk_scale {rs:g} → {q}（名义 {n:,.0f} USDT，止损亏损约 {n * d:,.0f} USDT）")
+                q = f"{X.contracts(inst, n / px)} contracts" if demo else f"{n / px:.6g} coins"
+                ex.append(f"stop distance {d:.0%}, risk_scale {rs:g} -> {q} (notional {n:,.0f} USDT, stop loss approx {n * d:,.0f} USDT)")
                 if rs == 1.0:
                     base = r.get("risk_usd")
         if ex:
-            out.append(f"本币当前基准（入场 {px:g}，基准风险金额约 {float(base):,.0f} USDT）：" + "；".join(ex) + "。")
+            out.append(f"Current baseline for this coin (entry {px:g}, base risk amount approx {float(base):,.0f} USDT): " + "; ".join(ex) + ".")
     except Exception:
         pass
     return out
@@ -543,10 +545,10 @@ def strip_keep_size_fields(call: OrderToolCall) -> tuple[OrderToolCall, dict]:
 def retry_prompt(prompt: str, history: list) -> str:
     if not history:
         return prompt
-    parts = [prompt, "", "## 你之前的工具调用被拒绝，请改参数重新调用"]
+    parts = [prompt, "", "## Your previous tool call was rejected — fix the parameters and call again"]
     for i, h in enumerate(history, 1):
-        parts.append(f"第 {i} 次参数：{json.dumps(h['call'], ensure_ascii=False) if h.get('call') else '（无法解析）'}")
-        parts.append("拒绝原因：" + "；".join(h["errors"]))
+        parts.append(f"Attempt {i} parameters: {json.dumps(h['call'], ensure_ascii=False) if h.get('call') else '(unparseable)'}")
+        parts.append("Rejection reasons: " + "; ".join(h["errors"]))
     return "\n".join(parts)
 
 
