@@ -76,12 +76,6 @@ def window_bj(cfg, s, day: str) -> tuple[_dt.datetime, _dt.datetime]:
     return _at(day, c["window"][0], c["tz"]), _at(day, c["window"][1], c["tz"])
 
 
-def in_window(cfg, s, now: _dt.datetime) -> bool:
-    now = now.astimezone(BJ)
-    a, b = window_bj(cfg, s, now.date().isoformat())
-    return a <= now <= b
-
-
 def missing_at(cfg, s, day: str) -> _dt.datetime:
     """开场后 missing_after_minutes 仍无完成标记 → 告警时刻（北京时区）。"""
     return start_bj(cfg, s, day) + _dt.timedelta(minutes=int(scfg(cfg, s)["missing_after_minutes"]))

@@ -1,4 +1,4 @@
-"""限价入场 + 超时撤单市价补单（全部 mock 交易所 HTTP，不连网、不下单）。"""
+"""限价入场 + 超时撤单重挂（全部 mock 交易所 HTTP，不连网、不下单）。"""
 import pytest
 
 from desk import demo_exec as DX, entry_limit as EL, okx_demo as X, settings
@@ -140,61 +140,30 @@ def test_not_timed_out_waits(fake):
     assert f.posts == []
 
 
-def test_timeout_cancel_and_market_fill_with_attach(fake):
-    f = fake(child_state="live", acc="0"); _reg()
-    assert dict(EL.check_timeouts(_cfg(fallback_market=True), now_ms=LATE))["A1"] == "fallback_done"
-    assert f.paths("/api/v5/trade/cancel-order") == [{"instId": INST, "ordId": "C1"}]
-    m = f.paths("/api/v5/trade/order")
-    assert len(m) == 1 and m[0]["ordType"] == "market" and m[0]["sz"] == "1" and m[0]["side"] == "buy" and m[0]["posSide"] == "long"
-    att = m[0]["attachAlgoOrds"][0]
-    assert att["slTriggerPx"] == "60000" and att["tpTriggerPx"] == "70000" and att["slOrdPx"] == "-1" and att["tpOrdPx"] == "-1"
+def test_check_timeouts_skips_when_locked(fake):
+    fake(); _reg()
+    with EL._locked():
+        assert EL.check_timeouts(_cfg(), now_ms=LATE) == []
 
 
-def test_fully_filled_no_fallback(fake):
+def test_fully_filled_done(fake):
     f = fake(child_state="filled", acc="1"); _reg()
     assert dict(EL.check_timeouts(_cfg(), now_ms=LATE))["A1"] == "filled"
     assert f.posts == []
 
 
-def test_repeat_calls_no_double_fill(fake):
-    f = fake(child_state="live", acc="0"); _reg()
-    EL.check_timeouts(_cfg(fallback_market=True), now_ms=LATE); EL.check_timeouts(_cfg(fallback_market=True), now_ms=LATE + 1)
-    assert len(f.paths("/api/v5/trade/order")) == 1
-    # 中断重入：状态停在 filling 且补单其实已下 → 不再下第二张
-    s = EL._load(); s["entries"]["A1"]["status"] = "filling"; EL._save(s)
-    EL.check_timeouts(_cfg(fallback_market=True), now_ms=LATE + 2)
-    assert len(f.paths("/api/v5/trade/order")) == 1
-    # 拿不到锁时什么都不做
-    with EL._locked():
-        assert EL.check_timeouts(_cfg(), now_ms=LATE + 3) == []
-
-
-def test_partial_fill_sltp_covers_total(fake):
+def test_protect_total_replaces_old_oco_new_first(fake):
+    # _protect_total（重挂路径共用）：按总仓位重挂保护时先挂新 OCO 再撤旧，不出现裸仓
     old = {"algoId": "OLD", "ordType": "oco", "instId": INST, "posSide": "long", "side": "sell", "sz": "0.4", "algoClOrdId": "taold"}
-    f = fake(child_state="partially_filled", acc="0.4", existing_sl=[old],
-             pos={"instId": INST, "posSide": "long", "pos": "1"})
-    _reg()
-    assert dict(EL.check_timeouts(_cfg(fallback_market=True), now_ms=LATE))["A1"] == "fallback_done"
-    m = f.paths("/api/v5/trade/order")
-    assert len(m) == 1 and m[0]["sz"] == "0.6" and "attachAlgoOrds" not in m[0]
+    f = fake(existing_sl=[old], pos={"instId": INST, "posSide": "long", "pos": "1"})
+    e = {"inst": INST, "side": "long", "pos_side": "long", "stop_loss": 60000, "take_profit": 70000}
+    assert EL._protect_total("A1", e) == "NEW"
     oco = f.paths("/api/v5/trade/order-algo")
     assert len(oco) == 1 and oco[0]["sz"] == "1" and oco[0]["ordType"] == "oco" and oco[0]["reduceOnly"] is True
     assert oco[0]["slOrdPx"] == "-1" and oco[0]["tpOrdPx"] == "-1"
-    # 先挂新 OCO 再撤旧的：不出现裸仓
     order = [p for p, _ in f.posts]
     assert order.index("/api/v5/trade/order-algo") < order.index("/api/v5/trade/cancel-algos")
     assert f.paths("/api/v5/trade/cancel-algos") == [[{"instId": INST, "algoId": "OLD"}]]
-
-
-def test_kill_blocks_fallback_but_protects(fake, tmp_path, monkeypatch):
-    f = fake(child_state="partially_filled", acc="0.4", pos={"instId": INST, "posSide": "long", "pos": "0.4"})
-    _reg()
-    from desk import ledger
-    k = tmp_path / "KILL"; k.write_text("x")
-    monkeypatch.setattr(settings, "KILL_PATH", k)
-    assert dict(EL.check_timeouts(_cfg(), now_ms=LATE))["A1"] == "blocked"
-    assert f.paths("/api/v5/trade/order") == []
-    assert f.paths("/api/v5/trade/order-algo")[0]["sz"] == "0.4"   # 已成交部分仍有止损
 
 
 def test_ws_records_trigger_time(fake):
@@ -204,7 +173,7 @@ def test_ws_records_trigger_time(fake):
     assert EL._load()["entries"]["A1"]["triggered_ms"] == T0 + 5
 
 
-# ---------------- 等待/重挂（fallback_market=false，2026-11-11 用户决定：取消市价兜底，就等它触发）
+# ---------------- 等待/重挂（2026-11-11 用户决定：取消市价兜底，就等它触发）
 import json as _json
 
 EXP = "2099-01-01 00:00:00+0800"

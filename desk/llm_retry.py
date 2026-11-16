@@ -269,15 +269,3 @@ def report_lines() -> list[str]:
     for f in FAILURES:
         out.append(f"【需报告用户】LLM 调用重试 {f['attempts'] - 1} 次后仍失败：{f['stage'] or '未知阶段'}，{f['error']}")
     return out
-
-
-def summary_line() -> str | None:
-    parts = []
-    if RETRIES:
-        ok = len(RETRIES) - sum(f["attempts"] - 1 for f in FAILURES)
-        parts.append(f"LLM 可重试错误共重试 {len(RETRIES)} 次（其中 {max(ok, 0)} 次后成功恢复），失败 {len(FAILURES)} 个调用")
-    if SWITCHES:
-        parts.append(f"主 key 故障自动切换备用 key {len(SWITCHES)} 次（备用单价更高，花销见用量小节）")
-    if TRUNCATIONS:
-        parts.append(f"提示词保险丝触发 {len(TRUNCATIONS)} 次（超体积输入已截断至上限内，详见日志）")
-    return "；".join(parts) if parts else None

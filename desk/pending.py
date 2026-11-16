@@ -1,11 +1,11 @@
-"""条件入场单（pending entry）：每币最多一张，新单替换旧单。只做纸面成交。
+"""条件入场单（pending entry）：每币最多一张，新单替换旧单。
 
-存储：state/ledger/pending_entries.json（当前挂单） + state/ledger/pending_events.jsonl（挂单/替换/撤销/触发/成交/拒单事件）。"""
+存储：state/ledger/pending_entries.json（当前挂单） + state/ledger/pending_events.jsonl（挂单/替换/撤销/触发/成交/拒单事件）。
+本模块只管挂单的存取与事件记录；触发判定在模拟盘走 OKX 条件单（desk/entry_limit.py），不在本地。
+（本地分钟线触发判定 find_trigger/expired 原供已退休的纸面监控 desk.monitor 使用，2026-11-15 删除。）"""
 from __future__ import annotations
 
 import datetime as _dt
-
-import pandas as pd
 
 from desk import settings
 
@@ -55,27 +55,3 @@ def cancel(cfg, inst: str, reason: str):
         o = p.pop(inst)
         save(p)
         event("撤销", inst, id=o["id"], reason=reason)
-
-
-def expired(o: dict, now: _dt.datetime) -> bool:
-    return now >= _dt.datetime.strptime(o["expires"], "%Y-%m-%d %H:%M:%S%z")
-
-
-def find_trigger(o: dict, bars: pd.DataFrame, near_pct: float = 0.0):
-    """在 o['last_check_ts_ms'] 之后的已收盘分钟K线里找首次触发。返回 (bar_ts, 成交参考价, 是否真正触及) 或 None。
-    gte：High≥触发价；跳空高开（Open>触发价）按开盘价。lte：Low≤触发价；跳空低开按开盘价。
-    near_pct>0 时（confirm 模式）价格进入触发价 near_pct% 以内也算"接近触发"。"""
-    since = o.get("last_check_ts_ms") or o["created_ts_ms"]
-    t = float(o["trigger_px"])
-    for b in bars[bars.ts >= since].itertuples():
-        if o["condition"] == "gte":
-            if b.High >= t:
-                return int(b.ts), (b.Open if b.Open > t else t), True
-            if near_pct and b.High >= t * (1 - near_pct / 100):
-                return int(b.ts), float(b.Close), False
-        else:
-            if b.Low <= t:
-                return int(b.ts), (b.Open if b.Open < t else t), True
-            if near_pct and b.Low <= t * (1 + near_pct / 100):
-                return int(b.ts), float(b.Close), False
-    return None

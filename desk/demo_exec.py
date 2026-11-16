@@ -2,7 +2,7 @@
 
 !! 禁止实盘：所有网络调用都经 desk/okx_demo.py 的 _request —— 只用 OKX_DEMO_* 密钥、强制 x-simulated-trading: 1、
 !! 启动自检失败即拒绝下单，不回退实盘 key。本模块不写本地纸面账本（trades.csv/account.json），也不写本地 pending。
-!! 两个旧纸面仓（BTC/ETH）只由 desk.monitor（旧仓盯盘）管理，本模块对它们不做任何模拟盘动作，只在护栏里计数。
+!! 旧纸面仓（本地纸面账本）已于 2026-11-15 退休：本模块只反映 OKX 模拟盘账户，不再并入任何本地纸面持仓。
 
 本地只保存元数据 state/ledger/demo_orders.json：
   triggers[algoId] = {inst_id, decision_id, side, expires, horizon_days, ...}   条件单的有效期/来源
@@ -34,8 +34,7 @@ def ecfg(cfg) -> dict:
 TRAILING_DEFAULTS = {"enabled": False, "activation_frac_of_tp": 0.5, "trail_atr_mult": 1.0}
 
 
-ENTRY_LIMIT_DEFAULTS = {"enabled": True, "offset_pct": 0.1, "timeout_minutes": 3, "fallback_market": False, "ws_check_secs": 20,
-                        "fallback_judge_enabled": True, "fallback_judge_model": "deepseek-flash", "fallback_judge_provider": "deepseek"}
+ENTRY_LIMIT_DEFAULTS = {"enabled": True, "offset_pct": 0.1, "timeout_minutes": 3, "ws_check_secs": 20}
 
 
 def entry_limit_px(side: str, trigger_px: float, offset_pct: float, tick: float) -> float:
@@ -157,8 +156,7 @@ def trigger_risk(cfg, triggers) -> list[dict]:
 
 def book(cfg, prices: dict | None = None) -> dict:
     """与 ledger.book 同结构。equity=护栏/仓位基准（execution.equity_basis：initial=state/demo_account.json 初始权益，live=实时）；live_equity=模拟盘实时 USDT 权益。
-    positions 含模拟盘持仓 + 旧纸面仓（legacy=True，只计数、不操作）。"""
-    from desk import ledger
+    positions 只含模拟盘持仓（旧纸面仓并入 book 的 legacy 合并已于 2026-11-15 退休：服务器纸面账本为空，合并恒为空操作）。"""
     _require()
     tick = {c["inst_id"]: c["ticker"] for c in cfg["coins"]}
     r = reg()
@@ -180,16 +178,12 @@ def book(cfg, prices: dict | None = None) -> dict:
                     "contracts": abs(float(p["pos"])), "pos_side": p["posSide"], "avg_px": float(p["avgPx"]), "price": px,
                     "value": margin + upl, "sl_px": sl, "tp_px": tp, "upnl": upl, "entry_time": _ts(p["cTime"]),
                     "deadline": r["positions"].get(inst, {}).get("deadline"), "venue": "okx_demo"})
-    paper = ledger.book(cfg, prices)
-    for p in paper["positions"]:
-        pos.append({**p, "legacy": True, "venue": "paper(旧仓)"})
     live = usdt_equity()
     eq = basis_equity(cfg, live)
-    demo_pos = [p for p in pos if not p.get("legacy")]
     ini = initial_equity() if DEMO_ACCOUNT.exists() else live
-    return {"cash": live - sum(p["value"] for p in demo_pos), "equity": eq, "live_equity": live, "initial": ini,
-            "positions": pos, "exposure": sum(p["notional"] for p in demo_pos), "margin": sum(p["margin"] for p in demo_pos),
-            "triggers": trigger_orders(), "equity_basis": ecfg(cfg)["equity_basis"], "paper_equity": paper["equity"],
+    return {"cash": live - sum(p["value"] for p in pos), "equity": eq, "live_equity": live, "initial": ini,
+            "positions": pos, "exposure": sum(p["notional"] for p in pos), "margin": sum(p["margin"] for p in pos),
+            "triggers": trigger_orders(), "equity_basis": ecfg(cfg)["equity_basis"],
             # R12：在途入场子单（读取失败则 book 失败，护栏拒绝开仓，不按“无挂单”处理）
             "pending_entries": pending_entry_risk(cfg, pending_entry_orders())}
 

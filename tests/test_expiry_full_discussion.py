@@ -44,7 +44,6 @@ def world(monkeypatch, tmp_path):
     monkeypatch.setattr(X, "get", lambda path, **kw: {"data": []})
     monkeypatch.setattr(monitor, "schedule_rediscuss", lambda *a, **k: None)
     monkeypatch.setattr(ED, "SPAWN", lambda args, logfile: w["spawn"].append(args))
-    monkeypatch.setattr(EXP, "_call_tm", lambda *a: (_ for _ in ()).throw(AssertionError("full_discussion 不应调用简化问答")))
     cfg = settings.load_config()
     w["cfg"], w["run"] = cfg, (lambda: demo_watch.run_once(w["cfg"]))
     return w
@@ -62,9 +61,14 @@ def _m(w):
 
 def test_default_mode_is_full_discussion():
     assert EXP.mode(settings.load_config()) == "full_discussion"
-    assert EXP.mode({"expiry_extend": {"enabled": True, "mode": "simple"}}) == "simple"
+    # simple 已于 2026-11-15 退休：未知/旧 mode 值回退 full_discussion
+    assert EXP.mode({"expiry_extend": {"enabled": True, "mode": "simple"}}) == "full_discussion"
     assert EXP.mode({"expiry_extend": {"enabled": True, "mode": "off"}}) == "off"
     assert EXP.mode({"expiry_extend": {"enabled": False}}) == "off"
+    # 配置默认值（原 test_expiry_extend.py::test_config_defaults 的存续部分）：simple 专属键已删
+    c = EXP.ecfg(settings.load_config())
+    assert c["enabled"] is True and c["max_extensions"] == 2
+    assert "max_extend_days" not in c and "retry_delays" not in c and "max_round_attempts" not in c
 
 
 def test_expiry_triggers_full_discussion_once(world):
@@ -164,17 +168,6 @@ def test_mode_off_closes_without_discussion(world):
     world["cfg"]["expiry_extend"]["mode"] = "off"
     world["run"]()
     assert world["spawn"] == [] and world["close"] == ["持有期到期"]
-
-
-def test_mode_simple_uses_tm(world, monkeypatch):
-    world["cfg"]["expiry_extend"]["mode"] = "simple"
-    called = []
-    monkeypatch.setattr(EXP, "_call_tm", lambda cfg, p: called.append(p) or EXP.ExpiryDecision(action="close", rationale="x"))
-    monkeypatch.setattr(EXP, "latest_decision", lambda inst: None)
-    from desk import manager
-    monkeypatch.setattr(manager, "market_ctx", lambda inst: {"last": 104.0})
-    world["run"]()
-    assert called and world["spawn"] == [] and world["close"] == ["持有期到期"]
 
 
 def test_schedule_nonblocking_background(world, monkeypatch):

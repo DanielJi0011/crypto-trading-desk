@@ -44,8 +44,8 @@ def _parse(s):
 
 
 def _expiry(cfg, r, inst, m, pos, now):
-    """2026-10-29 用户决定：到期（或到期前一个检查周期内）由交易经理判断延期或平仓；失败/达上限回退旧行为（到期平仓）。
-    结论与通知标记先写入登记再执行，重启后不重复判断、不重复通知。平仓后只通知，不触发再讨论。
+    """到期处理：full_discussion 模式（默认）走全员讨论（_expiry_full）；mode=off（延期功能关闭）
+    到期直接平仓。simple 简化问答已于 2026-11-15 退休，未知 mode 经 EXP.mode() 回退 full_discussion。
     决策 4（2026-11-15）：exit_mode=trailing 且最新存档判定仍为同向非衰竭趋势时，先自动续一期再谈复核
     （desk/expiry.py trailing_extend_check）；HALT 在调用方已拦，本函数不判。"""
     r.setdefault("positions", {})[inst] = m   # r 可能已在本轮被重新读取，确保写回的是当前这条登记
@@ -63,21 +63,12 @@ def _expiry(cfg, r, inst, m, pos, now):
         return r
     if EXP.mode(cfg) == "full_discussion":
         return _expiry_full(cfg, r, inst, m, pos, now)
-    v = EXP.judge(cfg, inst, pos, m, now)
-    DX.save_reg(r)                        # 先落盘结论（含跨轮尝试计数）
-    if v["action"] == "extend":
-        EXP.apply_extend(m, v); DX.save_reg(r)
-        X.log_event("expiry_extended", inst_id=inst, days=v["days"], new_deadline=m["deadline"],
-                    orig_deadline=m.get("orig_deadline"), extensions=m["extensions"], reason=v["reason"])
-        log(f"{inst} 持有期延期 {v['days']:g} 天至 {m['deadline']}：{v['reason']}")
-        _notify("position_extended", inst_id=inst,
-                message=f"{inst} 持有期到期：交易经理延期 {v['days']:g} 天（新到期 {m['deadline']}，止损止盈不变），原因：{v['reason']}")
+    # mode=off：不延期、到期平仓（旧行为）。平仓后只通知，不触发再讨论。
+    if now < _parse(m["deadline"]):       # 提前窗口内被 due() 唤醒：等真正到期再平
         return r
-    if now < _parse(m["deadline"]):       # 提前窗口内判了平仓：等真正到期再平（结论已记，不重复调用）
-        return r
-    DX.close(cfg, pos, "持有期到期"); log(f"{inst} 持有期到期，已平仓：{v['reason']}")
-    X.log_event("expiry_closed", inst_id=inst, deadline=v.get("deadline"), reason=v["reason"])
-    _notify("position_expired", inst_id=inst, message=f"{inst} 持有期到期，已平仓（{v['reason']}；只通知，不再讨论）")
+    DX.close(cfg, pos, "持有期到期"); log(f"{inst} 持有期到期，已平仓：延期功能关闭（mode=off）")
+    X.log_event("expiry_closed", inst_id=inst, deadline=m["deadline"], reason="延期功能关闭（mode=off），到期平仓", mode="off")
+    _notify("position_expired", inst_id=inst, message=f"{inst} 持有期到期，已平仓（延期功能关闭；只通知，不再讨论）")
     return DX.reg()
 
 
@@ -162,7 +153,7 @@ def run_once(cfg, source: str = "demo_watch 轮询") -> dict:
     except Exception as e:
         log(f"风险复核失败 {type(e).__name__}: {e}")
         X.log_event("trigger_review_error", error=str(e)[:300])
-    # 0) 限价入场超时：触发后限价子单超过 entry_limit.timeout_minutes 未完全成交 → 撤单后按 fallback_market 语义处理（默认 false=等触发/重挂，不市价追单；desk/entry_limit.py）
+    # 0) 限价入场超时：触发后限价子单超过 entry_limit.timeout_minutes 未完全成交 → 撤单后绝不市价追单，未成交剩余按原触发价重挂等触发（desk/entry_limit.py）
     try:
         from desk import entry_limit
         for aid, res in ([] if halt else entry_limit.check_timeouts(cfg)):

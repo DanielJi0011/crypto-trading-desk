@@ -3,8 +3,8 @@
 !! 禁止实盘：所有调用都经 desk/okx_demo.py（OKX_DEMO_* + x-simulated-trading: 1）。只处理本模块登记过的条件单
 !! （place_trigger 在 entry_limit.enabled 时登记），不碰其它任何现有订单。
 
-超时语义由 execution.entry_limit.fallback_market 决定：
-  false（默认，2026-11-11 用户决定「这个兜底就没有必要了，就等它触发」）：取消市价兜底。
+超时语义（唯一语义）：2026-11-11 用户决定取消市价兜底（「这个兜底就没有必要了，就等它触发」），
+    市价兜底路径（含兜底前判定）已于 2026-11-15 代码精简中整套删除，不可恢复。
     超时撤子单后绝不市价追单——过护栏后，只要原到期未过，一律以原触发价/止损止盈/剩余张数
     重挂一张条件单（沿用原到期 expires 与原 decision 关联，可多轮重挂、始终受原到期约束），
     不论现价在触发价的哪一侧：回到等待侧（gte 单现价<触发价 / lte 单现价>触发价）重挂，已穿过
@@ -13,17 +13,12 @@
     作罢的指令）。原到期已过、或触发条件/原到期无法确定（现价等数据取不到）→ 仍以
     entry_missed_no_chase 收尾（fail-safe）。已成交部分照常重挂保护。
     市价兜底事故背景：2026-11-11 ETH 计划 2075、市价兜底成交 2055.74、RR 1.76→1.007。
-  true（旧行为，回滚用）：撤单后市价补剩余（filling/protecting 状态机），且补单发出前先过兜底前判定
-    （desk/fallback_judge.py）：交易经理身份 + 快速模型判断当前价位入场是否仍合理，结论落
-    entries[algoId].fallback_judge 后再执行；否决/判定失败 → result=abandoned，开关 fallback_judge_enabled。
 
 状态文件 state/ledger/entry_limit.json：entries[algoId] = {...,status}
   armed      已挂条件单，未触发
   triggered  已触发，记录 ordId（限价子单）与 triggered_ms（触发时间；demo_ws 收到触发事件时先记，否则取算法单历史 triggerTime/uTime）
   cancelling 已决定撤限价子单（先落盘再发请求）
-  filling    （仅 fallback_market=true）已生成市价补单 clOrdId（先落盘再下单；重入时按 clOrdId 查单，不会重复补单）
-  protecting （仅 fallback_market=true）补单已完成，正在按总仓位重挂止损止盈
-  done       终态（filled / fallback_done / blocked / abandoned / rearmed / missed_no_chase / gone 等，见 result）
+  done       终态（filled / blocked / rearmed / missed_no_chase / nothing_left / rearm_failed / algo_* 等，见 result）
 防重入：fcntl 文件锁 state/ledger/entry_limit.lock（非阻塞，拿不到锁本轮跳过）+ 上述状态机。
 """
 from __future__ import annotations
@@ -191,11 +186,6 @@ def _position_contracts(e) -> float:
     return tot
 
 
-def _det(*parts):
-    from desk.demo_exec import det_id
-    return det_id(*parts)
-
-
 def _place_oco(e, sz) -> str:
     inst = e["inst"]
     sl, tp = e.get("stop_loss"), e.get("take_profit")
@@ -251,7 +241,7 @@ def _protect_add_leg(aid, e):
     return new_id
 
 
-# ------------------------------------------------------------------ 等待/重挂（fallback_market=false）
+# ------------------------------------------------------------------ 等待/重挂
 def _resolve_condition_expires(aid, e):
     """重挂所需的触发条件（gte/lte）与原到期时刻：优先本条登记，其次 demo_orders 登记表
     （触发后 watch 处理完会 pop，只能尽力），再次按 decision_id 查决策记录的 pending。任一来源命中即用。"""
@@ -280,7 +270,7 @@ def _resolve_condition_expires(aid, e):
 
 
 def _wait_or_end(cfg, aid, e, filled, remain) -> str:
-    """fallback_market=false 的超时收尾：绝不市价追单。
+    """超时收尾（唯一语义）：绝不市价追单。
     remain<=0 → nothing_left；护栏不过 → 与旧 blocked 相同收尾（已成交部分照常保护）；
     原到期已过 / 条件或到期无法确定 / 现价读取失败 → entry_missed_no_chase 收尾（fail-safe 不变）；
     其余一律 submit_trigger 以原触发价/止损止盈/剩余张数重挂（原到期、原 decision_id），不论现价
@@ -423,75 +413,7 @@ def _step(cfg, el, aid, e, now_ms) -> str:
             return "filled"
         lot = float(_ct(inst)["lotSz"])
         remain = round((total - filled) / lot) * lot
-        if not el.get("fallback_market"):
-            # 2026-11-11 用户决定：取消市价兜底，就等它触发（等待/重挂语义，见 _wait_or_end）
-            return _wait_or_end(cfg, aid, e, filled, remain)
-        reasons = _guard(cfg, {**e, "accFillSz": X._dec(filled), "remain": X._dec(remain)})
-        if reasons or remain <= 0:
-            X.log_event("entry_limit_fallback_skipped", algoId=aid, inst_id=inst, remain=X._dec(remain), reasons=reasons)
-            if filled > 0:
-                _protect_total(aid, {**e})
-            _update(aid, status="done", result="blocked" if reasons else "nothing_left", accFillSz=X._dec(filled))
-            return "blocked"
-        # 兜底前判定（2026-11-11 用户指令，desk/fallback_judge.py）：护栏通过后、市价补单发出前，
-        # 由交易经理身份 + 快速模型判断当前价位入场是否仍合理。结论先落盘（fallback_judge 字段）再执行，
-        # 重入/重启不重复判定；已记录 proceed 时本段整段跳过，直接走原 filling 路径。
-        prev_judge = e.get("fallback_judge") or {}
-        if prev_judge.get("verdict") not in ("proceed", "abandon"):
-            from desk import fallback_judge
-            if fallback_judge.judge_cfg(cfg)["enabled"]:
-                outcome, facts, judgment = fallback_judge.judge_fallback(
-                    cfg, e, filled=filled, remain=remain, now_ms=now_ms)
-                _update(aid, fallback_judge={"verdict": outcome, "judgment": judgment, "facts": facts,
-                                             "at": settings.now_str()})
-                prev_judge = {"verdict": outcome}
-                if outcome == "proceed":
-                    X.log_event("fallback_judge_proceed", algoId=aid, inst_id=inst,
-                                reason=(judgment or {}).get("reason"), **facts)
-                elif outcome == "skip":
-                    X.log_event("fallback_judge_skipped", algoId=aid, inst_id=inst, **facts)
-                    prev_judge = {"verdict": "proceed"}   # 现价取不到（见 fallback_judge 模块头注）：按旧行为放行
-                else:   # abandon / failed（failed 按未批准处理）：不发市价单，与 blocked 同样收尾
-                    if outcome == "failed":
-                        X.log_event("fallback_judge_failed", algoId=aid, inst_id=inst, **facts)
-                    X.log_event("fallback_abandoned", algoId=aid, inst_id=inst,
-                                judge_outcome=outcome, reason=(judgment or {}).get("reason"), **facts)
-                    if filled > 0:
-                        _protect_total(aid, {**e})
-                    _update(aid, status="done", result="abandoned", accFillSz=X._dec(filled))
-                    return "abandoned"
-        elif prev_judge.get("verdict") == "abandon":   # 判定已落盘否决但上次未及收尾（防御）：直接收尾
-            if filled > 0:
-                _protect_total(aid, {**e})
-            _update(aid, status="done", result="abandoned", accFillSz=X._dec(filled))
-            return "abandoned"
-        e = _update(aid, status="filling", accFillSz=X._dec(filled), remain=X._dec(remain),
-                    fallback_cl=_det("elf", aid, X._dec(remain)), attach_new=filled <= 0)
-        st = "filling"
-    if st == "filling":
-        if _get_order(inst, cl=e["fallback_cl"]) is None:   # 未下过 → 下；已存在则不重复
-            body = {"instId": inst, "tdMode": "isolated", "side": "buy" if e["side"] == "long" else "sell", "ordType": "market",
-                    "sz": e["remain"], "clOrdId": e["fallback_cl"]}
-            if e.get("pos_side", "net") != "net":
-                body["posSide"] = e["pos_side"]
-            if e.get("attach_new"):   # 原子单一点没成交 → 原附带止损止盈不会生成，给补单附带相同的
-                from desk import demo_exec as DX
-                body["attachAlgoOrds"] = [DX._attach(inst, e.get("stop_loss"), e.get("take_profit"))]
-            d = X.post("/api/v5/trade/order", body)["data"][0]
-            X.log_event("entry_limit_fallback_placed", algoId=aid, inst_id=inst, ordId=d.get("ordId"), clOrdId=e["fallback_cl"],
-                        sz=e["remain"], side=e["side"], attach=bool(e.get("attach_new")))
-        else:
-            X.log_event("entry_limit_fallback_exists", algoId=aid, inst_id=inst, clOrdId=e["fallback_cl"])
-        e = _update(aid, status="done" if e.get("attach_new") else "protecting",
-                    result="fallback_done" if e.get("attach_new") else None)
-        if e.get("attach_new"):
-            return "fallback_done"
-        st = "protecting"
-    if st == "protecting":
-        fo = _get_order(inst, cl=e["fallback_cl"])
-        if fo and fo.get("state") not in ("filled", "canceled", "mmp_canceled"):
-            return "protecting"   # 市价补单尚未终态，下轮再挂
-        new_id = _protect_total(aid, e)
-        _update(aid, status="done", result="fallback_done", sltp_algoId=new_id)
-        return "fallback_done"
+        # 2026-11-11 用户决定：取消市价兜底，就等它触发（等待/重挂语义，见 _wait_or_end）；
+        # 市价兜底路径已于 2026-11-15 代码精简中整套删除，本分支即唯一超时语义。
+        return _wait_or_end(cfg, aid, e, filled, remain)
     return st or "unknown"

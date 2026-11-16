@@ -405,21 +405,3 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main()
-
-
-def confirm_quarter(cfg, data: dict, quarter: str) -> list[dict]:
-    """S2：季度确认。把探索期通过的候选按确认期规则重检，门槛用全局累计检验数做 Bonferroni。
-    结果写入 results.jsonl（confirm_of 指向原假设）；不写手册，学习冻结期间只作记录。"""
-    reg = {x["id"]: x for x in settings.read_jsonl(REGISTRY)}
-    seen = {x.get("confirm_of") for x in settings.read_jsonl(RESULTS) if x.get("confirm_of")}
-    ccfg = {**cfg, "research": {**cfg["research"], "phase": "confirm"}}
-    k = global_k(0)
-    out = []
-    for c in settings.read_jsonl(RDIR / "candidates.jsonl"):
-        if c.get("phase") != "explore" or c["id"] in seen or c["id"] not in reg:
-            continue
-        h = {**reg[c["id"]]["hypothesis"], "side": side_of(reg[c["id"]]["hypothesis"])}
-        r = {"id": c["id"] + "-C" + quarter, "confirm_of": c["id"], "role": reg[c["id"]]["role"], "quarter": quarter,
-             "tested": settings.now_str(), **evaluate(h, data, ccfg, k)}
-        settings.append_jsonl(RESULTS, r); out.append(r); seen.add(c["id"])
-    return out

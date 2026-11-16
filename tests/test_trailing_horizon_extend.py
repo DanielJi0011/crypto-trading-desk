@@ -40,13 +40,16 @@ def calls(monkeypatch, tmp_path):
 def world(monkeypatch, tmp_path, calls):
     from desk import demo_watch, entry_limit, demo_ws, monitor, trigger_review, manager
     from desk import trailing_stop, rr_recheck, stop_coverage, reconcile
+    from desk import expiry_discuss as ED
     past = _ts(hours=-1)
     store = {"reg": {"triggers": {}, "positions": {INST: {
         "deadline": past, "opened": _ts(days=-5), "horizon_days": 5, "side": "short",
         "exit_mode": "trailing", "plan_tp": 80.0, "atr14_open": 2.0,
         "trail": {"activated": True, "best_px": 88.0, "stop_px": 95.0}}},
         "watch": {"last_algo_uts": 1}}}
-    w = {"close": [], "sent": [], "tm": [], "store": store, "tmp": tmp_path, "add_verdict": calls}
+    w = {"close": [], "sent": [], "spawn": [], "store": store, "tmp": tmp_path, "add_verdict": calls}
+    monkeypatch.setattr(ED, "DIR", tmp_path / "expiry_discuss")
+    monkeypatch.setattr(ED, "SPAWN", lambda args, logfile: w["spawn"].append(args))
     monkeypatch.setattr(X, "verify", lambda: True)
     monkeypatch.setattr(X, "EVENTS", tmp_path / "ev.jsonl")
     monkeypatch.setattr(trigger_review, "poll", lambda *a, **k: {})
@@ -73,14 +76,9 @@ def world(monkeypatch, tmp_path, calls):
     monkeypatch.setattr(manager, "market_ctx", lambda inst: {"last": 90.0})
     monkeypatch.setattr(EXP, "latest_decision", lambda inst: {"decision_id": "D-1", "consensus": -0.4, "stances": {}})
     monkeypatch.setattr("desk.llm_retry.SLEEP", lambda s: None)
-    w["out"] = EXP.ExpiryDecision(action="close", rationale="到期平仓")
-
-    def _tm(cfg, prompt):
-        w["tm"].append(prompt)
-        return w["out"]
-    monkeypatch.setattr(EXP, "_call_tm", _tm)
     cfg = settings.load_config()
-    cfg["expiry_extend"]["mode"] = "simple"   # 原路径用 simple 模式观察（TM 被调用与否一目了然）
+    # 原路径 = 默认 full_discussion：以「到期全员讨论子进程是否被启动（spawn）」观察是否回落原路径
+    # （simple 简化问答已于 2026-11-15 退休，原 fixture 借它观察 TM 调用）
     w["cfg"], w["run"] = cfg, (lambda: demo_watch.run_once(w["cfg"]))
     return w
 
@@ -99,7 +97,7 @@ def test_trailing_auto_extends_on_fresh_trend_verdict(world):
     world["add_verdict"]()   # short / strong / mid
     world["run"]()
     m = _m(world)
-    assert world["close"] == [] and world["tm"] == []          # 没平仓、没走复核（TM 未被调用）
+    assert world["close"] == [] and world["spawn"] == []       # 没平仓、没走复核（到期讨论未启动）
     assert m["extensions"] == 1 and m["orig_deadline"] == old
     delta = EXP._dt.datetime.strptime(m["deadline"], EXP.FMT) - EXP._dt.datetime.strptime(old, EXP.FMT)
     assert delta == dt.timedelta(days=5)                        # 续一期 = horizon_days
@@ -113,18 +111,15 @@ def test_trailing_auto_extends_on_fresh_trend_verdict(world):
 
 
 def test_second_expiry_rechecks_latest_verdict(world):
-    """续期不是永久通行证：下一期到期时重新读最新判定，已转 late_exhaustion → 走原路径平仓。"""
-    # simple 模式另有累计天数上限 max_extend_days=3 < 一期 horizon 5 天：自动续期经共用的 apply_extend
-    # 累计 extended_days 后，simple 路径会先撞天数上限直接平仓（TM 不被咨询）。本用例要观察的是
-    # 「回落到原路径且 TM 被咨询」，故放宽该 legacy 上限；生产 full_discussion 模式只按次数上限，不受此影响。
-    world["cfg"]["expiry_extend"]["max_extend_days"] = 30
+    """续期不是永久通行证：下一期到期时重新读最新判定，已转 late_exhaustion → 回落原路径（到期全员讨论）。"""
     world["add_verdict"]()
     world["run"]()
     assert _m(world)["extensions"] == 1
     _m(world)["deadline"] = _ts(hours=-1)                       # 模拟下一期到期
     world["add_verdict"](stage="late_exhaustion", signals=["forced_flow_exhaustion"])
     world["run"]()
-    assert world["close"] == ["持有期到期"] and len(world["tm"]) == 1
+    assert world["close"] == [] and len(world["spawn"]) == 1    # 没自动续、没直接平：回落到期讨论
+    assert _m(world)["extensions"] == 1
     assert len([e for e in _events(world) if e["event"] == "horizon_extended_trailing"]) == 1
 
 
@@ -132,26 +127,24 @@ def test_second_expiry_rechecks_latest_verdict(world):
 def test_trailing_late_exhaustion_uses_normal_path(world):
     world["add_verdict"](stage="late_exhaustion", signals=["forced_flow_exhaustion"])
     world["run"]()
-    assert world["close"] == ["持有期到期"] and len(world["tm"]) == 1     # TM 被咨询 = 原路径
+    assert world["close"] == [] and len(world["spawn"]) == 1    # 到期讨论被启动 = 原路径
     assert not [e for e in _events(world) if e["event"] == "horizon_extended_trailing"]
-    assert [e["event"] for e in _events(world)].count("expiry_closed") == 1
+    assert [e["event"] for e in _events(world)].count("expiry_discussion_started") == 1
 
 
 def test_trailing_direction_flip_uses_normal_path(world):
     world["add_verdict"](direction="long")                     # 判定转多，持仓为空单
-    world["out"] = EXP.ExpiryDecision(action="extend", extend_days=2, rationale="再看看")
     world["run"]()
-    assert world["close"] == [] and len(world["tm"]) == 1
-    assert _m(world)["extensions"] == 1 and _m(world)["extended_days"] == 2   # 原路径的 TM 延期
-    assert [e["event"] for e in _events(world)].count("expiry_extended") == 1
-    assert not [e for e in _events(world) if e["event"] == "horizon_extended_trailing"]
+    assert world["close"] == [] and len(world["spawn"]) == 1    # 不自动续：回落到期讨论（结论应用见 test_expiry_full_discussion）
+    assert int(_m(world).get("extensions") or 0) == 0
+    assert not [e for e in _events(world) if e["event"] in ("horizon_extended_trailing", "expiry_extended")]
 
 
 def test_trailing_switch_off_uses_normal_path(world):
     world["cfg"]["execution"]["trailing_horizon_extend"]["enabled"] = False
     world["add_verdict"]()
     world["run"]()
-    assert world["close"] == ["持有期到期"] and len(world["tm"]) == 1
+    assert world["close"] == [] and len(world["spawn"]) == 1
     assert not [e for e in _events(world) if e["event"] == "horizon_extended_trailing"]
 
 
@@ -159,7 +152,7 @@ def test_trailing_cap_reached_no_auto_extend(world):
     _m(world)["extensions"] = 2                                 # config max_extensions=2（所有模式共享总上限）
     world["add_verdict"]()
     world["run"]()
-    assert world["close"] == ["持有期到期"] and world["tm"] == []          # 原路径同样因上限直接平仓
+    assert world["close"] == ["持有期到期"] and world["spawn"] == []          # 原路径同样因上限直接平仓
     assert not [e for e in _events(world) if e["event"] == "horizon_extended_trailing"]
 
 
@@ -168,7 +161,7 @@ def test_fixed_tp_position_with_trend_verdict_uses_normal_path(world):
     _m(world).pop("exit_mode")
     world["add_verdict"]()                                     # 同向强趋势判定也续不了固定止盈仓位
     world["run"]()
-    assert world["close"] == ["持有期到期"] and len(world["tm"]) == 1
+    assert world["close"] == [] and len(world["spawn"]) == 1
     assert not [e for e in _events(world) if e["event"] == "horizon_extended_trailing"]
 
 

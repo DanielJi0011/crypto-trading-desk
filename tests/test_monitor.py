@@ -1,4 +1,6 @@
-"""离线测试：条件入场单触发/过期/护栏拒单/confirm 路径（模拟 LLM）、多空永续、强平、聚合、止损后再讨论限频。"""
+"""离线测试：再讨论调度（限频/在途/续跑）、条件单替换、聚合与 pm_execute 挂单、纸面账本盯市数学。
+（纸面监控 process_pending/run_once 的触发/confirm 测试已随该引擎于 2026-11-15 退休删除；
+schedule_rediscuss 的止损触发语义另由 test_demo_ws.py 覆盖。）"""
 import datetime as dt
 
 import pandas as pd
@@ -20,7 +22,6 @@ def env(monkeypatch):
         kp.unlink()
     monkeypatch.setattr(ledger, "PRICE", lambda inst: 100.0)
     monkeypatch.setattr(ledger, "FUNDING", lambda inst: 0.0001)
-    monkeypatch.setattr(monitor, "LAST", lambda inst: 100.0)
     calls = []
     monkeypatch.setattr(monitor, "SPAWN", lambda args, lf: calls.append(args))
     return cfg, ledger, monitor, pending, calls
@@ -37,47 +38,6 @@ def order(**kw):
          "consensus": 0.5, "ref_px": 100, "reason": "突破"}
     o.update(kw)
     return o
-
-
-def test_idle_no_llm_no_market(env, monkeypatch):
-    cfg, ledger, monitor, pending, _ = env
-    monkeypatch.setattr(monitor, "MIN_BARS", lambda *a: (_ for _ in ()).throw(AssertionError("不应请求行情")))
-    monkeypatch.setattr(monitor, "CONFIRM", lambda *a: (_ for _ in ()).throw(AssertionError("不应调用 LLM")))
-    assert monitor.run_once(cfg) == {"idle": True}
-
-
-def test_long_breakout_fill_with_gap(env, monkeypatch):
-    cfg, ledger, monitor, pending, _ = env
-    o = pending.place(cfg, "BTC-USDT-SWAP", order())
-    t0 = o["created_ts_ms"] + 60_000
-    # 第 2 根跳空高开 107 > 触发 105 → 按开盘价 107 成交（再加滑点）
-    monkeypatch.setattr(monitor, "MIN_BARS", lambda inst, bar: bars([(100, 104, 99, 103), (107, 108, 106, 107)], t0))
-    res = monitor.process_pending(cfg)
-    assert res[0]["result"] == "成交" and res[0]["px"] == pytest.approx(107 * 1.0005)
-    t = ledger.open_trades()[0]
-    m = ledger.meta()[t["trade_id"]]
-    # 1x：保证金 = 名义 / 1；名义 = size_pct 10% × 权益 1000 × 1 = 100（qty 向下取整到 1e-8）
-    fill = 107 * 1.0005
-    assert m["side"] == "long" and m["leverage"] == 1 and m["margin_usd"] == pytest.approx(float(t["notional_usd"]))
-    assert float(t["notional_usd"]) == pytest.approx(100.0, abs=1e-5)
-    # liq_price(long) = entry × (1 − 1/lev + mmr) = entry × (1 − 1 + 0.005)
-    assert m["liq_px"] == pytest.approx(fill * 0.005)
-    assert pending.load() == {}
-    assert [e["type"] for e in pending.events()][-2:] == ["触发", "成交"]
-
-
-def test_short_pullback_fill_and_stop_on_high(env, monkeypatch):
-    cfg, ledger, monitor, pending, _ = env
-    o = pending.place(cfg, "ETH-USDT-SWAP", order(side="short", trigger_px=95.0, condition="lte", stop_loss=100.0,
-                                                   take_profit=85.0, consensus=-0.5))
-    t0 = o["created_ts_ms"] + 60_000
-    monkeypatch.setattr(monitor, "MIN_BARS", lambda inst, bar: bars([(97, 98, 94.5, 95)], t0))
-    res = monitor.process_pending(cfg)
-    assert res[0]["result"] == "成交" and res[0]["side"] == "short" and res[0]["px"] == pytest.approx(95 * 0.9995)
-    # 空单：High 触止损（同一根 K 线也触及止盈 → 按止损）
-    monkeypatch.setattr(ledger, "BARS", lambda inst: bars([(96, 101, 84, 90)], t0 + 3600_000))
-    c = ledger.mark_to_market(cfg)
-    assert c[0]["exit_reason"] == "止损" and float(c[0]["exit_px"]) == 100 and float(c[0]["pnl_usd"]) < 0
 
 
 def test_short_tp_on_low_and_profit_sign(env, monkeypatch):
@@ -113,84 +73,12 @@ def test_liquidation_guard_and_mark(env, monkeypatch):
     assert c[0]["exit_reason"] == "强平" and float(c[0]["pnl_usd"]) == pytest.approx(-info["margin"] - info["fee"], rel=1e-6)
 
 
-def test_expiry(env, monkeypatch):
-    cfg, ledger, monitor, pending, _ = env
-    pending.place(cfg, "BTC-USDT-SWAP", order(expire_hours=1))
-    res = monitor.process_pending(cfg, now=settings.now() + dt.timedelta(hours=2))
-    assert res[0]["result"] == "过期" and pending.load() == {}
-
-
 def test_replace_one_per_coin(env):
     cfg, ledger, monitor, pending, _ = env
     pending.place(cfg, "BTC-USDT-SWAP", order())
     pending.place(cfg, "BTC-USDT-SWAP", order(trigger_px=110.0))
     assert len(pending.load()) == 1 and pending.load()["BTC-USDT-SWAP"]["trigger_px"] == 110.0
     assert "替换" in [e["type"] for e in pending.events()]
-
-
-@pytest.mark.parametrize("case", ["kill", "existing", "consensus", "stop", "daily_loss"])
-def test_guardrail_rejections(env, monkeypatch, case):
-    cfg, ledger, monitor, pending, _ = env
-    kw = {}
-    if case == "kill":
-        ledger.kill_switch_path(cfg).write_text("x")
-    if case == "existing":
-        assert ledger.open_position(cfg, "BTC-USDT-SWAP", 100, 95.0, None, 5, "D0", "t", 1000)[0]
-    if case == "consensus":
-        kw["consensus"] = 0.05
-    if case == "stop":
-        kw["stop_loss"] = 110.0
-    if case == "daily_loss":
-        # 1x：名义 200（保证金 200 = 单笔上限 20%）；入场 100.05，在 70 平仓
-        # 亏 ≈ 1.999×(70−100.05) − 费 ≈ −60.2，超过权益 5%（≈47）→ DAILY_LOSS
-        assert ledger.open_position(cfg, "ETH-USDT-SWAP", 200, 90.0, None, 5, "D0", "t", 1000, leverage=1)[0]
-        ledger.close_position(cfg, ledger.open_trades()[0]["trade_id"], "测试", px=70.0)
-    o = pending.place(cfg, "BTC-USDT-SWAP", order(**kw))
-    monkeypatch.setattr(monitor, "MIN_BARS", lambda inst, bar: bars([(104, 106, 103, 105)], o["created_ts_ms"] + 60_000))
-    res = monitor.process_pending(cfg)
-    assert res[0]["result"] == "拒单", res
-    assert pending.load() == {}
-    if case == "daily_loss":
-        assert any("DAILY_LOSS" in r for r in res[0]["reasons"])
-    if case == "kill":
-        ledger.kill_switch_path(cfg).unlink()
-
-
-def test_confirm_path(env, monkeypatch):
-    cfg, ledger, monitor, pending, _ = env
-    cfg = {**cfg, "pending": {**cfg["pending"], "mode": "confirm", "near_pct": 0.5}}
-    seen = []
-
-    def fake_confirm(c, coin, o, ctx):
-        seen.append(ctx)
-        return monitor.EntryConfirm(confirm=len(seen) > 1, reason="模拟")
-    monkeypatch.setattr(monitor, "CONFIRM", fake_confirm)
-    # 第一次：价格进入 0.5% 以内（104.6）但未触及 → 请求确认 → 跳过 → 撤单
-    o = pending.place(cfg, "BTC-USDT-SWAP", order())
-    monkeypatch.setattr(monitor, "MIN_BARS", lambda inst, bar: bars([(104, 104.6, 103, 104.5)], o["created_ts_ms"] + 60_000))
-    assert monitor.process_pending(cfg)[0]["result"] == "跳过" and not seen[0]["hit"]
-    assert pending.load() == {}
-    # 第二次：真实触及 → 确认 → 成交
-    o = pending.place(cfg, "BTC-USDT-SWAP", order())
-    monkeypatch.setattr(monitor, "MIN_BARS", lambda inst, bar: bars([(104, 106, 103, 105.5)], o["created_ts_ms"] + 60_000))
-    assert monitor.process_pending(cfg)[0]["result"] == "成交" and seen[1]["hit"]
-
-
-def test_stop_triggers_rediscuss_once_with_cooldown(env, monkeypatch):
-    cfg, ledger, monitor, pending, calls = env
-    ok, info = ledger.open_position(cfg, "BTC-USDT-SWAP", 200, 95.0, None, 5, "D", "t", 1000)
-    t0 = int(settings.now().timestamp() * 1000) + 60_000
-    monkeypatch.setattr(monitor, "MIN_BARS", lambda inst, bar: bars([(96, 97, 94, 95)], t0))
-    monitor.run_once(cfg)
-    assert calls == [["--coin", "BTC", "--event", info["trade_id"], "--reason", "sl"]]
-    tr = [t for t in ledger.store.read_trades() if t["trade_id"] == info["trade_id"]][0]
-    # 新语义（2026-11-09）：启动只记在途，未完成前重复调度不重复启动；完成落盘后才算已讨论
-    assert monitor.schedule_rediscuss(cfg, tr) == "再讨论进行中" and len(calls) == 1
-    assert monitor.complete_rediscuss(tr["inst_id"], tr["trade_id"]) is True
-    assert monitor.schedule_rediscuss(cfg, tr) == "该事件已讨论过"
-    ok, info2 = ledger.open_position(cfg, "BTC-USDT-SWAP", 200, 95.0, None, 5, "D2", "t", 1000)
-    tr2 = dict(tr, trade_id=info2["trade_id"])
-    assert monitor.schedule_rediscuss(cfg, tr2) == "冷却中" and len(calls) == 1
 
 
 def test_rediscuss_stale_inflight_resumes_and_spawn_failure_retries(env, monkeypatch):
