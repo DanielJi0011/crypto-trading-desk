@@ -37,7 +37,7 @@ class OrderToolCall(BaseModel):
     leverage: float = Field(default=1, description="杠杆（只作上限，新开仓上限由代码强制）")
     expire_hours: float | None = Field(default=None, description="pending/replace_pending/keep_pending 必填（keep_expiry=true 时可不填）：有效期小时，"
                                        "从挂单时刻起算：pending/replace_pending 从本次新挂单时刻起算；keep_pending 从现有挂单的原挂单时刻起算（不是从现在起算）")
-    keep_expiry: bool = Field(default=False, description="仅 keep_pending/replace_pending 可用：true=沿用现有挂单原到期时刻，忽略 expire_hours")
+    keep_expiry: bool = Field(default=False, description="仅 keep_pending/replace_pending 可用：true=沿用现有挂单原到期时刻，忽略 expire_hours；若原到期早于下一场开场后 2 小时，系统会自动顺延到下一场开场后 2 小时")
     new_stop: float | None = Field(default=None, description="hold/reduce 有持仓时可选：新止损（只能收紧）")
     new_tp: float | None = Field(default=None, description="hold/reduce 有持仓时可选：新止盈（须在现价盈利一侧）")
     reduce_fraction: float | None = Field(default=None, description="reduce 必填：减仓比例 0.1~0.9")

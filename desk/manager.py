@@ -747,6 +747,60 @@ def keep_same_trigger(cfg, inst, mk, agg, ex, tm, notes, bk=None) -> dict:
     return info
 
 
+def next_session_expiry_floor(cfg):
+    """保留/重挂（keep_expiry）条件单的到期下限：下一场开场 + 2 小时（北京时间 aware datetime）。
+
+    2026-11-16 用户批准：晚场保留一张早场挂的单时若沿用原到期，单子可能在保留决定后几十分钟内
+    到期（如 ETH 1860 单 21:21 保留、21:50 到期），保留决定形同虚设。下限保证被保留的单至少
+    活到下一个例行决策点之后。开场时刻一律经 sessions.start_bj 从 config 读，不硬编码。
+
+    2026-11-19 修正（用户批准）：正在跑的这一场不算“下一场”。场次实际开跑时刻可早于 config
+    名义开场（早场定时器 07:35、config 写 08:00）：2026-11-19 早场 07:57 的 SOL 保留决定按旧
+    逻辑把 08:00 当“下一场”，下限算成 10:00、低于原到期 21:18，下限静默失效、单子没被顺延。
+    now 落在某场窗口内时，该场的开场时刻跳过，下限落到再下一场。"""
+    import datetime as _d
+    from desk import sessions
+    now = settings.now()
+    today = now.astimezone(sessions.BJ).date()
+    running = []
+    for off in (-1, 0, 1):
+        day = (today + _d.timedelta(days=off)).isoformat()
+        for s in sessions.SESSIONS:
+            w0, w1 = sessions.window_bj(cfg, s, day)
+            if w0 <= now <= w1:
+                running.append((w0, w1))
+    starts = [sessions.start_bj(cfg, s, (today + _d.timedelta(days=off)).isoformat())
+              for off in (0, 1, 2) for s in sessions.SESSIONS]
+    nxt = min(t for t in starts
+              if t > now and not any(w0 <= t <= w1 for w0, w1 in running))
+    return nxt + _d.timedelta(hours=2)
+
+
+def enforce_keep_expiry_floor(cfg, inst, algo_id, notes) -> dict | None:
+    """keep_pending 执行后强制到期下限：登记表到期早于下一场下限 → 顺延到下限并记事件；否则不动。
+    在 apply_tm_expiry 之后执行，覆盖其算出的结果（apply_tm_expiry 本身的语义不变）。"""
+    import datetime as _d
+    from desk import demo_exec as DX, okx_demo
+    fmt = "%Y-%m-%d %H:%M:%S%z"
+    m = (DX.reg().get("triggers") or {}).get(str(algo_id)) or {}
+    old = m.get("expires")
+    if not old:
+        return None
+    try:
+        old_dt = _d.datetime.strptime(old, fmt)
+    except (TypeError, ValueError):
+        return None
+    floor = next_session_expiry_floor(cfg)
+    if floor <= old_dt:
+        return None
+    new = floor.strftime(fmt)
+    if not DX.set_trigger_expiry(inst, str(algo_id), new, "保留顺延至下一场开场后2小时"):
+        return None
+    okx_demo.log_event("expiry_extended_on_keep", inst_id=inst, algoId=str(algo_id), old=old, new=new)
+    notes.append(f"条件单 {algo_id} 到期顺延：{old} → {new}（保留顺延至下一场开场后 2 小时）")
+    return {"old": old, "new": new}
+
+
 def apply_tm_expiry(cfg, inst, algo_id, tm, notes) -> dict | None:
     """保留现有挂单时，有效期按交易经理 entry_expire_hours，自原挂单时刻起算（只改登记表 expires，到期由 expiry 模块撤单）。
     算出的到期已过 → 不改并写明。返回 {old, new} 或 None。"""
@@ -1029,12 +1083,22 @@ def _pm_execute_tool(cfg, coin, did, st, w, mk, bk, pos, rationale, source, tm, 
     # 执行时不挂固定止盈（tp=None），计划止盈与开仓 ATR 随登记落盘，供 desk/trailing_stop.py 棘轮接管。
     trail = getattr(tm, "_trailing_exit", None)
     agg["exit_mode"] = "trailing" if trail else "fixed"
-    if t.get("keep_expiry_at") and a == "replace_pending":   # keep_expiry：新单沿用原到期时刻，按执行时剩余小时重算
+    if t.get("keep_expiry_at") and a == "replace_pending":   # keep_expiry：新单沿用原到期时刻（不早于下一场下限），按执行时剩余小时重算
         from desk import tm_order_tool as _T
-        h = _T.remaining_hours(t["keep_expiry_at"])
-        if h:
+        target = _T._parse_ts(t["keep_expiry_at"])
+        if target is not None and target.tzinfo is None:
+            target = target.replace(tzinfo=settings.now().tzinfo)
+        floor = next_session_expiry_floor(cfg)
+        if target is not None and floor > target:
+            h = (floor - settings.now()).total_seconds() / 3600
             tm.entry_expire_hours = h
-            notes.append(f"keep_expiry：重挂单沿用原到期时刻 {t['keep_expiry_at']}（剩余 {h:.2f} 小时）")
+            notes.append(f"keep_expiry：原到期时刻 {t['keep_expiry_at']} 早于下一场开场后 2 小时，"
+                         f"重挂单到期顺延至 {floor.strftime('%Y-%m-%d %H:%M:%S%z')}（剩余 {h:.2f} 小时）")
+        else:
+            h = _T.remaining_hours(t["keep_expiry_at"])
+            if h:
+                tm.entry_expire_hours = h
+                notes.append(f"keep_expiry：重挂单沿用原到期时刻 {t['keep_expiry_at']}（剩余 {h:.2f} 小时）")
     elif t.get("keep_expiry_at") and a == "keep_pending":
         notes.append(f"keep_expiry：保留挂单沿用原到期时刻 {t['keep_expiry_at']}，不按 expire_hours 重算")
     try:
@@ -1068,6 +1132,9 @@ def _pm_execute_tool(cfg, coin, did, st, w, mk, bk, pos, rationale, source, tm, 
             exp_chg = apply_tm_expiry(cfg, inst, pend.get("algoId") or ex["algoId"], tm, notes)
             if exp_chg:
                 pend["expires_changed"] = exp_chg
+            fl_chg = enforce_keep_expiry_floor(cfg, inst, pend.get("algoId") or ex["algoId"], notes)
+            if fl_chg:
+                pend["expires_changed"] = fl_chg
         elif a in ("open", "add") and drift.skip(cfg, inst, did, mk, agg, notes, "add" if pos else "open"):
             action = "hold(价格漂移)"
         else:
