@@ -31,6 +31,12 @@ execution:
     enabled: true                       # 开关：false=全部仓位固定止盈（改动前行为）
     activation_frac_of_tp: 0.5          # 激活线：价格向有利方向走出「计划止盈距离」的这一比例后，移动止损开始跟踪
     trail_atr_mult: 1.0                 # 跟踪距离 = 该倍数 × 开仓时 ATR14（日线口径，与止损标尺同源）
+  # 保本锁（desk/breakeven_lock.py；2026-11-20 用户批准）：固定止盈核心仓（非移动止损、开仓时非末段衰竭、
+  # 非条件加仓腿）的浮盈达到 1R（开仓原始止损距离，下单时冻结、禁止用收紧后的现止损重算）后，demo_watch
+  # 把止损移到入场价正点位（只进不退）；保本出场记独立原因 breakeven_lock、不进止损披露、唤醒再讨论。
+  breakeven_lock:
+    enabled: true                       # 开关：false=不标记资格、不上锁（改动前行为）
+    trigger_r: 1.0                      # 触发线：浮盈达到该倍数 × R（原始止损距离）时上锁
   # 移动止损仓位持有期自动续期（desk/expiry.py trailing_extend_check；2026-11-15 用户批准，决策 4）：exit_mode=trailing
   # 的持仓到期时，若该币最新存档行情判定（代码门后的生效阶段）仍为与持仓同向、强度 strong/moderate、非 late_exhaustion
   # 的趋势，自动续一期（horizon_days），不触发到期复核；判定转弱/衰竭/反向/失败 → 走原到期路径。每次到期重新核对
@@ -79,16 +85,16 @@ providers:
 role_models:   # 用户要求：四家：grok-4.7 / gpt-6.1-sol / claude-opus-5-5（2026-10-27 接入）/ deepseek-flash（用户所说 deepseek-4.1-flash 在 API 中的 id）
   market:            {provider: deepseek, model: deepseek-flash, tier: quick, reasoning: medium}
   sentiment:         {provider: grok, model: grok-4.7, tier: quick, reasoning: medium}
-  news:              {provider: gpt, model: gpt-6.1-sol, tier: quick, reasoning: medium}
+  news:              {provider: gpt, model: gpt-6.2-sol, tier: quick, reasoning: medium}
   flows:             {provider: deepseek, model: deepseek-flash, tier: quick, reasoning: medium}
   bull:              {provider: grok, model: grok-4.7, tier: quick, reasoning: medium}
   bear:              {provider: grok, model: grok-4.7, tier: quick, reasoning: medium}
   research_manager:  {provider: claude, model: claude-opus-5-5, tier: deep, reasoning: high}
-  trader:            {provider: gpt, model: gpt-6.1-sol, tier: quick, reasoning: medium}
+  trader:            {provider: gpt, model: gpt-6.2-sol, tier: quick, reasoning: medium}
   aggressive:        {provider: grok, model: grok-4.7, tier: quick, reasoning: medium}
   conservative:      {provider: claude, model: claude-opus-5-5, tier: quick, reasoning: medium}
-  neutral:           {provider: gpt, model: gpt-6.1-sol, tier: quick, reasoning: medium}
-  portfolio_manager: {provider: gpt, model: gpt-6.1-sol, tier: deep, reasoning: high}
+  neutral:           {provider: gpt, model: gpt-6.2-sol, tier: quick, reasoning: medium}
+  portfolio_manager: {provider: gpt, model: gpt-6.2-sol, tier: deep, reasoning: high}
   trade_manager:     {provider: claude, model: claude-opus-5-5, tier: deep, reasoning: high}
   reviewer:          {provider: claude, model: claude-opus-5-5, tier: deep, reasoning: high}
   extractor:         {provider: deepseek, model: deepseek-flash, tier: quick, reasoning: medium}
@@ -100,7 +106,7 @@ coins:                                  # TradingAgents 代码 -> OKX USDT 永�
   - {ticker: SOL-USD, inst_id: SOL-USDT-SWAP, name: Solana}
 
 parallel:                               # 三币并行分析（2026-10-28 新增，默认关闭；用户同意后再改 true）
-  enabled: true                         # false：原串行流程（逐币 读账户→分析→立场→决策执行），行为完全不变
+  enabled: false                        # 2026-11-21 定时场次断点续跑 Plan A（用户批准）：定时场次改串行 + 开存档点；false：原串行流程（逐币 读账户→分析→立场→决策执行），行为完全不变
                                         # true：只让各币"分析+立场提取"（等模型的部分）同时跑，三路全开不设上限、不错开启动；
                                         #       账户在本场开始时由主线程按币顺序读取；决策与下单仍在主线程按 coins 顺序（BTC→ETH→SOL）串行，
                                         #       护栏在 R8 锁内重读账户计算，与串行一致；重试策略不变（SDK max_retries + llm.retry_delays）
@@ -218,6 +224,7 @@ manager:
   # 行情判定独立：判定失败但特征表在时过滤照常生效。整层仍受 trend_rule_enabled 总开关约束。
   weekly_filter:
     enabled: true                       # 开关：false=周线方向只进特征表展示，不拦截任何下单
+    mode: advisory                      # 2026-11-21 门收敛（用户批准）：advisory=只计算/披露/留痕不硬拦（默认）；block=恢复逆周线硬拦
   # 4H 入场结构（2026-11-15 用户批准，desk/regime_judge.py）：周期框架定稿的一环——4H 只做入场触发
   # 微调：代码按已收盘 4H K 线算最近确认波段高/低点，做空触发价不得低于波段高点、做多触发价不得
   # 高于波段低点（validate §3.8 [H4_STRUCT]，作用域 open/pending/replace_pending；恰等于可过）；

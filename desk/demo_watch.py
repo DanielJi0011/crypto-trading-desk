@@ -204,6 +204,8 @@ def run_once(cfg, source: str = "demo_watch 轮询") -> dict:
                 r["positions"][m["inst_id"]].update({"exit_mode": "trailing", "plan_tp": m.get("plan_tp"),
                                                      "atr14_open": m.get("atr14_open"),
                                                      "trail": {"activated": False, "best_px": None, "stop_px": m.get("stop_loss")}})
+            if m.get("breakeven"):   # 保本锁资格：冻结 R 元数据随登记落盘（desk/breakeven_lock.py）
+                r["positions"][m["inst_id"]]["breakeven"] = dict(m["breakeven"])
             X.log_event("trigger_fired", inst_id=m["inst_id"], algoId=aid, ordId=child)
             _adv(aid, "triggered", inst_id=m["inst_id"], child_ordId=child)
             log(f"条件单 {aid} {m['inst_id']} 已触发（子单 {child}，成交以子单状态为准）")
@@ -232,6 +234,8 @@ def run_once(cfg, source: str = "demo_watch 轮询") -> dict:
             X.log_event("registry_position_cleared", inst_id=inst, child_ordId=m.get("child_ordId"), verdict=verdict)
             from desk import trailing_stop as _tsexit   # 移动止损仓位：清登记前暂存退出标记，供第 3 步止损事件区分 reason
             _tsexit.note_exit(r, inst, m, int(now.timestamp() * 1000))
+            from desk import breakeven_lock as _beexit   # 保本锁仓位：同一暂存机制，供第 3 步区分 breakeven_lock
+            _beexit.note_exit(r, inst, m, int(now.timestamp() * 1000))
             k = _es_key(m)
             if ES.get(k) in ("filled", "partial"):
                 if ES.get(k) == "partial":
@@ -292,6 +296,16 @@ def run_once(cfg, source: str = "demo_watch 轮询") -> dict:
         except Exception as e:
             log(f"移动止损棘轮失败 {type(e).__name__}: {e}")
             X.log_event("trailing_stop_error", error=str(e)[:300])
+    # 2f) 保本锁（2026-11-20）：登记了 breakeven 资格的固定止盈核心仓——浮盈达到 1R（冻结口径）时把止损
+    #     移到入场价（desk/breakeven_lock.py）。HALT 全冻结期间零动作（check 内再守一道，双保险）。
+    if not halt:
+        try:
+            from desk import breakeven_lock
+            for line in breakeven_lock.check(cfg):
+                log(line)
+        except Exception as e:
+            log(f"保本锁检查失败 {type(e).__name__}: {e}")
+            X.log_event("breakeven_lock_error", error=str(e)[:300])
     # 3) 止损/止盈检测 → 再讨论
     from desk.monitor import schedule_rediscuss
     cur = int(r["watch"].get("last_algo_uts") or int(now.timestamp() * 1000))
@@ -301,6 +315,7 @@ def run_once(cfg, source: str = "demo_watch 轮询") -> dict:
     first = "handled_algos" not in r["watch"]
     handled = r["watch"].setdefault("handled_algos", {})
     trailing_hits = []   # 本轮判定为移动止损退出的币：暂存消费要在末尾重读的登记上落盘
+    breakeven_hits = []   # 同上：保本锁退出暂存的消费落盘
     floor = int(now.timestamp() * 1000) - RESCAN_MS
     for t in ("oco", "conditional"):
         for a in X.get("/api/v5/trade/orders-algo-history", ordType=t, state="effective", instType="SWAP").get("data", []):
@@ -325,6 +340,14 @@ def run_once(cfg, source: str = "demo_watch 轮询") -> dict:
                     if _tsr.position_is_trailing(a["instId"]) or _tsr.consume_exit_reason(r, a["instId"], u):
                         reason, why = "trailing_stop", "移动止损"
                         trailing_hits.append(a["instId"])
+                    else:
+                        # 保本锁出场同理：登记还在时按 locked 标记、已清时按暂存标记，均须出场价≈入场价，
+                        # 命中则 reason=breakeven_lock 唤醒再讨论，且不记止损冷却（中性退出，记入会污染披露）
+                        from desk import breakeven_lock as _ber
+                        _be_px = float(a["actualPx"]) if a.get("actualPx") else None
+                        if _ber.match_exit(r, a["instId"], u, _be_px):
+                            reason, why = "breakeven_lock", "保本锁"
+                            breakeven_hits.append(a["instId"])
                 X.log_event("stop_detected" if a["actualSide"] == "sl" else "tp_detected", inst_id=a["instId"], algoId=a["algoId"], px=a.get("actualPx"))
                 if reason == "sl":   # 止盈/移动止损不记止损冷却（不禁止同向）
                     try:   # L6：记下被止损方向
@@ -346,8 +369,12 @@ def run_once(cfg, source: str = "demo_watch 轮询") -> dict:
     r["watch"]["handled_algos"] = {**{k: v for k, v in (r["watch"].get("handled_algos") or {}).items() if v >= floor - RESCAN_MS}, **keep}
     for _ti in trailing_hits:   # 移动止损退出暂存的消费落盘（第 3 步中途的 r 在此处被重读，只改内存副本不算数）
         (r["watch"].get("trailing_exits") or {}).pop(_ti, None)
+    for _bi in breakeven_hits:   # 保本锁退出暂存的消费落盘（同上）
+        (r["watch"].get("breakeven_exits") or {}).pop(_bi, None)
     from desk import trailing_stop as _tsp
     _tsp.prune_stash(r, floor - RESCAN_MS)
+    from desk import breakeven_lock as _bsp
+    _bsp.prune_stash(r, floor - RESCAN_MS)
     DX.save_reg(r)
     log(f"完成：模拟盘持仓 {len(held)}，条件单 {len(live)}，权益基准 {bk['equity']:.2f}（实时 {bk['live_equity']:.2f}）")
     return {"ok": True}

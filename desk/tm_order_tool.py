@@ -103,6 +103,7 @@ def validate(cfg, call: OrderToolCall, ctx: dict) -> list[str]:
     a, pos, ex, cs = call.action, ctx.get("pos"), ctx.get("existing"), ctx.get("consensus_side")
     mk, bk, inst = ctx["mk"], ctx["bk"], ctx["inst"]
     rc = sizing.rcfg(cfg)
+    ctx.pop("_gate_notes", None)   # 门收敛留痕（§3.5 让位 / §3.7 周线咨询 / §3.8 突破保底）：每轮校验重记，避免重试间串味
     # 1) 必填项
     miss = [k for k in required(call) if (getattr(call, k) in (None, "") if k in ("side", "condition") else _num(getattr(call, k)) is None)]
     if not (call.invalidation or "").strip():
@@ -149,6 +150,7 @@ def validate(cfg, call: OrderToolCall, ctx: dict) -> list[str]:
     # 3.5) 趋势市护栏（2026-11-11 改版：判定来源为 LLM 行情判定，desk/regime_judge）：只在本场判定生效
     #      （方向与下单方向一致且强度 strong/moderate）时触发；判定失败/无趋势完全不触发。
     #      作用域 = 新入场 open/pending/replace_pending（keep_pending 沿用原单，不在此列）。
+    #      2026-11-21 门收敛：近价带与 §3.8 波段位冲突时 H4 优先（近价带单侧放宽到波段位），让位放行留痕。
     tr = ctx.get("trend") or {}
     if tr.get("enabled") and tr.get("active") and a in ("open", "pending", "replace_pending") and call.side == tr.get("side"):
         tc = tr.get("cfg") or {}
@@ -163,12 +165,28 @@ def validate(cfg, call: OrderToolCall, ctx: dict) -> list[str]:
                 errs.append(f"[TREND_OVERSOLD] 本场行情判定为末段衰竭（late_exhaustion）降级中：risk_scale={rs:g} 超过降级上限 {rs_cap:g}，请改小后重试")
         if a in ("pending", "replace_pending") and atr > 0 and _num(call.trigger_px):
             cap = float(tc.get("near_atr", 0.3)) * atr
-            dist = abs(float(call.trigger_px) - last)
-            if dist > cap + 1e-9:
-                errs.append(f"[TREND_DIST] 趋势市近价护栏（依本场 LLM 行情判定）：触发价 {float(call.trigger_px):g} 距现价 {last:g} 为 {dist:.6g}，"
+            trig = float(call.trigger_px)
+            lo_b, hi_b = last - cap, last + cap
+            # 入场门优先级（2026-11-21 门收敛，用户批准）：近价带边缘与 §3.8 的 4H 波段位冲突时
+            # H4 优先——做空把近价上限放宽到波段高点、做多把下限放宽到波段低点（另一侧不变）。
+            # 波段值只认 regime 里的代码计算值、且结构门启用时才让位；波段缺失/结构门关闭维持原带。
+            _h4 = (ctx.get("trend") or {}).get("h4") or {}
+            _yield_to = None
+            if _h4.get("enabled"):
+                if call.side == "short" and _h4.get("swing_high") is not None and float(_h4["swing_high"]) > hi_b:
+                    hi_b = _yield_to = float(_h4["swing_high"])
+                elif call.side == "long" and _h4.get("swing_low") is not None and float(_h4["swing_low"]) < lo_b:
+                    lo_b = _yield_to = float(_h4["swing_low"])
+            if trig < lo_b - 1e-9 or trig > hi_b + 1e-9:
+                errs.append(f"[TREND_DIST] 趋势市近价护栏（依本场 LLM 行情判定）：触发价 {trig:g} 距现价 {last:g} 为 {abs(trig - last):.6g}，"
                             f"超过上限 {float(tc.get('near_atr', 0.3)):g}×ATR14={cap:.6g}；允许触发价范围 "
-                            f"{last - cap:.6g}~{last + cap:.6g}（gte 小反弹或 lte 跌破均可），请改近后重试，"
+                            f"{lo_b:.6g}~{hi_b:.6g}（gte 小反弹或 lte 跌破均可），请改近后重试，"
                             "或改用 open 现价入场，不要改成 hold 绕过")
+            elif _yield_to is not None and abs(trig - last) > cap + 1e-9:
+                # 触发价超出原近价带、靠 H4 让位才放行 → 留痕（经 to_decision 进决策记录）
+                ctx.setdefault("_gate_notes", []).append(
+                    f"[TREND_DIST→H4_STRUCT] 近价门与 4H 结构门冲突：H4 优先，近价带放宽至波段位 {_yield_to:g}"
+                    f"（TREND_DIST yielded to H4_STRUCT），触发价 {trig:g} 在放宽范围内放行")
         if errs:
             return errs
     # 3.6) 移动止损退出标记（2026-11-14 用户批准，desk/trailing_stop.py）：趋势市生效（方向一致、强度
@@ -181,27 +199,67 @@ def validate(cfg, call: OrderToolCall, ctx: dict) -> list[str]:
                 and not tr.get("downgrade") and call.side and call.side == tr.get("side")
                 and _num(call.take_profit) and float(mk.get("atr14") or 0) > 0):
             ctx["_trailing_exit"] = {"plan_tp": float(call.take_profit), "atr14": float(mk["atr14"])}
+    # 3.6b) 保本锁资格标记（2026-11-20 用户批准，desk/breakeven_lock.py）：作用域与 §3.6 相同的新入场
+    #       （open，或无持仓时的 pending/replace_pending；有持仓时的 pending 是加仓腿，不在范围）。
+    #       条件：保本锁开关开、本单未被标移动止损（互斥——移动止损第一步棘轮即近保本位，是超集）、
+    #       开仓时未处末段衰竭降级（tr.downgrade 生效 = 生效 stage 为 late_exhaustion、方向一致且
+    #       强度生效；判定失败/无趋势不是衰竭，照常纳入）。R 在此刻按下单参数冻结：R=|计划入场价 −
+    #       原始止损|（open 用 entry，缺失时用现价；pending 用触发价），成交后随登记落盘，盯盘脚本
+    #       据此在浮盈达到 trigger_r×R 时把止损移到实际入场价；严禁用日后收紧过的现止损重算 R。
+    if a in ("open", "pending", "replace_pending") and not (a != "open" and pos) and "_trailing_exit" not in ctx:
+        from desk import demo_exec as _DXB
+        _late = bool(tr.get("enabled") and tr.get("active") and tr.get("downgrade")
+                     and call.side and call.side == tr.get("side"))
+        _eref = (_num(call.entry) or float(mk["last"])) if a == "open" else _num(call.trigger_px)
+        if (_DXB.ecfg(cfg)["breakeven_lock"].get("enabled") and not _late
+                and _num(call.stop_loss) and _eref):
+            _r = abs(float(_eref) - float(call.stop_loss))
+            if _r > 0:
+                ctx["_breakeven_open"] = {"entry_ref": float(_eref), "orig_stop": float(call.stop_loss),
+                                          "r_dist": _r, "stage_at_open": (tr.get("judge") or {}).get("stage")}
     # 3.7) 周线方向过滤（决策 2，2026-11-15 用户批准，desk/regime_judge.weekly_block_reason）：周线方向是
     #      纯代码数据（完整周收盘 vs 周 MA20 位置 + 五周斜率），与 LLM 判定是否生效无关——判定失败但
     #      特征表在，过滤照常生效。作用域同 §3.5：新入场 open/pending/replace_pending；keep_pending
     #      沿用原单、add 是已有持仓的加仓腿，均不在此列。周线中性/缺失/过滤关闭 → 不拦（fail-soft）。
+    #      2026-11-21 门收敛（用户批准）：mode=advisory（默认）时逆周线不硬拦，只留痕披露；
+    #      mode=block 时恢复原硬拦。mode 只认 regime 里 build_regime 写入的代码计算值。
     if a in ("open", "pending", "replace_pending"):
         from desk import regime_judge as _RJ
         _wb = _RJ.weekly_block_reason(ctx.get("trend"), call.side)
         if _wb:
-            errs.append(_wb)
-            return errs
+            _wk = (ctx.get("trend") or {}).get("weekly") or {}
+            if _wk.get("mode", "advisory") == "block":
+                errs.append(_wb)
+                return errs
+            ctx.setdefault("_gate_notes", []).append(
+                f"[WEEKLY_DIR] 周线方向为 {_wk.get('direction')}，本单 side={call.side} 逆周线："
+                "咨询模式（advisory）不拦截，仅披露留痕（硬拦需 manager.weekly_filter.mode=block）")
     # 3.8) 4H 入场结构（2026-11-15 用户批准，desk/regime_judge.h4_block_reason）：4H 波段是纯代码数据
     #      （已收盘 4H K 线的最近确认枢轴高/低点），与 LLM 判定是否生效无关——判定失败但特征表在，
     #      结构门照常生效。作用域同 §3.7：新入场 open/pending/replace_pending（open 以现价为入场价
     #      比对）；add 加仓腿、keep_pending 沿用原单不在此列。波段缺失/开关关闭 → 不拦（fail-soft）。
+    #      2026-11-21 门收敛：突破保底（海龟式 failsafe，无状态）——现价已越过 20 日极值且与下单
+    #      方向一致时不拦截，留痕 [H4_BREAKOUT_PASS]（见下方裁定）。
     if a in ("open", "pending", "replace_pending"):
         from desk import regime_judge as _RJ
         _px = float(mk["last"]) if a == "open" else _num(call.trigger_px)
         _hb = _RJ.h4_block_reason(ctx.get("trend"), call.side, _px)
         if _hb:
-            errs.append(_hb)
-            return errs
+            # 突破保底：极值用特征表既有日线口径（hi_20 = 近 20 根已收盘日线最高、lo_20 = 最低）；
+            # 做空看现价 ≤ lo_20、做多看现价 ≥ hi_20。特征缺失/极值非法 → 不触发保底，照常拦截。
+            import math as _math
+            _feat = (ctx.get("trend") or {}).get("features") or {}
+            _last = float(mk["last"])
+            _ext = _feat.get("lo_20") if call.side == "short" else _feat.get("hi_20") if call.side == "long" else None
+            _brk = (isinstance(_ext, (int, float)) and _math.isfinite(float(_ext))
+                    and ((_last <= float(_ext)) if call.side == "short" else (_last >= float(_ext))))
+            if _brk:
+                ctx.setdefault("_gate_notes", []).append(
+                    f"[H4_BREAKOUT_PASS] 现价 {_last:g} 已越过 20 日{'最低' if call.side == 'short' else '最高'} "
+                    f"{float(_ext):g}（与 {call.side} 方向一致的突破），4H 结构门不拦截本单（海龟式保底）")
+            else:
+                errs.append(_hb)
+                return errs
     # 4) 点位硬护栏（止损侧向、距离≤stop_max_pct、止盈侧向、RR≥min_rr）
     if a in OPEN_ACTS or a == "keep_pending":
         px = float(mk["last"]) if a in ("open", "add") else float(call.trigger_px)
@@ -407,6 +465,10 @@ def to_decision(call: OrderToolCall, ctx: dict):
                        "keep_expiry_at": (ctx.get("existing") or {}).get("expires") if call.keep_expiry and a in ("keep_pending", "replace_pending") else None}
     if ctx.get("_trailing_exit"):   # 移动止损退出（validate §3.6 已判定资格）：执行层据此不挂固定止盈
         dec._trailing_exit = dict(ctx["_trailing_exit"])
+    if ctx.get("_breakeven_open"):   # 保本锁资格（validate §3.6b 已判定）：执行层据此把冻结 R 写进持仓/挂单登记
+        dec._breakeven_open = dict(ctx["_breakeven_open"])
+    if ctx.get("_gate_notes"):   # 门收敛留痕（validate §3.5 让位 / §3.7 周线咨询 / §3.8 突破保底）：执行层记入决策记录
+        dec._gate_notes = list(ctx["_gate_notes"])
     return dec
 
 
@@ -439,7 +501,8 @@ def instructions(ctx: dict, cfg=None) -> str:
     if tr.get("enabled"):
         _na = float((tr.get("cfg") or {}).get("near_atr", 0.3))
         lines.append(f"In a trend session (per the 'Regime judgment (LLM)' section), follow the trend execution rules: open or a near-price pending; near-price means trigger within <={_na:g}xATR14 of spot.")
-        lines.append(f"In a trend session, a pending trigger farther than {_na:g}xATR14 from spot will be rejected with the allowed range: move it closer and retry; do not switch to hold to bypass.")
+        lines.append(f"In a trend session, a pending trigger farther than {_na:g}xATR14 from spot will be rejected with the allowed range: move it closer and retry; do not switch to hold to bypass. "
+                     "Exception: when the band edge conflicts with the 4H swing bound, the band extends to the swing level (H4 takes precedence over the near-price band).")
         if tr.get("active"):
             _j = tr.get("judge") or {}
             _atr, _last = float(ctx["mk"].get("atr14") or 0), float(ctx["mk"]["last"])
@@ -451,9 +514,14 @@ def instructions(ctx: dict, cfg=None) -> str:
             lines.append("Regime judgment failed for this coin: trend rules NOT active; use the regular rules.")
         _wk = tr.get("weekly") or {}
         if _wk.get("enabled") and _wk.get("direction") in ("long", "short"):
-            lines.append(f"Weekly direction filter (code, from completed weekly closes): weekly direction is {_wk['direction']}; "
-                         "open/pending/replace_pending against it will be rejected ([WEEKLY_DIR]); "
-                         "if consensus opposes the weekly direction, hold and say 'weekly filter' in the rationale; do not try to order.")
+            if _wk.get("mode") == "block":
+                lines.append(f"Weekly direction filter (code, from completed weekly closes): weekly direction is {_wk['direction']}; "
+                             "open/pending/replace_pending against it will be rejected ([WEEKLY_DIR]); "
+                             "if consensus opposes the weekly direction, hold and say 'weekly filter' in the rationale; do not try to order.")
+            else:
+                lines.append(f"Weekly direction filter (code, from completed weekly closes; [WEEKLY_DIR] is ADVISORY only): weekly direction is {_wk['direction']}; "
+                             "open/pending/replace_pending against it will NOT be rejected; treat it as one input, "
+                             "and if you order against it, note the weekly direction in the rationale.")
         _h4 = tr.get("h4") or {}
         if _h4.get("enabled"):
             _parts = []
@@ -464,7 +532,9 @@ def instructions(ctx: dict, cfg=None) -> str:
             if _parts:
                 lines.append("4H entry structure (code, closed 4H bars): " + "; ".join(_parts) +
                              "; non-conforming open/pending/replace_pending will be rejected ([H4_STRUCT]); "
-                             "a trigger exactly at the swing level passes. Market opens are checked against the same constraint at spot.")
+                             "a trigger exactly at the swing level passes. Market opens are checked against the same constraint at spot. "
+                             "Breakout failsafe: if spot has already crossed the 20-day extreme in your order's direction "
+                             "(short: spot <= 20-day low; long: spot >= 20-day high), the gate does not block ([H4_BREAKOUT_PASS]).")
     if cfg is not None and tr.get("enabled"):
         try:
             from desk import demo_exec as _DX
@@ -475,6 +545,11 @@ def instructions(ctx: dict, cfg=None) -> str:
                              "late_exhaustion or no trend keeps the fixed take-profit. "
                              "Conditional ADD orders placed while this coin has a position do NOT use the trailing stop: fixed take-profit, really on the exchange; "
                              "never describe an add-on order as trailing-stop in your rationale.")
+            if _DX.ecfg(cfg)["breakeven_lock"].get("enabled"):
+                lines.append("Breakeven lock (code-decided, not yours to choose): when your NEW position keeps the fixed take-profit "
+                             "(a fresh open while this coin has NO position; not late_exhaustion, not a conditional add, not a trailing-stop position), "
+                             "the watch script moves its stop to the entry price once unrealized profit reaches 1R (the ORIGINAL stop distance, "
+                             "frozen at placement). It only ever tightens, never loosens, and your take-profit stays as placed.")
         except Exception:
             pass
     return "\n".join(lines)

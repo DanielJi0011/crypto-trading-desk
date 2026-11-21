@@ -28,10 +28,13 @@ def ecfg(cfg) -> dict:
     out = {**d, **(cfg.get("execution") or {})}
     out["entry_limit"] = {**ENTRY_LIMIT_DEFAULTS, **(out.get("entry_limit") or {})}
     out["trailing_stop"] = {**TRAILING_DEFAULTS, **(out.get("trailing_stop") or {})}
+    out["breakeven_lock"] = {**BREAKEVEN_DEFAULTS, **(out.get("breakeven_lock") or {})}
     return out
 
 
 TRAILING_DEFAULTS = {"enabled": False, "activation_frac_of_tp": 0.5, "trail_atr_mult": 1.0}
+
+BREAKEVEN_DEFAULTS = {"enabled": False, "trigger_r": 1.0}
 
 
 ENTRY_LIMIT_DEFAULTS = {"enabled": True, "offset_pct": 0.1, "timeout_minutes": 3, "ws_check_secs": 20}
@@ -426,15 +429,18 @@ def open_now(cfg, bk, inst, size_pct, sl, tp, side, lev, decision_id, horizon_da
                                        "deadline": (settings.now() + _dt.timedelta(days=horizon_days)).strftime("%Y-%m-%d %H:%M:%S%z")}
     if exit_meta:
         r["positions"][inst].update(exit_meta)
-        r["positions"][inst]["trail"] = {"activated": False, "best_px": None, "stop_px": sl}
+        if exit_meta.get("exit_mode") == "trailing":
+            r["positions"][inst]["trail"] = {"activated": False, "best_px": None, "stop_px": sl}
     save_reg(r)
     from desk import entry_state
     entry_state.advance(d.get("ordId"), "open_sent", inst_id=inst, decision_id=decision_id)
     X.log_event("open_ok", inst_id=inst, decision_id=decision_id, ordId=d.get("ordId"), sz=sz, side=side, lever=lev, sl=sl, tp=tp,
-                **({"exit_mode": "trailing", "plan_tp": exit_meta.get("plan_tp")} if exit_meta else {}))
+                **({"exit_mode": "trailing", "plan_tp": exit_meta.get("plan_tp")} if exit_meta and exit_meta.get("exit_mode") == "trailing" else {}),
+                **({"breakeven_eligible": True} if (exit_meta or {}).get("breakeven") else {}))
     return True, {"trade_id": f"DEMO-{inst}-{ps}", "ord_id": d.get("ordId"), "sz": sz, "qty": qty, "px": ref_px, "side": side,
                   "leverage": lev, "margin": qty * ref_px / lev, "notional": qty * ref_px, "liq_px": checks.get("liq_px"), "checks": checks,
-                  **({"exit_mode": "trailing", "plan_tp": exit_meta.get("plan_tp")} if exit_meta else {})}
+                  **({"exit_mode": "trailing", "plan_tp": exit_meta.get("plan_tp")} if exit_meta and exit_meta.get("exit_mode") == "trailing" else {}),
+                  **({"breakeven_eligible": True} if (exit_meta or {}).get("breakeven") else {})}
 
 
 def place_trigger(cfg, bk, inst, o: dict, extra: dict | None = None):
@@ -604,7 +610,8 @@ def submit_trigger(cfg, inst, o: dict, sz: str, expires: str, force_market: bool
     from desk import entry_state
     entry_state.advance(d["algoId"], "armed", inst_id=inst, decision_id=o.get("decision_id"))
     X.log_event("trigger_placed", **{k: meta[k] for k in ("inst_id", "algoId", "sz", "side", "trigger_px", "stop_loss", "take_profit", "decision_id", "order_px")},
-                **({"exit_mode": meta["exit_mode"], "plan_tp": meta.get("plan_tp")} if meta.get("exit_mode") else {}))
+                **({"exit_mode": meta["exit_mode"], "plan_tp": meta.get("plan_tp")} if meta.get("exit_mode") else {}),
+                **({"breakeven_eligible": True} if meta.get("breakeven") else {}))
     if order_px != "-1":   # 限价入场：登记到超时跟踪（desk/entry_limit.py，由 demo_watch 每轮检查）
         from desk import entry_limit
         entry_limit.register(d["algoId"], inst=inst, side=side, pos_side=ps, sz=sz, order_px=order_px, trigger_px=px,
@@ -614,7 +621,8 @@ def submit_trigger(cfg, inst, o: dict, sz: str, expires: str, force_market: bool
                              horizon_days=o.get("horizon_days"),
                              **({"add": dict(extra["add"])} if (extra or {}).get("add") else {}),
                              **({"exit_mode": meta["exit_mode"], "plan_tp": meta.get("plan_tp"),
-                                 "atr14_open": meta.get("atr14_open")} if meta.get("exit_mode") else {}))
+                                 "atr14_open": meta.get("atr14_open")} if meta.get("exit_mode") else {}),
+                             **({"breakeven": meta["breakeven"]} if meta.get("breakeven") else {}))
     try:   # 挂单即时提醒（与开平仓同一 webhook 通道；按 algoId 去重，entry_limit_registered 不再另发）
         from desk.demo_ws import notify_placed
         notify_placed(meta)

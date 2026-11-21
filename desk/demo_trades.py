@@ -121,6 +121,10 @@ def link(row: dict, events: list[dict], reg: dict, papers: list[dict], entries=(
         # 是否真正激活过（激活/跟进事件带 decision_id 落在 demo 事件流里）：未激活先触原始止损的仍按「止损」记账
         r["trail_activated"] = any(e.get("event") in ("trailing_activated", "trailing_stop_moved")
                                    and e.get("decision_id") == r["decision_id"] for e in events)
+    if r.get("decision_id"):
+        # 保本锁是否真正上过锁（breakeven_locked 事件带 decision_id）：出场价≈入场价时记账为「保本锁」
+        r["breakeven_locked"] = any(e.get("event") == "breakeven_locked"
+                                    and e.get("decision_id") == r["decision_id"] for e in events)
     if not r["decision_id"]:
         r["test"] = any(e.get("event") in TEST_EVENTS and e.get("inst_id") == inst and
                         (_near(e.get("time"), c, 60_000) or _near(e.get("time"), row.get("uTime") or c, 60_000))
@@ -128,16 +132,22 @@ def link(row: dict, events: list[dict], reg: dict, papers: list[dict], entries=(
     return r
 
 
-def _exit_reason(row, sl, tp, ws_events, exit_mode=None) -> str:
+def _exit_reason(row, sl, tp, ws_events, exit_mode=None, breakeven=False) -> str:
     typ = str(row.get("type") or "")
     if typ in ("3", "4", "5"):
         return CLOSE_TYPE[typ]
     px, u = _f(row.get("closeAvgPx")), int(row.get("uTime") or 0)
+    entry = _f(row.get("openAvgPx"))
+    at_entry = bool(px and entry and abs(px - entry) / px <= 0.003)   # 出场价≈入场价（保本锁出场口径）
     for e in ws_events:
         if e.get("inst_id") == row["instId"] and e.get("kind") in ("stop_loss", "take_profit") and _near(e.get("time"), u, 120_000):
             if e["kind"] == "stop_loss":
+                if breakeven and at_entry:
+                    return "保本锁"   # 保本锁仓位的入场价止损事件单独标注（不算止损笔数）
                 return "移动止损" if exit_mode == "trailing" else "止损"   # 移动止损仓位的止损事件单独标注
             return "止盈"
+    if breakeven and at_entry:
+        return "保本锁"
     if px and sl and abs(px - float(sl)) / px <= 0.003:
         return "止损"
     if px and tp and abs(px - float(tp)) / px <= 0.003:
@@ -162,7 +172,8 @@ def to_trade(row: dict, info: dict, ct_val: float, ws_events=()) -> dict:
             "tp_px": "" if info.get("tp") in (None, "") else f"{float(info['tp']):g}",
             "exit_time": _ts(row["uTime"]), "exit_px": f"{exit_:g}",
             "exit_reason": _exit_reason(row, _f(info.get("sl")), _f(info.get("tp")), ws_events,
-                                        "trailing" if (info.get("exit_mode") == "trailing" and info.get("trail_activated")) else None),
+                                        "trailing" if (info.get("exit_mode") == "trailing" and info.get("trail_activated")) else None,
+                                        breakeven=bool(info.get("breakeven_locked"))),
             "fee_usd": f"{fee:.6f}", "funding_usd": row.get("fundingFee") or "0", "gross_pnl_usd": row.get("pnl") or "",
             "pnl_usd": f"{pnl:.6f}", "pnl_pct": f"{pnl / margin * 100:.4f}" if margin else "0",
             "signal_id": info.get("decision_id") or "", "decision_id": info.get("decision_id") or "",

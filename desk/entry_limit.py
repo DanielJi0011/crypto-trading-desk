@@ -327,7 +327,9 @@ def _wait_or_end(cfg, aid, e, filled, remain) -> str:
                                         # 移动止损仓位重挂必须保留退出方式（o["take_profit"] 本就是 None），
                                         # 否则重挂单成交后会变成无计划止盈的裸奔仓位、棘轮也接不上
                                         **({"exit_mode": e["exit_mode"], "plan_tp": e.get("plan_tp"),
-                                            "atr14_open": e.get("atr14_open")} if e.get("exit_mode") else {})},
+                                            "atr14_open": e.get("atr14_open")} if e.get("exit_mode") else {}),
+                                        # 保本锁资格元数据（R 冻结值）同样必须随重挂保留，否则成交后资格丢失
+                                        **({"breakeven": e["breakeven"]} if e.get("breakeven") else {})},
                                  keep_lev=True)
     except Exception as ex:
         X.log_event("entry_rearm_failed", algoId=aid, inst_id=inst, error=f"{type(ex).__name__}: {ex}")

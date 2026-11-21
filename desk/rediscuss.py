@@ -12,7 +12,8 @@ import sys
 from desk import settings
 
 
-REASON_CN = {"sl": "止损", "tp": "止盈", "rr_recheck": "盈亏比复核", "trailing_stop": "移动止损"}
+REASON_CN = {"sl": "止损", "tp": "止盈", "rr_recheck": "盈亏比复核", "trailing_stop": "移动止损",
+             "breakeven_lock": "保本锁"}
 
 
 def _fmt(x) -> str:
@@ -42,6 +43,13 @@ def reason_brief(reason: str, event: str, detail: dict | None = None) -> str:
                 "最终一段回撤触及移动止损平仓——这通常意味着趋势告一段落或反转，多数情况下是盈利退出，不要当作看错方向的普通止损。"
                 "本次讨论的任务是定下一次入场：重新评估趋势是否仍在；同向再入场优先等回抽到关键位的条件单，不要在现价直接追；"
                 "确认反转再考虑反向，没有好位置就观望。")
+    if reason == "breakeven_lock":
+        return (f"## 本次再讨论的触发原因：保本锁触发平仓（事件 {event}）\n"
+                "上一笔仓位是固定止盈仓位，浮盈一度达到 1R（开仓原始止损距离）后，盯盘脚本已按保本锁规则（desk/breakeven_lock.py）"
+                "把止损移到入场价；随后价格回落触及入场价止损平仓，约保本离场（仅亏手续费量级）。这是一次中性退出："
+                "方向判断既未被证实也未被证伪，不要当作看错方向的普通止损，也没有止损冷却限制。"
+                "本次讨论的任务是定下一次入场：重新评估趋势与结构是否仍支持原方向；同向再入场优先等回抽到关键位的条件单，"
+                "不要在现价直接追；确认反转再考虑反向，没有好位置就观望。")
     return (f"## 本次再讨论的触发原因：止损成交（事件 {event}）\n"
             "上一笔仓位刚被止损，本次讨论的任务是重新评估并定下一次入场点位；同向开仓有冷却期限制。")
 
@@ -50,7 +58,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--coin", required=True)
     ap.add_argument("--event", default="")
-    ap.add_argument("--reason", choices=("sl", "tp", "rr_recheck", "trailing_stop"), default="sl")   # 触发原因：止损 / 止盈 / RR 复核 / 移动止损
+    ap.add_argument("--reason", choices=("sl", "tp", "rr_recheck", "trailing_stop", "breakeven_lock"), default="sl")   # 触发原因：止损 / 止盈 / RR 复核 / 移动止损 / 保本锁
     ap.add_argument("--mock", action="store_true")
     a = ap.parse_args(argv)
     if a.mock:
@@ -87,7 +95,8 @@ def main(argv=None):
     res = analysis.analyze(cfg, coin, date, bk, tracker, extra_brief=reason_brief(a.reason, a.event, detail))
     fs = res["final_state"]; fs["_signal"] = res["signal"]
     st = stances.extract(fs, cfg, tracker)
-    _src = {"tp": "post_tp", "sl": "post_stop", "rr_recheck": "rr_recheck", "trailing_stop": "post_trailing"}[a.reason]
+    _src = {"tp": "post_tp", "sl": "post_stop", "rr_recheck": "rr_recheck", "trailing_stop": "post_trailing",
+            "breakeven_lock": "post_breakeven"}[a.reason]
     rec = manager.decide_and_execute(cfg, coin, date, fs, st, tracker, source=f"{_src}:{a.event}")
     rec["trigger_reason"] = a.reason
     rec["report_dir"] = res["report_dir"]

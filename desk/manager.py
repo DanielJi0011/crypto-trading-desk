@@ -17,6 +17,13 @@ DIR_NUM = {"bullish": 1, "bearish": -1, "neutral": 0, "close": 0}
 ACT_CN = {"hold(交易经理否决)": "不入场（交易经理否决）", "hold(交易经理缺席)": "不开新仓（交易经理缺席）", "buy": "开多", "short": "开空", "hold": "持有/观望", "sell": "平仓", "reduce": "减仓", "pending": "挂条件入场单", "hold(止损冷却)": "不开仓（止损冷却）", "hold(止盈后不追单)": "不开仓（止盈后交易经理否决追单）",
           "add_long": "同向加多", "add_short": "同向加空", "pending_add": "挂条件加仓单", "hold(价格漂移)": "不下单（价格漂移超阈值）"}
 
+# 决策记录 run_path：本币本场走了哪条执行路径（2026-11-21 定时场次断点续跑，Plan A）。
+# normal=首次尝试即成功；graph-resume=图内崩溃后从存档点续跑；tail=图已完成仅补尾段；
+# graph-fresh=无可复用存档点整币新跑；done=补跑时已有决策记录，跳过。
+RUN_PATH_CN = {"normal": "正常", "graph-resume": "图续跑（图内崩溃后从存档点续跑 1 次）",
+               "tail": "尾段续跑（图已完成，仅补尾段）", "graph-fresh": "整币新跑（无可复用存档点）",
+               "done": "已有决策跳过"}
+
 
 # 投票角色：组合经理只负责执行（过护栏、在 OKX 模拟盘下市价单/挂条件单），不投票、不计权重；交易经理作为一个投票角色
 VOTERS = [r for r in ROLE_KEYS if r != "portfolio_manager"] + ["trade_manager"]
@@ -354,7 +361,7 @@ def _run_regime_judge(cfg, coin, mk, st, w, S, texts, tracker) -> dict:
     return regime_judge.build_regime(cfg, judge, feat)
 
 
-def decide_and_execute(cfg, coin, trade_date, fs, st, tracker, source="daily") -> dict:
+def decide_and_execute(cfg, coin, trade_date, fs, st, tracker, source="daily", run_path="normal") -> dict:
     inst = coin["inst_id"]
     mk = market_ctx(inst)
     ap = fs.get("_analysis_px")          # 分析开始时的参考价（run_daily 串行/并行两路都记）；没有则不做漂移检查
@@ -443,6 +450,7 @@ def decide_and_execute(cfg, coin, trade_date, fs, st, tracker, source="daily") -
                                              ("portfolio_manager", fs.get("final_trade_decision"))) if v},
            "consensus_side": gate.get("consensus_side"), "tm_vetoed_consensus": gate.get("vetoed_consensus"),
            "tm_flip_blocked": gate.get("flip_blocked") or None,
+           "run_path": run_path,
            "llm_regime": ({"judge": regime.get("judge"), "features": regime.get("features"),
                            "active": regime.get("active"), "side": regime.get("side"),
                            "downgrade": regime.get("downgrade"),
@@ -684,7 +692,7 @@ def record_session(source) -> str:
     """决策记录的场次：止盈/止损后再讨论记 rediscuss（不再误记为 morning），持有期到期全员讨论记 expiry，其余按当前场次。"""
     if str(source).startswith("expiry"):
         return "expiry"
-    return "rediscuss" if str(source).startswith(("post_tp", "post_stop", "post_trailing")) else settings.SESSION
+    return "rediscuss" if str(source).startswith(("post_tp", "post_stop", "post_trailing", "post_breakeven")) else settings.SESSION
 
 
 def pending_widen_guard(cfg, inst, ex, bk):
@@ -1083,6 +1091,16 @@ def _pm_execute_tool(cfg, coin, did, st, w, mk, bk, pos, rationale, source, tm, 
     # 执行时不挂固定止盈（tp=None），计划止盈与开仓 ATR 随登记落盘，供 desk/trailing_stop.py 棘轮接管。
     trail = getattr(tm, "_trailing_exit", None)
     agg["exit_mode"] = "trailing" if trail else "fixed"
+    # 保本锁资格（validate §3.6b 判定，to_decision 透传）：固定止盈核心仓（非移动止损、非末段衰竭、
+    # 非加仓腿）——冻结 R 随登记落盘，盯盘脚本（desk/breakeven_lock.py）在浮盈达到 1R 时把止损移到入场价。
+    be = getattr(tm, "_breakeven_open", None)
+    if be and not trail:
+        notes.append(f"[BREAKEVEN] 本仓纳入保本锁：浮盈达到 1R（原始止损距离 {float(be['r_dist']):g}，"
+                     f"下单时冻结）后盯盘脚本把止损移到入场价（只进不退）；开仓阶段 "
+                     f"{be.get('stage_at_open') or '无判定'}")
+    # 门收敛留痕（validate §3.5 近价让位 / §3.7 周线咨询放行 / §3.8 突破保底，to_decision 透传）：记入决策记录备查
+    for _gn in (getattr(tm, "_gate_notes", None) or []):
+        notes.append(_gn)
     if t.get("keep_expiry_at") and a == "replace_pending":   # keep_expiry：新单沿用原到期时刻（不早于下一场下限），按执行时剩余小时重算
         from desk import tm_order_tool as _T
         target = _T._parse_ts(t["keep_expiry_at"])
@@ -1183,7 +1201,8 @@ def _pm_execute_tool(cfg, coin, did, st, w, mk, bk, pos, rationale, source, tm, 
                                      f"跟踪距离={_tsc['trail_atr_mult']:g}×ATR14（{float(trail['atr14']):g}）")
                     ok, inf = DX.open_now(cfg, bk, inst, size, sl, None if trail else tp, side, lev, did, agg["horizon_days"], mk["last"],
                                           **({"exit_meta": {"exit_mode": "trailing", "plan_tp": tp,
-                                                            "atr14_open": float(trail["atr14"])}} if trail else {}))
+                                                            "atr14_open": float(trail["atr14"])}} if trail else
+                                             ({"exit_meta": {"breakeven": {"eligible": True, "locked": False, **be}}} if be else {})))
                     execd = {"type": "open", "ok": ok, **inf}
                     action = ("buy" if side == "long" else "short") if ok else "hold(护栏拒单)"
                     if not ok:
@@ -1200,7 +1219,8 @@ def _pm_execute_tool(cfg, coin, did, st, w, mk, bk, pos, rationale, source, tm, 
                         "horizon_days": agg["horizon_days"], "expire_hours": float(tm.entry_expire_hours), "consensus": agg["S"],
                         "reason": (tm.rationale or rationale or "")[:200]},
                         **({"extra": {"exit_mode": "trailing", "plan_tp": tp,
-                                      "atr14_open": float(trail["atr14"])}} if trail else {}))
+                                      "atr14_open": float(trail["atr14"])}} if trail else
+                           ({"extra": {"breakeven": {"eligible": True, "locked": False, **be}}} if be else {})))
                     if ok:
                         pend = inf; action = "pending"
                         notes.append(f"模拟盘条件单 {inf['algoId']}：{'多' if side == 'long' else '空'} {lev:g}x "
