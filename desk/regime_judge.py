@@ -31,13 +31,17 @@ v1 存档记录无 judge_standard 字段，打分时按 v1 分段。
 
 周线方向过滤（决策 2，2026-11-15 用户批准）：周期框架定稿——日线波段为主框架；周线只作方向过滤，
 不作判定输入。代码按完整周收盘算周线方向（由特征表同一批已收盘日线按 ISO 周聚合，未走完的周不算；
-收盘 vs 周 MA20 位置与 MA20 五周斜率同向才算趋势），随特征表一并渲染进判定/TM 提示词。执行层硬规则
-= 禁止逆周线方向开新仓：validate §3.7 经 weekly_block_reason 裁定，作用域同 §3.5（open/pending/
+收盘 vs 周 MA20 位置与 MA20 五周斜率同向才算趋势），随特征表一并渲染进判定/TM 提示词。执行层规则
+= 逆周线方向开新仓受约束：validate §3.7 经 weekly_block_reason 裁定，作用域同 §3.5（open/pending/
 replace_pending；keep_pending 沿用原单、add 为已有持仓加仓腿，不在此列）。与 LLM 判定是否生效无关
 （周线是纯代码数据，判定失败但特征表在时过滤照常生效）；周线中性/数据缺失/开关关闭一律不拦
 （fail-soft）。周线方向与本场被拦方向随 regime_calls 存档（weekly_direction / weekly_blocked_side，
 stage_overridden 式记账）。开关 manager.weekly_filter.enabled（默认开）；整层仍受 trend_rule_enabled
 总开关约束（manager 只在总开关开时构建 regime，validate 也只从 regime 读周线状态）。
+2026-11-21 门收敛（用户批准）：新增 manager.weekly_filter.mode —— advisory（默认）时 §3.7 不再
+硬拦，只计算、披露、留痕（逆周线放行记 [WEEKLY_DIR] 咨询留痕进决策记录）；mode=block 恢复本段
+上文的原硬拦行为。weekly_block_reason 本身不变（仍返回「若硬拦时的拦截说明」），由 validate
+按 mode 决定拦截还是留痕。
 
 4H 入场结构（2026-11-15 用户批准）：周期框架里 4H 只做入场触发微调——本改动给它一份窄的、代码化
 的活：入场触发价不得落进当前 4H 波段内部。代码按已收盘 4H K 线（与分析师参考文本同一缓存路径）
@@ -48,6 +52,10 @@ stage_overridden 式记账）。开关 manager.weekly_filter.enabled（默认开
 add 加仓腿、keep_pending 沿用原单不在此列）。与 LLM 判定是否生效无关；波段数据缺失/开关关闭一律
 不拦（fail-soft）。波段值与本场约束界随 regime_calls 存档（h4_swing_high/low、h4_short/long_bound）。
 开关 manager.h4_entry_structure.enabled（默认开）；整层仍受 trend_rule_enabled 总开关约束。
+2026-11-21 门收敛（用户批准）：① 突破保底（海龟式 failsafe，无状态）——现价已越过 20 日极值且与
+下单方向一致（做空：现价 ≤ 特征表 lo_20；做多：现价 ≥ hi_20，均为特征表既有日线口径）时，§3.8
+不拦截并留痕 [H4_BREAKOUT_PASS]（在 validate §3.8 裁定，h4_block_reason 本身不变）；② 入场门
+优先级——§3.5 近价带与本门波段位冲突时 H4 优先，近价上限放宽到波段位（validate §3.5 裁定）。
 """
 from __future__ import annotations
 
@@ -86,9 +94,13 @@ def trend_cfg(cfg) -> dict:
 
 def weekly_cfg(cfg) -> dict:
     """周线方向过滤配置（manager.weekly_filter 段）：enabled=false 时周线方向只进特征表展示、
-    不拦截任何下单。默认 True 与 trend_rule_enabled 同口径（显式配置见 config.yaml）。"""
+    不拦截任何下单。默认 True 与 trend_rule_enabled 同口径（显式配置见 config.yaml）。
+    mode（2026-11-21 门收敛，用户批准）：advisory（默认）= 只计算、披露、留痕，不硬拦；
+    block = 恢复 2026-11-15 原硬拦行为。非法值按 advisory 处理（收敛方向 fail-soft）。"""
     W = ((cfg or {}).get("manager") or {}).get("weekly_filter") or {}
-    return {"enabled": bool(W.get("enabled", True))}
+    mode = str(W.get("mode", "advisory")).strip().lower()
+    return {"enabled": bool(W.get("enabled", True)),
+            "mode": mode if mode in ("advisory", "block") else "advisory"}
 
 
 def h4_cfg(cfg) -> dict:
@@ -695,7 +707,7 @@ def build_regime(cfg, judge, feat) -> dict:
     if wd not in ("long", "short", "none"):
         wd = None
     wc = weekly_cfg(cfg)
-    weekly = {"enabled": wc["enabled"], "direction": wd, "missing": wd is None,
+    weekly = {"enabled": wc["enabled"], "mode": wc["mode"], "direction": wd, "missing": wd is None,
               "blocked_side": ({"long": "short", "short": "long"}.get(wd)
                                if wc["enabled"] and wd in ("long", "short") else None)}
     # 4H 入场结构状态（2026-11-15）：波段值只认特征表里的代码计算值，非法/非有限/非正一律按缺失
@@ -772,17 +784,22 @@ _STAGE_CN = {"early": "早期", "mid": "中段", "late_exhaustion": "末段衰�
 
 def _weekly_line(regime) -> str:
     """TM 提示词里的周线过滤说明行（决策 2）：过滤关闭时不出现；启用时按方向/中性/缺失三态
-    说明拦截口径。周线过滤独立于 LLM 判定——判定失败时本行照常出现（只要 regime 已构建）。
-    P4：紧凑英文渲染（拦截口径不变）。"""
+    说明口径。周线过滤独立于 LLM 判定——判定失败时本行照常出现（只要 regime 已构建）。
+    2026-11-21 门收敛后默认 advisory：只披露不拦截，措辞按 mode 切换（block 才写 will be rejected）。
+    P4：紧凑英文渲染。"""
     wk = (regime or {}).get("weekly") or {}
     if not wk.get("enabled"):
         return ""
     wd = wk.get("direction")
     if wd in ("long", "short"):
         opp = "short" if wd == "long" else "long"
-        return (f"\nWeekly direction filter (code-computed): weekly direction this run is {wd}; "
-                f"no new opens against it — {opp} open/pending/replace_pending will be rejected ([WEEKLY_DIR]); "
-                "if consensus is opposite to the weekly direction, hold and say so in the rationale; do not try to order.")
+        if wk.get("mode") == "block":
+            return (f"\nWeekly direction filter (code-computed): weekly direction this run is {wd}; "
+                    f"no new opens against it — {opp} open/pending/replace_pending will be rejected ([WEEKLY_DIR]); "
+                    "if consensus is opposite to the weekly direction, hold and say so in the rationale; do not try to order.")
+        return (f"\nWeekly direction filter (code-computed, [WEEKLY_DIR] now ADVISORY only): weekly direction this run is {wd}; "
+                f"a {opp} open/pending/replace_pending runs against it but will NOT be rejected for that reason; "
+                "treat the weekly direction as one input, and if you order against it, note the weekly direction in the rationale.")
     if wk.get("missing"):
         return "\nWeekly direction filter (code-computed): weekly data missing this run; filter inactive; use the regular rules."
     return "\nWeekly direction filter (code-computed): weekly direction neutral this run; the filter blocks nothing."
@@ -803,7 +820,9 @@ def _h4_line(regime) -> str:
     if not parts:
         return "\n4H entry structure (code-computed): 4H swing data missing this run; gate inactive; use the regular rules."
     return ("\n4H entry structure (code, closed 4H bars): " + "; ".join(parts) +
-            " — non-conforming open/pending/replace_pending will be rejected ([H4_STRUCT]); a trigger exactly at the swing level passes.")
+            " — non-conforming open/pending/replace_pending will be rejected ([H4_STRUCT]); a trigger exactly at the swing level passes. "
+            "Breakout failsafe: if spot has already crossed the 20-day extreme in your order's direction "
+            "(short: spot <= 20-day low; long: spot >= 20-day high), the structure gate does not block ([H4_BREAKOUT_PASS]).")
 
 
 def regime_block(regime: dict, mk) -> str:
@@ -837,7 +856,9 @@ def regime_block(regime: dict, mk) -> str:
          f"when your order direction matches the judged direction, never rest the only entry far from spot: "
          f"(a) open at market, or (b) near-price pending, trigger within <={tc['near_atr']:g}xATR14={cap:.6g} of spot "
          f"(shorts: gte bounce or lte breakdown both qualify); beyond that is rejected "
-         "([TREND_DIST]). If a market open is blocked by price drift, switch to (b); never fall back to hold or a far order.")
+         "([TREND_DIST]). Exception (gate priority): when the near band's edge conflicts with the 4H swing bound, "
+         "the band extends to the swing level (H4 takes precedence over [TREND_DIST]), so a trigger at the swing level is allowed. "
+         "If a market open is blocked by price drift, switch to (b); never fall back to hold or a far order.")
     if regime.get("downgrade"):
         s += (f"\nStage is late_exhaustion this session; downgrade active: market open DISABLED, near-price pending only, "
               f"risk_scale<={tc['oversold_risk_scale']:g} ([TREND_OVERSOLD] hard check).")
@@ -856,7 +877,8 @@ def log_call(*, date, session, source, inst, decision_id, regime) -> dict:
            "judge": regime.get("judge"), "failed": bool(regime.get("failed")),
            "active": bool(regime.get("active")), "downgrade": bool(regime.get("downgrade")),
            "weekly_direction": wk.get("direction"), "weekly_missing": bool(wk.get("missing")),
-           "weekly_filter_enabled": bool(wk.get("enabled")), "weekly_blocked_side": wk.get("blocked_side"),
+           "weekly_filter_enabled": bool(wk.get("enabled")), "weekly_filter_mode": wk.get("mode"),
+           "weekly_blocked_side": wk.get("blocked_side"),
            "h4_swing_high": h4.get("swing_high"), "h4_swing_high_time": h4.get("swing_high_time"),
            "h4_swing_low": h4.get("swing_low"), "h4_swing_low_time": h4.get("swing_low_time"),
            "h4_missing": bool(h4.get("missing")), "h4_filter_enabled": bool(h4.get("enabled")),

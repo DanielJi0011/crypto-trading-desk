@@ -96,12 +96,12 @@ def test_features_includes_weekly(monkeypatch):
     f = RJ.features("BTC-USDT-SWAP")
     assert f["weekly_direction"] == "long" and f["weekly_missing"] is False and f["weekly_weeks"] == 40
     block = RJ.feature_block(f, dict(MK))
-    assert "周线方向" in block and "多头" in block and "周 MA20" in block
+    assert "weekly direction" in block and "long" in block and "weekly MA20" in block
 
 
 def test_feature_block_weekly_missing_renders_gap():
     s = RJ.feature_block({"bars": 100}, dict(MK))
-    assert "周线方向" in s and "数据不足" in s
+    assert "weekly direction" in s and "n/a" in s
 
 
 # ---------------- 配置与 regime 状态 ----------------
@@ -141,26 +141,26 @@ def test_block_reason_matrix():
 
 def test_regime_block_weekly_line():
     s = RJ.regime_block(_reg(feat=W_SHORT, judge=_judge()), dict(MK))
-    assert "周线方向过滤" in s and "[WEEKLY_DIR]" in s and "空头" in s
+    assert "Weekly direction filter" in s and "[WEEKLY_DIR]" in s and "short" in s
 
 
 def test_regime_block_weekly_line_when_judge_failed():
     # 判定失败时趋势规则不生效，但周线过滤是纯代码数据，照常提示拦截
     s = RJ.regime_block(_reg(feat=W_SHORT, judge=None), dict(MK))
-    assert "判定失败" in s and "周线方向过滤" in s and "[WEEKLY_DIR]" in s
+    assert "Judgment failed" in s and "Weekly direction filter" in s and "[WEEKLY_DIR]" in s
 
 
 def test_regime_block_no_weekly_line_when_disabled():
     cfg = _cfg(weekly_filter={"enabled": False})
     s = RJ.regime_block(_reg(feat=W_SHORT, judge=_judge(), cfg=cfg), dict(MK))
-    assert "周线方向过滤" not in s
+    assert "Weekly direction filter" not in s
 
 
 def test_instructions_weekly_line():
     ctx = {"inst": "BTC-USDT-SWAP", "mk": dict(MK), "bk": dict(BK), "pos": None, "existing": None,
            "S": -0.5, "consensus_side": "short", "trend": _reg(feat=W_SHORT, judge=None)}
     s = T.instructions(ctx, _cfg())
-    assert "周线方向过滤" in s and "[WEEKLY_DIR]" in s
+    assert "Weekly direction filter" in s and "[WEEKLY_DIR]" in s
 
 
 def test_log_call_weekly_fields(tmp_path, monkeypatch):
@@ -203,15 +203,22 @@ def _pend_short():
                take_profit=98.0, expire_hours=48, **INV)
 
 
+def _block_cfg():
+    # 2026-11-21 门收敛后默认 advisory 不硬拦；本组三条测的是 mode=block 的原硬拦行为，显式钉住
+    return _cfg(weekly_filter={"enabled": True, "mode": "block"})
+
+
 def test_validate_counter_weekly_open_blocked(vctx):
-    # 判定失败（judge=None）也拦：周线过滤不依赖 LLM 判定生效
-    cfg, ctx = vctx(_reg(feat=W_SHORT), side="long")
+    # 判定失败（judge=None）也拦：周线过滤不依赖 LLM 判定生效（mode=block 口径）
+    cfg = _block_cfg()
+    cfg, ctx = vctx(_reg(feat=W_SHORT, cfg=cfg), side="long", cfg=cfg)
     errs = T.validate(cfg, _open_long(), ctx)
     assert any("[WEEKLY_DIR]" in e for e in errs), errs
 
 
 def test_validate_counter_weekly_pending_blocked(vctx):
-    cfg, ctx = vctx(_reg(feat=W_SHORT), side="long")
+    cfg = _block_cfg()
+    cfg, ctx = vctx(_reg(feat=W_SHORT, cfg=cfg), side="long", cfg=cfg)
     errs = T.validate(cfg, _pend_long(), ctx)
     assert any("[WEEKLY_DIR]" in e for e in errs), errs
 
@@ -219,7 +226,8 @@ def test_validate_counter_weekly_pending_blocked(vctx):
 def test_validate_counter_weekly_replace_pending_blocked(vctx):
     ex = {"algoId": "OLD", "side": "long", "trigger_px": 105.0, "condition": "gte",
           "stop_loss": 102.0, "take_profit": 112.0, "sz": "7", "expires": "2026-12-03 20:00:00+0800"}
-    cfg, ctx = vctx(_reg(feat=W_SHORT), side="long", existing=ex)
+    cfg = _block_cfg()
+    cfg, ctx = vctx(_reg(feat=W_SHORT, cfg=cfg), side="long", existing=ex, cfg=cfg)
     call = OTC(action="replace_pending", side="long", trigger_px=98.0, condition="lte",
                stop_loss=95.5, take_profit=104.0, expire_hours=48, **INV)
     errs = T.validate(cfg, call, ctx)
