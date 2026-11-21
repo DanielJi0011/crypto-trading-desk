@@ -59,6 +59,12 @@ def test_parallel_analyze_real_graph_briefs_isolated(monkeypatch):
     from concurrent.futures import ThreadPoolExecutor
     from desk import analysis, llm as dllm
     cfg = settings.load_config()
+    # 显式用并行口径（存档点关）：共享图三线程同时 propagate 与存档点重编译互斥；
+    # 仓库 config 2026-11-21 已翻为串行，此测试钉的是旧并行路径的简报隔离性质。
+    # 注意：analysis._graph 是模块级缓存，先清掉，否则拿到早前用例建的存档点图
+    # （存档点 SQLite 连接非线程安全，并发跑会报 closed database）。
+    monkeypatch.setattr(analysis, "_graph", None)
+    cfg = {**cfg, "parallel": {"enabled": True}}
     seen, lock = [], threading.Lock()
     orig = dllm.FakeChatModel._generate
 
@@ -75,10 +81,10 @@ def test_parallel_analyze_real_graph_briefs_isolated(monkeypatch):
         futs = [ex.submit(contextvars.copy_context().run, analysis.analyze, cfg, c, "2026-10-19", _book_all(), tracker) for c in coins]
         res = [f.result() for f in futs]
     assert all(r["final_state"] for r in res)
-    mine = re.compile(r"- (\S+-USDT-SWAP)：[^\n]*（本币）")
+    mine = re.compile(r"- (\S+-USDT-SWAP): [^\n]*\(this coin\)")
     checked = 0
     for stage, sys0 in seen:
-        if "[交易台共享信息]" not in sys0:
+        if "[Shared desk info]" not in sys0:
             continue
         ccy = stage.split("/")[0].split("-")[0]
         marks = set(mine.findall(sys0))
@@ -248,14 +254,24 @@ def test_parallel_and_serial_same_output(harness):
 
 
 @pytest.mark.parametrize("flag", [False, True])
-def test_single_coin_failure_isolated(harness, flag):
+def test_single_coin_failure_isolated(harness, flag, monkeypatch):
     harness["parallel"] = flag
     harness["fail"] = {"ETH-USDT-SWAP"}
+    if not flag:
+        # 串行定时场次（2026-11-21 Plan A）：失败后场内对该币续跑一次；此处续跑也失败（同款错），
+        # 报错明确写出两次失败，该币无决策，其余币不受影响。
+        from desk import resume as _resume
+        monkeypatch.setattr(_resume, "resume_coin",
+                            lambda cfg, coin, date, tracker: (_ for _ in ()).throw(
+                                RuntimeError(f"模拟 {coin['inst_id']} 分析失败")))
     rc, rep = harness["run"]()
     assert rc == 0
     assert [d["inst_id"] for d in rep["decisions"]] == ["BTC-USDT-SWAP", "SOL-USDT-SWAP"]
     errs = [e for e in rep["errors"] if "分析/决策失败" in e]
-    assert errs == ["ETH-USDT-SWAP 分析/决策失败：RuntimeError: 模拟 ETH-USDT-SWAP 分析失败"]
+    if flag:
+        assert errs == ["ETH-USDT-SWAP 分析/决策失败：RuntimeError: 模拟 ETH-USDT-SWAP 分析失败"]
+    else:
+        assert len(errs) == 1 and "场内断点续跑 1 次后仍失败" in errs[0] and "ETH-USDT-SWAP" in errs[0]
 
 
 def test_parallel_single_coin_uses_serial_path(harness):
@@ -266,12 +282,12 @@ def test_parallel_single_coin_uses_serial_path(harness):
 
 
 def test_config_default_parallel_off():
-    """代码默认关闭（缺省 parallel 段 → 串行）；config.yaml 已按用户同意于 2026-10-28 开启。"""
+    """代码默认关闭（缺省 parallel 段 → 串行）；config.yaml 2026-11-21 Plan A 已翻为串行（定时场次断点续跑，用户批准）。"""
     import yaml
     raw = yaml.safe_load(settings.CONFIG.read_text(encoding="utf-8"))
-    assert raw["parallel"]["enabled"] is True
+    assert raw["parallel"]["enabled"] is False
     from desk import run_daily
-    assert run_daily.parallel_enabled({}) is False and run_daily.parallel_enabled(raw) is True
+    assert run_daily.parallel_enabled({}) is False and run_daily.parallel_enabled(raw) is False
 
 
 @pytest.mark.parametrize("par", [False, True])

@@ -158,7 +158,7 @@ def resume_coin(cfg, coin: dict, date: str, tracker):
             st = stances.extract(fs, cfg, tracker)
         finally:
             dllm.STAGE.reset(tok)
-        rec = manager.decide_and_execute(cfg, coin, date, fs, st, tracker)
+        rec = manager.decide_and_execute(cfg, coin, date, fs, st, tracker, run_path="tail")
         rec["report_dir"] = None
         return rec, "tail"
     from desk import analysis, demo_exec, drift, ledger, okx_data
@@ -172,6 +172,7 @@ def resume_coin(cfg, coin: dict, date: str, tracker):
         st = stances.extract(fs, cfg, tracker)
     finally:
         dllm.STAGE.reset(tok)
-    rec = manager.decide_and_execute(cfg, coin, date, fs, st, tracker)
+    rec = manager.decide_and_execute(cfg, coin, date, fs, st, tracker,
+                                     run_path="graph-resume" if res.get("resumed_from_checkpoint") else "graph-fresh")
     rec["report_dir"] = res["report_dir"]
     return rec, ("graph-resume" if res.get("resumed_from_checkpoint") else "graph-fresh")

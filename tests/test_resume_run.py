@@ -26,15 +26,15 @@ def _cfg():
 # ------------------------------------------------------------------ 开关口径
 def test_checkpoint_enabled_rules(monkeypatch):
     cfg = _cfg()
-    assert cfg["parallel"]["enabled"] is True          # 仓库 config 现状：并行开（2026-10-28 用户同意）
-    assert dllm.checkpoint_enabled(cfg) is False        # 定时场次（并行）：关，行为与启用前一致
-    assert dllm.ta_config(cfg)["checkpoint_enabled"] is False
+    assert cfg["parallel"]["enabled"] is False          # 2026-11-21 Plan A：定时场次改串行，仓库 config 已翻为串行
+    assert dllm.checkpoint_enabled(cfg) is True         # 定时场次（串行）：开，图内崩溃可场内续跑
+    assert dllm.ta_config(cfg)["checkpoint_enabled"] is True
     monkeypatch.setattr(settings, "RESUME_MODE", True)
     assert dllm.checkpoint_enabled(cfg) is True         # 续跑入口（强制串行）：开
     assert dllm.ta_config(cfg)["checkpoint_enabled"] is True
-    cfg2 = {**cfg, "parallel": {"enabled": False}}
+    cfg2 = {**cfg, "parallel": {"enabled": True}}
     monkeypatch.setattr(settings, "RESUME_MODE", False)
-    assert dllm.checkpoint_enabled(cfg2) is True        # 串行部署：开
+    assert dllm.checkpoint_enabled(cfg2) is False       # 并行部署：关（存档点与共享图互斥）
 
 
 def test_parallel_guard_still_raises(monkeypatch):
@@ -92,6 +92,15 @@ def stubbed(monkeypatch, tmp_path):
     from desk import flows
     monkeypatch.setattr(flows, "analyze", lambda c, ccy, tr: {"report": "FLOWREP", "data": ""})
     monkeypatch.setattr(settings, "RESUME_MODE", True)
+    # 2026-11-21 Plan A 后存档点默认开：全套里的真实全流程用例（如 test_desk 在 2026-10-19
+    # 的 mock 跑）会在共享临时 state 下写同（币/日期/场次）的 run-ctx；本夹具先清掉自己
+    # 命名空间的旁车，保证断言只量本次运行（否则 _prepare_checkpoint 会多清一条旧线程）。
+    for _p in (resume.run_ctx_path("BTC-USD", DATE, "morning"),
+               resume.tail_sidecar_path("BTC-USD", DATE, "morning")):
+        try:
+            _p.unlink(missing_ok=True)
+        except Exception:
+            pass
     return cfg, stub
 
 
@@ -128,6 +137,9 @@ def test_analyze_resume_feeds_back_original_portfolio(stubbed, monkeypatch):
 
 def test_analyze_parallel_process_writes_tail_sidecar_only(stubbed, monkeypatch):
     cfg, stub = stubbed
+    # 存档点关闭的上下文（旧并行定时场次口径）：仓库 config 2026-11-21 已翻为串行，
+    # 此处显式用 parallel.enabled=True 的 cfg 复现“存档点关”的生产形状。
+    cfg = {**cfg, "parallel": {"enabled": True}}
     monkeypatch.setattr(settings, "RESUME_MODE", False)                 # 并行定时场次口径
     tracker = dllm.UsageTracker(cfg)
     day = "2026-10-18"                                                  # 独立日期，避免与同文件其他用例共用旁车
@@ -205,7 +217,7 @@ def test_resume_coin_tail(monkeypatch):
     seen = {}
     from desk import manager, stances
     monkeypatch.setattr(stances, "extract", lambda fs, cfg, tracker=None: {})
-    def fake_decide(cfg, coin, date, fs, st, tracker, source="daily"):
+    def fake_decide(cfg, coin, date, fs, st, tracker, source="daily", run_path="normal"):
         seen["fs"] = fs
         return {"decision_id": "D-2", "consensus": -0.2, "final_action": "hold"}
     monkeypatch.setattr(manager, "decide_and_execute", fake_decide)
@@ -225,7 +237,7 @@ def test_resume_coin_graph_fresh(monkeypatch):
         "report_dir": None, "resumed_from_checkpoint": False})
     monkeypatch.setattr(stances, "extract", lambda fs, cfg, tracker=None: {})
     monkeypatch.setattr(manager, "decide_and_execute",
-                        lambda cfg, coin, date, fs, st, tracker: {"decision_id": "D-3", "consensus": 0.0,
+                        lambda cfg, coin, date, fs, st, tracker, **k: {"decision_id": "D-3", "consensus": 0.0,
                                                                   "final_action": "hold"})
     rec, how = resume.resume_coin(_cfg(), COIN, "2026-10-16", None)     # 独立日期，同上
     assert how == "graph-fresh" and rec["decision_id"] == "D-3"

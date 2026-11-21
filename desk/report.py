@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from desk import ledger, scoring, settings
-from desk.manager import ACT_CN, weights
+from desk.manager import ACT_CN, RUN_PATH_CN, weights
 from desk.roles import ROLE_CN, ROLE_KEYS, read_meta
 
 CN = {**ROLE_CN, "trade_manager": "交易经理"}
@@ -396,6 +396,8 @@ def write(cfg, date, decisions, closed, reviews, weight_changes, pb_events, usag
               f"- 交易经理（{'不投票，定点位' if 'trade_manager' not in d.get('weights', {}) and d.get('decided_by') else '投票角色之一'}）建议：" + tm_advice_text(d),
               f"- 失效条件：{m.get('invalidation') or '—'}",
               f"- 理由：{m.get('rationale')}"]
+        if d.get("run_path") and d["run_path"] != "normal":   # 2026-11-21 断点续跑：日报如实记录每币路径
+            L.append(f"- 本场路径：{RUN_PATH_CN.get(d['run_path'], d['run_path'])}")
         _lr = d.get("llm_regime") or {}
         if _lr.get("regime_judge_failed"):
             L.append("- 本场行情判定（LLM）：**判定失败**，本场趋势市规则不生效")

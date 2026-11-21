@@ -111,8 +111,26 @@ def main(argv=None):
                 decisions.append(rec)
                 print(f"[ta-desk] {coin['inst_id']}: TA评级={res['signal']} 共识={rec['consensus']:+.3f} → {rec['final_action']}", flush=True)
             except Exception as e:
-                traceback.print_exc()
-                errors.append(f"{coin['inst_id']} 分析/决策失败：{type(e).__name__}: {e}")
+                if a.resume:
+                    # --resume 本身已是该币的唯一一次续跑，不再场内重跑第二遍
+                    traceback.print_exc()
+                    errors.append(f"{coin['inst_id']} 分析/决策失败：{type(e).__name__}: {e}")
+                    continue
+                # 定时场次断点续跑（2026-11-21 Plan A，用户批准）：该币首次分析/决策崩溃后，
+                # 场内只对该币从存档点/尾段续跑一次；仍失败才记 errors、该币本场无决策。
+                print(f"[ta-desk] {coin['inst_id']}: 首次分析/决策失败（{type(e).__name__}），场内断点续跑 1 次", flush=True)
+                try:
+                    from desk import resume as _resume
+                    rec, how = _resume.resume_coin(cfg, coin, date, tracker)
+                    if how == "done":
+                        _ensure_stances(cfg, rec)   # 决策已落盘但立场可能未落盘时补记（只补缺失的，不翻倍）
+                    else:
+                        scoring.record_stances(cfg, rec)
+                    decisions.append(rec)
+                    print(f"[ta-desk] {coin['inst_id']}: 续跑[{how}] 共识={rec['consensus']:+.3f} → {rec['final_action']}", flush=True)
+                except Exception as e2:
+                    traceback.print_exc()
+                    errors.append(f"{coin['inst_id']} 分析/决策失败：{type(e2).__name__}: {e2}（首次失败 {type(e).__name__}，场内断点续跑 1 次后仍失败）")
     # 4) 刚平仓的（含盯市与今日决策产生的）复盘
     reviewed = {p.stem for p in review.REVIEWS.glob("*.json")} if review.REVIEWS.exists() else set()
     # 本地纸面账本 closed（旧纸面仓）+ OKX 模拟盘已平仓（positions-history 只读 + 本地事件关联 decision_id）
@@ -176,6 +194,22 @@ def main(argv=None):
     print(f"[ta-desk] 日报：{path}", flush=True)
     print(f"[ta-desk] LLM 用量：{usage['calls']} 次调用，输入 {usage['input']:,}（缓存 {usage['cached']:,}），输出 {usage['output']:,}，估算 ${usage['cost_usd']:.4f}", flush=True)
     return 1 if errors and not decisions and not stop else 0
+
+
+def _ensure_stances(cfg, rec: dict) -> None:
+    """场内续跑命中 done（决策记录已落盘）时用：若该决策号的立场一行都没落盘
+    （崩溃恰好发生在决策落盘与立场落盘之间），补记一次；已有则不动，防样本翻倍。"""
+    from desk import scoring
+    from desk import settings as _settings
+    did = rec.get("decision_id")
+    if not did:
+        return
+    try:
+        rows = [r for r in _settings.read_jsonl(scoring.STANCES) if r.get("decision_id") == did]
+    except Exception:
+        rows = []
+    if not rows:
+        scoring.record_stances(cfg, rec)
 
 
 def parallel_enabled(cfg) -> bool:
