@@ -18,7 +18,9 @@ def wrap(source: str, text) -> str:
     if text is None:
         return text
     s = str(text)
-    if not s.strip() or BEGIN in s:
+    # 幂等判断只认“以 PREFACE 开头”（即本函数自己的产物）；文本中段含 BEGIN 不再视为已包裹，
+    # 否则外部文本只要塞一个 BEGIN 就能整段绕过包裹与清洗（2026-11-22 注入回归 J 确证后修复）。
+    if not s.strip() or s.startswith(PREFACE):
         return s
     s = s.replace(BEGIN, "").replace(END, "")       # 防止外部文本自带定界符提前闭合
     return f"{PREFACE}\n{BEGIN}（来源：{source}）\n{s}\n{END}"
