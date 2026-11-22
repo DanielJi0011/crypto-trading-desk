@@ -1,0 +1,214 @@
+# ============================================================
+# ta-desk 约束注册表（2026-11-22 建立；审查共识包 A 项）
+#
+# 每一项约束在此登记：层级 tier、加入日期、依据、退役条件、owner、来源。
+# 来源必须如实区分：user = 用户本人设定的框架/数值；claude_design = Muse 在用户
+# 授权（2026-11-14 策略维护委托等）下设计、经用户批准生效——不得冒充用户设定。
+# tier 变更、退役条件变更、新增约束，先改本文件并过 tests/test_constraint_registry.py
+# 的一致性测试（与 config.yaml 的 constraint_tiers 段逐项对齐）。
+#
+# 层级语义：
+#   hard     生存约束：代码硬拦，任何人不得自行删除/降级/改数值（须用户批准）。
+#   soft     策略门：代码校验层拦截；存废与形态由门账反事实数据 + 用户裁决决定。
+#   advisory 只计算/披露/留痕，不拦截。
+# 门账裁决规则在本文件末尾预注册（先写规则、后收数据，不许事后改口径）。
+# ============================================================
+
+constraints:
+  # ---------------- hard：生存约束（用户设定） ----------------
+  - id: DEMO_ISOLATION
+    tier: hard
+    class: guardrail
+    added: "2026-10-21"
+    basis: "只用 OKX 模拟盘：仅 OKX_DEMO_* 密钥、每请求强制 x-simulated-trading: 1、启动自检失败即拒单；实盘密钥已删除。"
+    config_ref: "execution.venue=okx_demo + desk/okx_demo.py"
+    retirement: "永不退役（实盘试点须用户另行批准并新建条目）"
+    owner: user
+    source: user
+  - id: RR_MIN
+    tier: hard
+    class: guardrail
+    added: "2026-10-22"
+    basis: "开仓/调点后盈亏比 RR 不得低于 1.5（用户硬标准，代码校验 §4 + check_open）。"
+    config_ref: "risk.min_rr_after_adjust=1.5"
+    retirement: "不设退役条件（数值变更须用户批准）"
+    owner: user
+    source: user
+  - id: STOP_REQUIRED
+    tier: hard
+    class: guardrail
+    added: "2026-10-21"
+    basis: "每笔开仓必须带止损，无止损不下单。"
+    config_ref: "guardrails.require_stop_loss=true"
+    retirement: "不设退役条件"
+    owner: user
+    source: user
+  - id: STOP_DIST_BAND
+    tier: hard
+    class: guardrail
+    added: "2026-10-22"
+    basis: "止损距离 = 1.5×ATR14 并夹在 1%–8% 之间；止损必须先于强平价触发（留强平缓冲）。"
+    config_ref: "risk.stop_atr_mult=1.5, risk.stop_min_pct=0.01, risk.stop_max_pct=0.08"
+    retirement: "不设退役条件（数值变更须用户批准）"
+    owner: user
+    source: user
+  - id: MARGIN_PER_TRADE
+    tier: hard
+    class: guardrail
+    added: "2026-10-30"
+    basis: "单币保证金 ≤ 权益 33%（用户 2026-10-30 由 20% 决定上调；与 risk.max_margin_pct 联动校验）。"
+    config_ref: "guardrails.max_position_pct=33, risk.max_margin_pct=0.33"
+    retirement: "不设退役条件（数值变更须用户批准）"
+    owner: user
+    source: user
+  - id: TOTAL_NOTIONAL
+    tier: hard
+    class: guardrail
+    added: "2026-10-30"
+    basis: "总名义（持仓+条件单+在途子单）≤ 权益 100%（用户 2026-10-30 由 180% 决定下调）。"
+    config_ref: "guardrails.max_total_notional_pct=100"
+    retirement: "不设退役条件（数值变更须用户批准）"
+    owner: user
+    source: user
+  - id: RISK_PER_TRADE
+    tier: hard
+    class: guardrail
+    added: "2026-10-30"
+    basis: "单笔风险 ≤ 权益 1.5%（用户 2026-10-30 由 0.75% 决定上调）；总在途风险 ≤ 4% 联动。"
+    config_ref: "risk.risk_per_trade_pct=0.015, risk.max_open_risk_pct=0.04"
+    retirement: "不设退役条件（数值变更须用户批准）"
+    owner: user
+    source: user
+  - id: DAILY_LOSS_HALT
+    tier: hard
+    class: guardrail
+    added: "2026-10-22"
+    basis: "当日权益较日初下跌 ≥2.5% → 当日停开新仓并撤入场类挂单（用户由 5% 决定改 2.5%）。"
+    config_ref: "risk.max_daily_loss_pct=0.025"
+    retirement: "不设退役条件（数值变更须用户批准）"
+    owner: user
+    source: user
+  - id: DRAWDOWN_KILL
+    tier: hard
+    class: guardrail
+    added: "2026-10-22"
+    basis: "权益较历史峰值回撤 ≥10% → 写 KILL 全停，只能人工解除。"
+    config_ref: "risk.max_drawdown_pct=0.10"
+    retirement: "不设退役条件（数值变更须用户批准）"
+    owner: user
+    source: user
+  - id: LEVERAGE_1X
+    tier: hard
+    class: guardrail
+    added: "2026-10-22"
+    basis: "新开仓杠杆上限 1 倍（用户决定 Q11；allow_leverage=false）。"
+    config_ref: "guardrails.leverage=1, guardrails.allow_leverage=false, swap.leverage_max=1"
+    retirement: "不设退役条件（数值变更须用户批准）"
+    owner: user
+    source: user
+  - id: ONE_POSITION_PER_COIN
+    tier: hard
+    class: guardrail
+    added: "2026-10-21"
+    basis: "最多 3 个持仓、每币一仓；同向加仓是独立新单（自带止损止盈），不算第二仓。"
+    config_ref: "guardrails.max_open_positions=3 + 执行层每币一仓"
+    retirement: "不设退役条件"
+    owner: user
+    source: user
+
+  # ---------------- soft：策略门（校验层拦截，存废看门账数据 + 用户裁决） ----------------
+  - id: DIRECTION
+    tier: soft
+    class: gate
+    added: "2026-10-30"
+    basis: "方案一（用户决定）：方向由投票角色加权共识定，交易经理无权重、只能否决不能翻转；共识无方向时不开仓/挂单（validate §3 [DIRECTION]）。"
+    config_ref: "manager.tm_no_vote_weight=true, manager.consensus_threshold=0.1"
+    retirement: "治理性规则，不走门账净 R 裁决；变更须用户批准"
+    owner: user
+    source: user
+  - id: TREND_DIST
+    tier: soft
+    class: gate
+    added: "2026-11-11"
+    basis: "趋势市近价护栏：判定生效时 pending 触发价距现价 ≤0.3×ATR14。2026-11-21 门收敛（用户批准）：与 4H 波段位冲突时 H4 优先、近价带单侧放宽到波段位并留痕。"
+    config_ref: "manager.trend_near_atr=0.3（validate §3.5）"
+    retirement: "走门账裁决（见 gate_adjudication 预注册规则）；0.3 这个数是全栈最经验性的参数，数据指控成立时第一个降级"
+    owner: claude_design
+    source: claude_design   # 用户 2026-11-11 令趋势判定改 LLM；近价带数值与门形态为 Muse 设计、经用户批准
+  - id: H4_STRUCT
+    tier: soft
+    class: gate
+    added: "2026-11-15"
+    basis: "4H 入场结构：做空触发价不得低于最近确认 4H 波段高点、做多镜像（validate §3.8）。2026-11-21 门收敛加突破保底：现价越过 20 日极值且同向时不拦（海龟式 failsafe，留痕 [H4_BREAKOUT_PASS]）。"
+    config_ref: "manager.h4_entry_structure.enabled=true"
+    retirement: "走门账裁决（见 gate_adjudication 预注册规则）"
+    owner: claude_design
+    source: claude_design   # 周期框架一环，Muse 设计、用户 2026-11-15 批次批准；保底为 2026-11-21 收敛批准
+  - id: TREND_OVERSOLD
+    tier: soft
+    class: gate
+    added: "2026-11-11"
+    basis: "末段衰竭（late_exhaustion）降级：判定生效且阶段为末段衰竭时禁用现价 open、只许近价 pending 且 risk_scale≤0.5。判定 v3（2026-11-14）加肯定信号门：无闭集内衰竭信号时代码强制生效阶段降为 mid。2026-11-22 起超限由 reject 改 clamp（夹到上限放行，留痕）。"
+    config_ref: "manager.trend_oversold_risk_scale=0.5（validate §3.5）"
+    retirement: "走门账裁决（见 gate_adjudication 预注册规则）；降级本身的用户处置决定仍开放（Muse 建议保留）"
+    owner: claude_design
+    source: claude_design   # 降级机制为 Muse 设计、经用户 2026-11-11/11-14 批准；判定改 LLM 本身是用户决定
+
+  # ---------------- advisory：只披露不拦截 ----------------
+  - id: WEEKLY_DIR
+    tier: advisory
+    class: gate
+    added: "2026-11-15"
+    basis: "周线方向过滤：代码按完整周收盘算周线方向。2026-11-15 以 block 上线；2026-11-21 门收敛（用户批准）降为 advisory——仍计算/披露/留痕，不再硬拦；config mode=block 可恢复硬拦（保留可逆性）。"
+    config_ref: "manager.weekly_filter.enabled=true, manager.weekly_filter.mode=advisory"
+    retirement: "已降级完成；是否彻底移除由用户决定（当前保留开关作回滚路径）"
+    owner: claude_design
+    source: claude_design
+
+  # ---------------- 学习层治理阈值（在其层内为硬约束：变更须用户批准） ----------------
+  - id: PROPOSAL_MIN_SAMPLES
+    tier: hard
+    class: learning
+    added: "2026-11-12"
+    basis: "自我迭代 v2（用户选项 A）：角色×行情×币 细格新增已出结果评分 ≥20 才生成手册修订提案；提案只落盘待批、永不自动生效（用户逐项批准）。"
+    config_ref: "learning.min_scored_before_edit=20 + desk/iteration_loop.py 细格口径"
+    retirement: "不设退役条件（变更须用户批准）"
+    owner: user
+    source: user
+  - id: ROLLBACK_PP
+    tier: hard
+    class: learning
+    added: "2026-11-15"
+    basis: "手册试行评估：修订后同格 20 条样本命中率比基线差 >5pp → 触发回滚裁决；现行闭环只出评估报告、回滚由用户裁决，不自动执行。"
+    config_ref: "learning.rollback_if_worse_pp=5.0, learning.eval_window_after_edit=20"
+    retirement: "不设退役条件（变更须用户批准）"
+    owner: user
+    source: user
+  - id: BATCH_MAX_CHANGES
+    tier: hard
+    class: learning
+    added: "2026-11-12"
+    basis: "每批手册修订提案最多 2 处改动，超量整批拒绝（防一次改太多无法归因）。"
+    config_ref: "learning.max_changes_per_edit=2"
+    retirement: "不设退役条件（变更须用户批准）"
+    owner: user
+    source: user
+
+# ============================================================
+# 门账裁决规则（预注册，2026-11-22；先写规则、后收数据）
+# 数据来源：state/ledger/gate_ledger.jsonl + gate_reviews.jsonl（desk/gate_ledger.py）。
+# 本节数值在首个裁决完成前不得修改；修改须用户批准并在本文件留变更记录。
+# ============================================================
+gate_adjudication:
+  applies_to: [TREND_DIST, H4_STRUCT, TREND_OVERSOLD]
+  sample_cell: "role×regime×coin 细格 + 天级聚类（cluster_day）双口径并报；同日三币高度相关，聚类口径为准"
+  enter_threshold:
+    would_block_judged_min: 10        # 该门 would_block 且已判定 ≥10 条
+    distinct_cluster_days_min: 10     # 且覆盖 ≥10 个独立决策日
+  verdict_rule: "净反事实 R = Σ(拦对挽回 R) − Σ(拦错成本 R)；净 R > 0 保留，≤ 0 降为 advisory"
+  r_unit: "一律用 R（止损距离）单位计，跨仓位跨币可加；不用美元"
+  precision_role: "精确率只作解读，不作门槛"
+  low_precision_high_value_tag: "精确率 <0.5 且净 R >0 → 标记『低精度高收益』，防被精确率误杀"
+  tradeable_false: "tradeable=false 的行不进裁决分母，单独计数"
+  fill_model: "1H 触价、同根 K 止损优先"
+  checkpoint: "累计 30 个开仓/否决样本做中期检查（只报告，不裁决）；正式裁决在毕业评审（40–50 笔平仓且含非下跌行情样本之后）"

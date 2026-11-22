@@ -458,12 +458,17 @@ def decide_and_execute(cfg, coin, trade_date, fs, st, tracker, source="daily", r
            "config_hash": settings.config_hash(cfg), "playbook_versions": roles.versions(),   # L1 追溯
            **({"tm_order_tool": {"attempts": tool_res["attempts"], "call": tool_res["call"], "rejected": tool_res["history"],
                                  "receipt": tool_res.get("receipt"), "ignored": tool_res.get("ignored"),
-                                 "ignored_note": tool_res.get("ignored_note")}}
+                                 "ignored_note": tool_res.get("ignored_note"), "clamp": tool_res.get("clamp")}}
               if tool_res else {})}
     if tm_attribution(cfg):   # 方案一 B：每一单的盈亏挂到交易经理名下
         rec["decided_by"] = "trade_manager"
         rec["decision_type"] = decision_type(action, dec, pos, absent)
     settings.append_jsonl(DECISIONS, rec)
+    try:   # 反事实门账（2026-11-22 共识包 B 项）：纯旁观记录，fail-soft——失败只记 demo_events，绝不影响决策
+        from desk import gate_ledger
+        gate_ledger.record_from_decision(cfg, rec, tctx, tool_res, regime)
+    except Exception:
+        pass
     if absent:   # 交易经理无结论（调用失败或工具 3 次未通过）：独立即时提醒（按决策号去重，同一币同一次讨论一次）
         try:
             from desk.demo_ws import notify_tm_no_conclusion

@@ -336,3 +336,26 @@ expiry_extend:                          # 2026-10-30 用户决定：持有期到
 
 ledger:
   tm_attribution: true                  # 2026-10-30 方案一：决策记 decided_by=trade_manager 与单子类型；平仓写 state/ledger/tm_ledger.jsonl（幂等）；日报加「交易经理战绩」；复盘以交易经理为主线；false=旧行为
+# 约束层级登记（2026-11-22 约束注册表）：每项约束的 tier 与根目录 constraints.yaml 注册表逐项对应，
+# 由 tests/test_constraint_registry.py 断言一致；注册表含加入日期/依据/退役条件/owner/来源与门账裁决预注册规则。
+# 本段仅作登记，运行代码不读（各约束的实际数值仍在各自原配置段里）。
+constraint_tiers:
+  DEMO_ISOLATION: hard
+  RR_MIN: hard
+  STOP_REQUIRED: hard
+  STOP_DIST_BAND: hard
+  MARGIN_PER_TRADE: hard
+  TOTAL_NOTIONAL: hard
+  RISK_PER_TRADE: hard
+  DAILY_LOSS_HALT: hard
+  DRAWDOWN_KILL: hard
+  LEVERAGE_1X: hard
+  ONE_POSITION_PER_COIN: hard
+  DIRECTION: soft
+  TREND_DIST: soft
+  H4_STRUCT: soft
+  TREND_OVERSOLD: soft
+  WEEKLY_DIR: advisory
+  PROPOSAL_MIN_SAMPLES: hard
+  ROLLBACK_PP: hard
+  BATCH_MAX_CHANGES: hard

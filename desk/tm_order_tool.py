@@ -305,6 +305,28 @@ def validate(cfg, call: OrderToolCall, ctx: dict) -> list[str]:
     return errs
 
 
+def _is_oversold_rs_err(e: str) -> bool:
+    """§3.5 末段降级里「risk_scale 超过降级上限」那一条（与「禁用现价 open」那条区分：后者夹 rs 也救不了）。"""
+    return e.startswith("[TREND_OVERSOLD]") and "risk_scale=" in e and "超过降级上限" in e
+
+
+def try_clamp_oversold(call: OrderToolCall, errs: list, ctx: dict) -> OrderToolCall | None:
+    """[TREND_OVERSOLD] 改 clamp（2026-11-22 共识包 C 项，用户批准）：
+    验证失败**仅**由末段降级 risk_scale 上限一条引起时，把 risk_scale 夹到上限返回新参数；
+    同时存在任何其他失败 → 返回 None，照旧拒绝重试。上限只读 ctx.trend.cfg 的生产配置值
+    （与 validate §3.5 同源），不改数值本身；夹紧方向与降级语义一致（只收紧、不放宽）。"""
+    if len(errs) != 1 or not _is_oversold_rs_err(errs[0]):
+        return None
+    tr = ctx.get("trend") or {}
+    if not (tr.get("enabled") and tr.get("active") and tr.get("downgrade")):
+        return None
+    cap = float((tr.get("cfg") or {}).get("oversold_risk_scale", 0.5))
+    rs = float(call.risk_scale if call.risk_scale is not None else 1.0)
+    if rs <= cap + 1e-12:
+        return None
+    return call.model_copy(update={"risk_scale": cap})
+
+
 def drift_error(cfg, inst, mk) -> str | None:
     from desk import drift, okx_data
     c = drift.dcfg(cfg)
@@ -644,6 +666,20 @@ def run(cfg, model, prompt: str, ctx: dict) -> dict:
             history.append({"call": None, "errors": [f"[PARSE] 工具参数无法解析（{type(e).__name__}: {str(e)[:160]}）"]})
             continue
         errs = validate(cfg, call, ctx)
+        clamp = None
+        if errs:
+            # [TREND_OVERSOLD] clamp：失败仅由降级 risk_scale 上限引起 → 夹到上限重验，
+            # 通过即放行（回执与 _gate_notes 留痕），不再打回让交易经理重试一轮。
+            clamped = try_clamp_oversold(call, errs, ctx)
+            if clamped is not None and not validate(cfg, clamped, ctx):
+                frm = float(call.risk_scale if call.risk_scale is not None else 1.0)
+                call = clamped
+                clamp = {"gate": "TREND_OVERSOLD", "field": "risk_scale",
+                         "from": frm, "to": float(call.risk_scale)}
+                ctx.setdefault("_gate_notes", []).append(
+                    f"[TREND_OVERSOLD→CLAMP] 末段衰竭降级：risk_scale {frm:g} 超过降级上限 "
+                    f"{float(call.risk_scale):g}，已夹到上限放行（clamp，不打回重试）")
+                errs = []
         if not errs:
             call, ign = strip_keep_size_fields(call)
             rc = (ctx.get("_sized") or {}).get(call.action)
@@ -652,7 +688,7 @@ def run(cfg, model, prompt: str, ctx: dict) -> dict:
                 note = f"{KEEP_IGNORED_NOTE}（{'、'.join(f'{k}={v:g}' for k, v in ign.items())}）"
                 rc = {**(rc or {}), "note": note}
             return {"dec": to_decision(call, ctx), "call": call.model_dump(), "attempts": n, "history": history, "absent_why": None,
-                    "receipt": rc, "ignored": ign or None, "ignored_note": note}
+                    "receipt": rc, "ignored": ign or None, "ignored_note": note, "clamp": clamp}
         history.append({"call": call.model_dump(), "errors": errs})
     last = "；".join(history[-1]["errors"]) if history else "无输出"
     return {"dec": None, "call": history[-1]["call"] if history else None, "attempts": TOOL_MAX_ATTEMPTS, "history": history,

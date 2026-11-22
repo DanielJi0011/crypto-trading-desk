@@ -370,6 +370,13 @@ def write(cfg, date, decisions, closed, reviews, weight_changes, pb_events, usag
     from desk import tm_ledger as _tml
     if _tml.enabled(cfg):
         L += [""] + _tml.report_lines(cfg)
+    try:
+        from desk import shadow_book as _sb
+        _sb_lines = _sb.report_lines(cfg)
+        if _sb_lines:
+            L += [""] + _sb_lines
+    except Exception:
+        pass
     notes_by = {k: list(v) for k, v in (coin_notes or {}).items()}
     if demo:   # 交易经理否决导致的撤单：自动补记（已在 coin_notes 里提到的单号不重复）
         from desk import okx_demo as _od2

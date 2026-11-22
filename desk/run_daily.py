@@ -188,6 +188,19 @@ def main(argv=None):
             pb_events += tail.get("events", [])
     except Exception as e:
         errors.append(f"迭代闭环收尾失败：{type(e).__name__}: {e}")
+    # 5e) 反事实门账评分（2026-11-22 共识包 B 项）：到期门账行按 1H 先触口径算反事实 R，
+    # 只落盘（gate_reviews.jsonl）、不裁决；裁决规则已预注册于 constraints.yaml。
+    try:
+        from desk import gate_ledger
+        gate_ledger.review_due(cfg)
+    except Exception as e:
+        errors.append(f"门账评分失败：{type(e).__name__}: {e}")
+    # 5f) 反向影子账（2026-11-22 共识包 D 项）：纸面记账，零下单零 LLM——TM 反向事件开仓 + 到期结算
+    try:
+        from desk import shadow_book
+        shadow_book.run_tail(cfg)
+    except Exception as e:
+        errors.append(f"影子账收尾失败：{type(e).__name__}: {e}")
     # 6) 日报
     usage = tracker.summary()
     settings.write_json(settings.STATE / "usage" / f"run-{dllm.RUN_ID}.json", usage)
