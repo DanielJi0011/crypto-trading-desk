@@ -501,6 +501,10 @@ def to_decision(call: OrderToolCall, ctx: dict):
 def instructions(ctx: dict, cfg=None) -> str:
     ex, pos = ctx.get("existing"), ctx.get("pos")
     lines = ["", "## Order tool (the tool parameters govern; the code does not parse your rationale text)",
+             "OUTPUT ORDER (mandatory): emit the order-tool call FIRST, before any analysis prose. The tool call is the deliverable: "
+             "if a long analysis comes first, the response can hit the output limit and be cut off before the tool call is emitted, "
+             "and the decision is then lost entirely (recorded as no conclusion). Put your reasoning in the tool call's rationale field; "
+             "any prose after the call must be short.",
              "After the discussion, call the order tool once with the fixed OrderToolCall parameters. The code checks only required fields and hard guardrails; "
              "it never changes your levels, size, or keep/re-hang decision. On failure it returns reasons and allowed ranges: fix and call again on the spot "
              f"(max {TOOL_MAX_ATTEMPTS} attempts; still failing = no conclusion, no order).",
@@ -643,6 +647,17 @@ def strip_keep_size_fields(call: OrderToolCall) -> tuple[OrderToolCall, dict]:
     return (call.model_copy(update={k: SIZE_FIELDS[k] for k in ign}) if ign else call), ign
 
 
+_PARSE_EMPTY_MARKERS = ("工具调用输出为空", "OutputParserException", "JSONDecodeError")
+
+
+def _parse_empty_attempt(h: dict) -> bool:
+    """这一轮失败是不是「解析为空/截断类」：没有解析出参数（call=None），且原因命中空输出/解析异常标记。
+    参数校验失败的轮次 call 是 dict，永远不算——其重试话术维持原样。"""
+    if h.get("call") is not None:
+        return False
+    return any(m in e for e in (h.get("errors") or []) for m in _PARSE_EMPTY_MARKERS)
+
+
 def retry_prompt(prompt: str, history: list) -> str:
     if not history:
         return prompt
@@ -650,6 +665,11 @@ def retry_prompt(prompt: str, history: list) -> str:
     for i, h in enumerate(history, 1):
         parts.append(f"Attempt {i} parameters: {json.dumps(h['call'], ensure_ascii=False) if h.get('call') else '(unparseable)'}")
         parts.append("Rejection reasons: " + "; ".join(h["errors"]))
+    if any(_parse_empty_attempt(h) for h in history):
+        # 解析为空/截断类失败（2026-11-22 晚场 SOL 事故：分析写满输出上限、工具调用没发出来）：重试只交表、不写分析。
+        parts += ["", "## Retry output format (a previous attempt produced NO parseable tool call — it was empty or cut off)",
+                  "This time emit ONLY the order-tool call: the call with its parameters and nothing else — no analysis prose before or after it. "
+                  "Keep the rationale inside the tool call to one short sentence. Prose outside the call is discarded anyway and risks cutting the call off again."]
     return "\n".join(parts)
 
 
