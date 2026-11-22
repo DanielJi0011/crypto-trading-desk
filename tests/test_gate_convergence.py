@@ -51,9 +51,12 @@ def vctx(monkeypatch):
     monkeypatch.setattr(T, "guard_errors", lambda cfg, call, ctx: [])
     monkeypatch.setattr(T, "keep_errors", lambda cfg, call, ctx: [])
 
-    def make(regime, side="short", existing=None, pos=None, cfg=None):
+    def make(regime, side="short", existing=None, pos=None, cfg=None, mk_over=None):
         cfg = cfg or _cfg()
-        return cfg, {"inst": "BTC-USDT-SWAP", "mk": dict(MK), "bk": dict(BK), "pos": pos,
+        mk = dict(MK)
+        if mk_over:
+            mk.update(mk_over)
+        return cfg, {"inst": "BTC-USDT-SWAP", "mk": mk, "bk": dict(BK), "pos": pos,
                      "existing": existing, "S": 0.5 if side == "long" else -0.5,
                      "consensus_side": side, "trend": regime}
     return make
@@ -156,20 +159,31 @@ def test_gate_notes_reach_decision(vctx):
 
 
 # ---------------- §3.8 突破保底 ----------------
+# 注意（2026-11-21 修复）：生产特征表 features() 从不写 hi_20/lo_20（只在内部算 pos_in_range），
+# 20 日极值只在 mk 里。以下用例一律用生产形状：特征表只给 H4 波段，极值走 mk_over。
 
 def test_breakout_pass_short_pending(vctx):
     # 现价 100 ≤ 20 日最低 100（已破位下行）：触发价 102 本会被 §3.8 拦，保底放行并留痕
-    feat = {**H4F, "lo_20": 100.0, "hi_20": 120.0}
-    cfg, ctx = vctx(_reg(feat=feat, judge=None), side="short")
+    cfg, ctx = vctx(_reg(feat=H4F, judge=None), side="short", mk_over={"lo_20": 100.0})
     assert T.validate(cfg, _pend_short(trigger=102.0, sl=104.5, tp=95.0), ctx) == []
     notes = _notes(ctx)
     assert len(notes) == 1 and "[H4_BREAKOUT_PASS]" in notes[0]
 
 
+def test_breakout_pass_uses_mk_extremes_production_shape(vctx):
+    # 回归（2026-11-21 早场实测）：生产特征表不写 hi_20/lo_20，极值只在 mk 里；旧代码只读
+    # 特征表 → _ext 为 None、保底永不触发——本用例在旧代码下必失败。
+    # 现价 100 严格低于 20 日最低 105（做空破位，形如当早 BTC 现价 58957.4 < 20 日低 61388）：
+    # 触发价 102 本会被 §3.8 拦，保底放行并留痕。
+    cfg, ctx = vctx(_reg(feat=H4F, judge=None), side="short", mk_over={"lo_20": 105.0})
+    assert "lo_20" not in (ctx["trend"] or {}).get("features", {})
+    assert T.validate(cfg, _pend_short(trigger=102.0, sl=104.5, tp=95.0), ctx) == []
+    assert any("[H4_BREAKOUT_PASS]" in n for n in _notes(ctx))
+
+
 def test_breakout_pass_short_open(vctx):
     # open 以现价比对同样适用保底：现价 100 < 波段高点 106 本会被拦，破位后放行
-    feat = {**H4F, "lo_20": 100.0, "hi_20": 120.0}
-    cfg, ctx = vctx(_reg(feat=feat, judge=None), side="short")
+    cfg, ctx = vctx(_reg(feat=H4F, judge=None), side="short", mk_over={"lo_20": 100.0})
     call = OTC(action="open", side="short", entry=100.0, stop_loss=102.5, take_profit=96.0, **INV)
     assert T.validate(cfg, call, ctx) == []
     assert any("[H4_BREAKOUT_PASS]" in n for n in _notes(ctx))
@@ -177,8 +191,7 @@ def test_breakout_pass_short_open(vctx):
 
 def test_breakout_not_triggered_above_20d_low(vctx):
     # 现价 100 > 20 日最低 99：未破位 → §3.8 照常拦，无留痕
-    feat = {**H4F, "lo_20": 99.0, "hi_20": 120.0}
-    cfg, ctx = vctx(_reg(feat=feat, judge=None), side="short")
+    cfg, ctx = vctx(_reg(feat=H4F, judge=None), side="short", mk_over={"lo_20": 99.0})
     errs = T.validate(cfg, _pend_short(trigger=102.0, sl=104.5, tp=95.0), ctx)
     assert any("[H4_STRUCT]" in e for e in errs), errs
     assert _notes(ctx) == []
@@ -186,24 +199,24 @@ def test_breakout_not_triggered_above_20d_low(vctx):
 
 def test_breakout_pass_long_mirror(vctx):
     # 做多镜像：现价 100 ≥ 20 日最高 100（已破位上行）：触发价 98 本会被 §3.8 拦，保底放行
-    feat = {**H4F, "lo_20": 80.0, "hi_20": 100.0}
-    cfg, ctx = vctx(_reg(feat=feat, judge=None), side="long")
+    cfg, ctx = vctx(_reg(feat=H4F, judge=None), side="long", mk_over={"hi_20": 100.0})
     assert T.validate(cfg, _pend_long(trigger=98.0, sl=95.5, tp=105.0), ctx) == []
     assert any("[H4_BREAKOUT_PASS]" in n for n in _notes(ctx))
 
 
 def test_breakout_wrong_direction_no_pass(vctx):
     # 上行破位（现价 ≥ hi_20）救不了做空单：做空只看 lo_20，现价 100 > 95 → 照常拦
-    feat = {**H4F, "lo_20": 95.0, "hi_20": 100.0}
-    cfg, ctx = vctx(_reg(feat=feat, judge=None), side="short")
+    cfg, ctx = vctx(_reg(feat=H4F, judge=None), side="short", mk_over={"lo_20": 95.0, "hi_20": 100.0})
     errs = T.validate(cfg, _pend_short(trigger=102.0, sl=104.5, tp=95.0), ctx)
     assert any("[H4_STRUCT]" in e for e in errs), errs
     assert _notes(ctx) == []
 
 
 def test_breakout_missing_extremes_no_pass(vctx):
-    # 特征缺 20 日极值 → 保底不触发（fail-soft），§3.8 照常拦
+    # 两处都缺 20 日极值（mk 与特征表均无）→ 保底不触发（fail-soft），§3.8 照常拦
     cfg, ctx = vctx(_reg(feat=H4F, judge=None), side="short")
+    ctx["mk"].pop("hi_20", None)
+    ctx["mk"].pop("lo_20", None)
     errs = T.validate(cfg, _pend_short(trigger=102.0, sl=104.5, tp=95.0), ctx)
     assert any("[H4_STRUCT]" in e for e in errs), errs
 

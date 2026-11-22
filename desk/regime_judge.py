@@ -53,7 +53,8 @@ add 加仓腿、keep_pending 沿用原单不在此列）。与 LLM 判定是否�
 不拦（fail-soft）。波段值与本场约束界随 regime_calls 存档（h4_swing_high/low、h4_short/long_bound）。
 开关 manager.h4_entry_structure.enabled（默认开）；整层仍受 trend_rule_enabled 总开关约束。
 2026-11-21 门收敛（用户批准）：① 突破保底（海龟式 failsafe，无状态）——现价已越过 20 日极值且与
-下单方向一致（做空：现价 ≤ 特征表 lo_20；做多：现价 ≥ hi_20，均为特征表既有日线口径）时，§3.8
+下单方向一致（做空：现价 ≤ 20 日最低 lo_20；做多：现价 ≥ 20 日最高 hi_20，均为 mk 的日线口径，
+与特征表同源）时，§3.8
 不拦截并留痕 [H4_BREAKOUT_PASS]（在 validate §3.8 裁定，h4_block_reason 本身不变）；② 入场门
 优先级——§3.5 近价带与本门波段位冲突时 H4 优先，近价上限放宽到波段位（validate §3.5 裁定）。
 """

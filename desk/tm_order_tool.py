@@ -245,12 +245,16 @@ def validate(cfg, call: OrderToolCall, ctx: dict) -> list[str]:
         _px = float(mk["last"]) if a == "open" else _num(call.trigger_px)
         _hb = _RJ.h4_block_reason(ctx.get("trend"), call.side, _px)
         if _hb:
-            # 突破保底：极值用特征表既有日线口径（hi_20 = 近 20 根已收盘日线最高、lo_20 = 最低）；
-            # 做空看现价 ≤ lo_20、做多看现价 ≥ hi_20。特征缺失/极值非法 → 不触发保底，照常拦截。
+            # 突破保底：极值取自 mk（manager.market_ctx 的 20 日高/低，与特征表同源同口径）；
+            # 生产特征表 features() 从不写 hi_20/lo_20（只在内部算 pos_in_range），特征表仅作回退。
+            # 做空看现价 ≤ lo_20、做多看现价 ≥ hi_20。极值缺失/非法 → 不触发保底，照常拦截。
             import math as _math
             _feat = (ctx.get("trend") or {}).get("features") or {}
             _last = float(mk["last"])
-            _ext = _feat.get("lo_20") if call.side == "short" else _feat.get("hi_20") if call.side == "long" else None
+            _key = "lo_20" if call.side == "short" else "hi_20" if call.side == "long" else None
+            _ext = mk.get(_key) if _key else None
+            if _ext is None:
+                _ext = _feat.get(_key) if _key else None
             _brk = (isinstance(_ext, (int, float)) and _math.isfinite(float(_ext))
                     and ((_last <= float(_ext)) if call.side == "short" else (_last >= float(_ext))))
             if _brk:
