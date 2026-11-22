@@ -179,6 +179,15 @@ def main(argv=None):
             baselines.update(cfg, date, decisions)
     except Exception as e:
         errors.append(f"对照组更新失败：{type(e).__name__}: {e}")
+    # 5d) 自我迭代 v2 闭环收尾（2026-11-22 用户批准接上）：平仓案例提炼 + 提案到量生成 + v2 试行评估；
+    # 全部只落盘（案例进 cases.jsonl、建议进 proposals 待批、评估进 iteration_reports），不生效、不回滚。
+    try:
+        if not stop:
+            from desk import iteration_loop
+            tail = iteration_loop.run_tail(cfg, tracker)
+            pb_events += tail.get("events", [])
+    except Exception as e:
+        errors.append(f"迭代闭环收尾失败：{type(e).__name__}: {e}")
     # 6) 日报
     usage = tracker.summary()
     settings.write_json(settings.STATE / "usage" / f"run-{dllm.RUN_ID}.json", usage)
