@@ -766,6 +766,79 @@ def move_tp(cfg, p, new_tp):
         return True, f"模拟盘止盈（先挂新再撤旧）{old}→{new_tp:.6g}，新单 {new_id}，张数 {sz}"
 
 
+def switch_exit_mode(cfg, p, to_mode, take_profit=None, atr14_open=None, decision_id=None, reason=""):
+    """退出模式切换（2026-11-24 用户批准）：交易经理在复盘时自主裁量，把已有核心仓的退出方式在
+    固定止盈止损 ↔ 移动止损之间切换（判定阶段只是交易经理的输入，代码不查判定、不做阶段映射）。
+    交易所侧统一走 _replace_close_algos（先挂新、确认可见、再撤旧，中间不裸仓）：
+      → trailing：新单只带止损（当前止损原值，不动一分），登记写 exit_mode/plan_tp/atr14_open 与
+        棘轮初始状态（stop_px=当前止损）；plan_tp 缺省取被摘掉的原固定止盈。原保本锁元数据一并
+        摘除（与移动止损互斥，breakeven_lock.check 本也有 trailing 跳过守卫，此处保持登记干净）。
+      → fixed：新单带当前止损（移动止损仓位 = 当前棘轮止损原值）+ 交易经理给的新固定止盈，
+        登记摘除 exit_mode/plan_tp/atr14_open/trail，回到固定仓位的登记形状。
+    止损在切换中绝不移动（新旧单同价），更谈不上放松。返回 (ok, 中文说明)。调用方须已过
+    tm_order_tool.validate 的护栏校验（HALT/RR/同模式等）；本函数再按登记与交易所实况守一道。"""
+    _require()
+    from desk import exec_lock
+    inst = p["inst_id"]
+    with exec_lock.hold(inst, why="switch_exit_mode"):
+        r = reg()
+        meta = dict(r["positions"].get(inst) or {})
+        from_mode = "trailing" if meta.get("exit_mode") == "trailing" else "fixed"
+        if to_mode not in ("trailing", "fixed"):
+            return False, f"退出模式切换目标非法：{to_mode}"
+        if from_mode == to_mode:
+            return False, f"该仓位已是{'移动止损' if to_mode == 'trailing' else '固定止盈止损'}，未切换"
+        mine = [a for a in close_algos(inst) if a.get("posSide") == p.get("pos_side", "net") and a.get("slTriggerPx")]
+        if not mine:
+            return False, "交易所无止损单，退出模式切换未执行（不允许出现无止损状态）"
+        sls = [float(a["slTriggerPx"]) for a in mine]
+        cur_sl = max(sls) if p["side"] == "long" else min(sls)   # 多张时取最紧一张（与 tighten_by_replace 同口径）
+        sz = X._dec(p["contracts"])
+        if to_mode == "trailing":
+            plan_tp = float(take_profit) if take_profit else None
+            if plan_tp is None:   # 缺省：原固定止盈转作计划止盈（激活线基准）
+                tps = [float(a["tpTriggerPx"]) for a in mine if a.get("tpTriggerPx")]
+                plan_tp = tps[0] if tps else (float(p["tp_px"]) if p.get("tp_px") else None)
+            if not plan_tp:
+                return False, "切移动止损缺计划止盈（交易经理未给 switch_take_profit 且原仓位无固定止盈可转），未切换"
+            if not atr14_open or float(atr14_open) <= 0:
+                return False, "切移动止损缺 ATR14（棘轮基准），未切换"
+            new_id = _replace_close_algos(p, cur_sl, None, sz)
+            if not new_id:
+                return False, "新止损单挂单或确认失败，保留旧单，退出模式未切换"
+            entry = dict(meta)
+            entry.update({"decision_id": meta.get("decision_id") or decision_id, "side": meta.get("side") or p["side"],
+                          "opened": meta.get("opened") or settings.now_str(),
+                          "exit_mode": "trailing", "plan_tp": plan_tp, "atr14_open": float(atr14_open),
+                          "trail": {"activated": False, "best_px": None, "stop_px": cur_sl}})
+            be_dropped = entry.pop("breakeven", None) is not None
+            r["positions"][inst] = entry
+            save_reg(r)
+            X.log_event("exit_mode_switched", inst_id=inst, decision_id=decision_id, from_mode=from_mode,
+                        to_mode="trailing", stop=cur_sl, plan_tp=plan_tp, atr14_open=float(atr14_open),
+                        breakeven_dropped=be_dropped, algoId=new_id, reason=(reason or "")[:200])
+            return True, (f"退出模式切换：固定止盈止损 → 移动止损（止损保持 {cur_sl:g} 不动，固定止盈已摘除；"
+                          f"计划止盈 {plan_tp:g} 仅作激活线基准，ATR14 {float(atr14_open):g}，棘轮自当前止损起步）")
+        new_tp = float(take_profit) if take_profit else None
+        if not new_tp:
+            return False, "切固定止盈止损缺新止盈（switch_take_profit），未切换"
+        new_id = _replace_close_algos(p, cur_sl, new_tp, sz)
+        if not new_id:
+            return False, "新止盈止损单挂单或确认失败，保留旧单，退出模式未切换"
+        entry = dict(meta)
+        for k in ("exit_mode", "plan_tp", "atr14_open", "trail"):
+            entry.pop(k, None)
+        entry.setdefault("decision_id", decision_id)
+        entry.setdefault("side", p["side"])
+        entry.setdefault("opened", settings.now_str())
+        r["positions"][inst] = entry
+        save_reg(r)
+        X.log_event("exit_mode_switched", inst_id=inst, decision_id=decision_id, from_mode=from_mode,
+                    to_mode="fixed", stop=cur_sl, tp=new_tp, algoId=new_id, reason=(reason or "")[:200])
+        return True, (f"退出模式切换：移动止损 → 固定止盈止损（止损保持当前棘轮位 {cur_sl:g} 不动，"
+                      f"新固定止盈 {new_tp:g} 已挂单）")
+
+
 def _alert(kind, **kw):
     X.log_event(kind, **kw)
     try:

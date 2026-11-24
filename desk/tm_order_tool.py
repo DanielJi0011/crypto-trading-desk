@@ -40,6 +40,8 @@ class OrderToolCall(BaseModel):
     keep_expiry: bool = Field(default=False, description="仅 keep_pending/replace_pending 可用：true=沿用现有挂单原到期时刻，忽略 expire_hours；若原到期早于下一场开场后 2 小时，系统会自动顺延到下一场开场后 2 小时")
     new_stop: float | None = Field(default=None, description="hold/reduce 有持仓时可选：新止损（只能收紧）")
     new_tp: float | None = Field(default=None, description="hold/reduce 有持仓时可选：新止盈（须在现价盈利一侧）")
+    exit_mode_switch: Literal["trailing", "fixed"] | None = Field(default=None, description="hold/reduce 有持仓时可选：把该仓位的退出模式原地切换为 trailing=移动止损 / fixed=固定止盈止损（不平仓、不重开）。这是你自己的判断——行情判定只是参考输入，代码不按阶段替你决定切不切。切换时止损保持现值、绝不放松；切 fixed 必须同时给 switch_take_profit（新固定止盈）；切 trailing 时 switch_take_profit 作计划止盈（激活线基准，不挂单），可省略=沿用原固定止盈。切换时不要同时给 new_tp")
+    switch_take_profit: float | None = Field(default=None, description="配合 exit_mode_switch：切 fixed 时的新固定止盈（必填，按现价与现止损算盈亏比须≥1.5）；切 trailing 时的计划止盈（可省略，省略则沿用原固定止盈作计划止盈）")
     reduce_fraction: float | None = Field(default=None, description="reduce 必填：减仓比例 0.1~0.9")
     horizon_days: int = Field(default=5, description="持有周期天数 1~30")
     invalidation: str = Field(default="", description="必填：什么情况说明判断错了")
@@ -135,6 +137,9 @@ def validate(cfg, call: OrderToolCall, ctx: dict) -> list[str]:
         errs.append(f"[EXPIRY] 现有挂单原到期时刻 {ex.get('expires') or '未登记'} 无法沿用（未登记或已过期）；请设 keep_expiry=false 并给 expire_hours")
     if a == "reduce" and call.reduce_fraction is not None and not (0.1 <= float(call.reduce_fraction) <= 0.9):
         errs.append(f"[REDUCE] reduce_fraction={call.reduce_fraction} 超出允许范围 0.1~0.9（全平请用 close）")
+    if call.exit_mode_switch and a not in ("hold", "reduce"):
+        errs.append(f"[EXIT_SWITCH] exit_mode_switch 只用于有持仓时的 hold/reduce（当前 action={a}）：切换退出模式是原地换单，"
+                    "不平仓、不重开，不要用 close/open 绕")
     if errs:
         return errs
     # 3) 方向：交易经理不能翻转共识
@@ -302,6 +307,7 @@ def validate(cfg, call: OrderToolCall, ctx: dict) -> list[str]:
         errs += keep_errors(cfg, call, ctx)
     elif a in ("hold", "reduce") and pos:
         errs += position_adjust_errors(cfg, call, pos, mk)
+        errs += exit_switch_errors(cfg, call, ctx)
     return errs
 
 
@@ -460,6 +466,62 @@ def position_adjust_errors(cfg, call, pos, mk) -> list[str]:
     return errs
 
 
+def exit_switch_errors(cfg, call, ctx) -> list[str]:
+    """退出模式切换校验（2026-11-24 用户批准）：切换是交易经理对已有持仓的自主裁量，代码只过
+    现有硬护栏——HALT/KILL 全冻结不切、已是目标模式不切、旧纸面仓不切、无止损不切；切 trailing
+    需移动止损机制启用、计划止盈在现价盈利一侧、本场 ATR14 可用（棘轮基准）；切 fixed 必须给
+    新止盈且按现价/生效止损/新止盈算 RR≥min_rr（与 §4 同一 min_rr_after_adjust 口径）。
+    行情判定阶段不是代码门：本函数不读 ctx.trend，切不切、切哪个方向全凭交易经理判断。"""
+    sw = call.exit_mode_switch
+    if not sw:
+        return []
+    from desk import demo_exec as DX, settings, sizing
+    pos, mk, inst = ctx["pos"], ctx["mk"], ctx["inst"]
+    errs: list[str] = []
+    if settings.halt_active() or settings.kill_active():
+        return ["[EXIT_SWITCH] HALT/KILL 全冻结期间不切换退出模式"]
+    if pos.get("legacy"):
+        return ["[EXIT_SWITCH] 旧纸面仓由旧仓盯盘管理，不切换退出模式"]
+    if _num(call.new_tp) is not None:
+        errs.append("[EXIT_SWITCH] 切换退出模式时不要同时给 new_tp（切 fixed 的新止盈用 switch_take_profit；切 trailing 后没有固定止盈）")
+    meta = (DX.reg().get("positions") or {}).get(inst) or {}
+    cur_mode = "trailing" if meta.get("exit_mode") == "trailing" else "fixed"
+    if cur_mode == sw:
+        errs.append(f"[EXIT_SWITCH] 该仓位已是{'移动止损' if sw == 'trailing' else '固定止盈止损'}，无需切换")
+        return errs
+    last, cur_stop = float(mk["last"]), _num(pos.get("sl_px"))
+    if cur_stop is None:
+        errs.append("[EXIT_SWITCH] 当前持仓无止损，禁止切换退出模式")
+        return errs
+    sg = 1 if pos["side"] == "long" else -1
+    if sw == "trailing":
+        if not DX.ecfg(cfg)["trailing_stop"].get("enabled"):
+            errs.append("[EXIT_SWITCH] 移动止损机制未启用（execution.trailing_stop.enabled=false），不能切移动止损")
+        plan = _num(call.switch_take_profit) or _num(pos.get("tp_px"))
+        if plan is None:
+            errs.append("[EXIT_SWITCH] 切移动止损须给 switch_take_profit 作计划止盈（原仓位无固定止盈可沿用）")
+        elif sg * (plan - last) <= 0:
+            errs.append(f"[EXIT_SWITCH] 计划止盈 {plan:g} 不在现价 {last:g} 盈利一侧")
+        if float(mk.get("atr14") or 0) <= 0:
+            errs.append("[EXIT_SWITCH] 本场 ATR14 缺失，无法为移动止损棘轮定基准，不能切换")
+    else:   # 切 fixed：止损取生效值（同场给了 new_stop 且已过只收紧校验时按新止损算 RR）
+        tp = _num(call.switch_take_profit)
+        if tp is None:
+            errs.append("[EXIT_SWITCH] 切固定止盈止损必须给 switch_take_profit（新固定止盈）")
+        else:
+            if sg * (tp - last) <= 0:
+                errs.append(f"[EXIT_SWITCH] 新止盈 {tp:g} 不在现价 {last:g} 盈利一侧")
+            eff_stop = _num(call.new_stop) or cur_stop
+            min_rr = float(sizing.rcfg(cfg).get("min_rr_after_adjust", 1.5))
+            rr = sizing.rr_ratio(pos["side"], last, eff_stop, tp)
+            if rr is None or rr + 1e-12 < min_rr:
+                need = last + sg * min_rr * abs(last - eff_stop)
+                errs.append(f"[EXIT_SWITCH] 切固定止盈止损的盈亏比 {('无效' if rr is None else f'{rr:.2f}')} < {min_rr:g}"
+                            f"（现价 {last:g}、止损 {eff_stop:g}、新止盈 {tp:g}）；按此止损，新止盈至少 {need:.6g}，"
+                            "或改用 reduce/close 处理该仓位")
+    return errs
+
+
 def to_decision(call: OrderToolCall, ctx: dict):
     """把通过校验的工具参数原样映射为现有执行层使用的 ManagerDecision（不改任何数）。"""
     from desk import manager
@@ -481,9 +543,11 @@ def to_decision(call: OrderToolCall, ctx: dict):
     elif a == "close":
         d = dict(action="sell")
     elif a == "reduce":
-        d = dict(action="reduce", reduce_fraction=call.reduce_fraction, new_stop=call.new_stop, new_tp=call.new_tp)
+        d = dict(action="reduce", reduce_fraction=call.reduce_fraction, new_stop=call.new_stop, new_tp=call.new_tp,
+                 exit_mode_switch=call.exit_mode_switch, switch_take_profit=call.switch_take_profit)
     else:   # hold / cancel_pending
-        d = dict(action="hold", new_stop=call.new_stop, new_tp=call.new_tp)
+        d = dict(action="hold", new_stop=call.new_stop, new_tp=call.new_tp,
+                 exit_mode_switch=call.exit_mode_switch, switch_take_profit=call.switch_take_profit)
         if a == "cancel_pending":
             base["confidence"] = 0.0   # 明确否决 → 走现有否决路径撤单
     dec = manager.ManagerDecision(**{**base, **d})
@@ -527,6 +591,20 @@ def instructions(ctx: dict, cfg=None) -> str:
     if pos:
         lines.append(f"Existing position in this coin: {pos.get('side')} avg {pos.get('avg_px')} stop {pos.get('sl_px')} take-profit {pos.get('tp_px')}; "
                      "the stop only tightens; same-direction adds use add (market) or pending (conditional add).")
+        _mode = None
+        try:
+            from desk import demo_exec as _DX2
+            _meta = (_DX2.reg().get("positions") or {}).get(ctx["inst"]) or {}
+            _mode = "trailing" if _meta.get("exit_mode") == "trailing" else "fixed"
+        except Exception:
+            _mode = None
+        if _mode:
+            lines.append(f"This position's exit mode is currently {'TRAILING (no fixed take-profit order on the exchange; a code ratchet trails the stop)' if _mode == 'trailing' else 'FIXED take-profit/stop-loss'}. "
+                         "On hold/reduce you may switch it in place with exit_mode_switch ('trailing' or 'fixed') — this is your own judgment call "
+                         "(the regime judgment is one input, not a rule: no stage obliges or forbids a switch). A switch never closes or reopens the position "
+                         "and the stop stays exactly where it is — it never loosens. Switching to fixed requires switch_take_profit with RR>=1.5 measured "
+                         "from spot and the current stop; switching to trailing takes switch_take_profit as the plan take-profit behind the activation line "
+                         "(omit it to reuse the current fixed take-profit as the plan). Do not combine a switch with new_tp; you may combine it with a tightening new_stop.")
     tr = ctx.get("trend") or {}
     if tr.get("enabled"):
         _na = float((tr.get("cfg") or {}).get("near_atr", 0.3))
@@ -569,7 +647,7 @@ def instructions(ctx: dict, cfg=None) -> str:
         try:
             from desk import demo_exec as _DX
             if _DX.ecfg(cfg)["trailing_stop"].get("enabled"):
-                lines.append("Exit mode (code-decided, not yours to choose): when this session's regime judgment is active and the stage is not late_exhaustion, "
+                lines.append("Exit mode of a NEW position (code-decided at entry, not yours to choose): when this session's regime judgment is active and the stage is not late_exhaustion, "
                              "your NEW position (a fresh open while this coin has NO position) exits by trailing stop, no fixed take-profit order; "
                              "your take_profit serves only the RR check and the trailing activation line, so still give levels at RR>=1.5 as usual; "
                              "late_exhaustion or no trend keeps the fixed take-profit. "

@@ -83,6 +83,8 @@ class ManagerDecision(BaseModel):
     take_profit: float | None = Field(default=None, description="止盈价（USDT），可省略")
     new_stop: float | None = Field(default=None, description="已有持仓时希望收紧到的新止损价（多单只能上移、空单只能下移），可省略")
     new_tp: float | None = Field(default=None, description="已有持仓（持有或减仓）时希望调整到的新止盈价，可调近或调远，但必须在现价盈利一侧（多单高于现价、空单低于现价）且不会立即触发；可省略")
+    exit_mode_switch: Literal["trailing", "fixed"] | None = Field(default=None, description="已有持仓时可填：把该仓位退出模式原地切换为 trailing=移动止损 / fixed=固定止盈止损（交易经理自主裁量，不平仓重开，止损保持现值绝不放松；由 tm_order_tool 映射）")
+    switch_take_profit: float | None = Field(default=None, description="配合 exit_mode_switch：切 fixed 时的新固定止盈；切 trailing 时的计划止盈（可省略=沿用原固定止盈）")
     invalidation: str | None = Field(default=None, description="一句话：什么情况说明判断错了（必填）")
     horizon_days: int = Field(default=5, description="持有周期（天，1~30）")
     confidence: float = Field(default=0.5, description="0~1")
@@ -435,6 +437,7 @@ def decide_and_execute(cfg, coin, trade_date, fs, st, tracker, source="daily", r
     S_pre_tm = S   # 交易经理提示里看到的口径（不含其本人投票）
     S = agg["S"]
     apply_position_sl_tp(cfg, pos, st, w, mk, dec, action, execd, notes, tm_absent=absent)
+    apply_exit_mode_switch(cfg, pos, dec, action, execd, notes, mk, did, tm_absent=absent)
 
     rec = {"decision_id": did, "date": trade_date, "session": record_session(source), "time": settings.now_str(), "inst_id": inst, "ticker": coin["ticker"],
            "price": mk["last"], "market": mk, "consensus": round(S, 4), "consensus_pre_tm": round(S_pre_tm, 4), "weights": w,
@@ -562,6 +565,43 @@ def apply_position_sl_tp(cfg, pos, st, w, mk, dec, action, execd, notes, tm_abse
         return
     apply_new_stop(cfg, pos, dec, action, execd, notes)
     apply_new_tp(cfg, pos, dec, action, execd, notes)
+
+
+def apply_exit_mode_switch(cfg, pos, dec, action, execd, notes, mk, did, tm_absent=False):
+    """交易经理 exit_mode_switch（2026-11-24 用户批准）：hold 或减仓成功后，把已有核心仓的退出模式
+    在固定止盈止损 ↔ 移动止损之间原地切换（demo_exec.switch_exit_mode 按交易所当前止损原值换单，
+    止损一分不动）。切换是交易经理的自主裁量：行情判定阶段只是其输入，本函数不查判定。
+    与调点同场出现时先调点后切换（decide_and_execute 调用顺序），切换读换单时的实时止损。
+    HALT/KILL 冻结期间不切换（validate 已拦，执行前再守一道）；交易经理缺席时不切换。"""
+    sw = getattr(dec, "exit_mode_switch", None)
+    if tm_absent or not sw or not pos:
+        return
+    reduced = action == "reduce" and isinstance(execd, dict) and execd.get("ok")
+    if action == "reduce" and not reduced:
+        notes.append("减仓未成功，退出模式切换未执行")
+        return
+    if not (action.startswith("hold") or reduced):
+        return
+    if settings.halt_active() or settings.kill_active():
+        notes.append("HALT/KILL 全冻结，退出模式切换未执行")
+        return
+    if pos.get("legacy"):
+        notes.append("旧纸面仓由旧仓盯盘管理，不切换退出模式")
+        return
+    if pos.get("venue") != "okx_demo":
+        notes.append("非模拟盘仓位，退出模式切换未执行")
+        return
+    if reduced and execd.get("remaining") is not None:   # 减仓后保护单张数须等于剩余仓位
+        pos = {**pos, "contracts": execd["remaining"]}
+    from desk import demo_exec
+    try:
+        ok, msg = demo_exec.switch_exit_mode(
+            cfg, pos, sw, take_profit=getattr(dec, "switch_take_profit", None),
+            atr14_open=(float(mk.get("atr14") or 0) or None),
+            decision_id=did, reason=getattr(dec, "rationale", "") or "")
+    except Exception as e:
+        msg = f"模拟盘退出模式切换失败：{type(e).__name__}: {e}"
+    notes.append(msg)
 
 
 def pm_execute(cfg, coin, did, st, w, mk, bk, pos, rationale, source="daily", tm=None, tm_state=None) -> dict:
